@@ -11,6 +11,23 @@ export interface LivePlatformEventAdapter<TEvent, TStatus> {
   createEventUrl(clientKey: string, lastEventId?: string): string;
 }
 
+export interface LivePlatformReply {
+  message: string;
+  idempotencyKey: string;
+}
+
+export interface LivePlatformReplyResult {
+  ok: boolean;
+  duplicate: boolean;
+  chunksTotal: number;
+  chunksSent: number;
+}
+
+export interface LivePlatformReplyAdapter {
+  id: string;
+  send(reply: LivePlatformReply): Promise<LivePlatformReplyResult>;
+}
+
 export interface LiveRoomEvent {
   id: string;
   type: LiveRoomEventType;

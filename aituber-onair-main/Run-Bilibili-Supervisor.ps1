@@ -5,6 +5,7 @@ $logDir = Join-Path $PSScriptRoot 'logs'
 $scriptPath = Join-Path $PSScriptRoot 'scripts\bilibili-room-supervisor.mjs'
 New-Item -ItemType Directory -Path $logDir -Force | Out-Null
 $env:BILIBILI_ROOM_ID = $RoomId
+$env:BILIBILI_AUTH_FILE = Join-Path (Split-Path $PSScriptRoot -Parent) '.runtime\bilibili-auth.json'
 $selfUidFile = Join-Path $PSScriptRoot 'config\bilibili-self-uid.txt'
 if (Test-Path -LiteralPath $selfUidFile) {
   $env:BILIBILI_SELF_UIDS = (Get-Content -LiteralPath $selfUidFile -Raw).Trim()

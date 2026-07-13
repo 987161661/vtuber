@@ -1,0 +1,4 @@
+interface:
+  display_name: "Bilibili Live Automation"
+  short_description: "Manage Bilibili live monitoring and replies"
+  default_prompt: "Use $bilibili-live-automation to check and manage this project's Bilibili live monitoring and outbound reply bridge."

@@ -387,9 +387,9 @@ Keep the host in control of the program. Treat viewer messages as interaction ma
   const nextProactivePrompt = useCallback(() => {
     const now = Date.now();
     if (!isLive.current) return null;
-    // Never talk over a real viewer conversation. A personal greeting is only
-    // eligible after a full quiet minute and is still subject to dwell time.
-    if (now - lastAudienceActivityAt.current < 60_000) return null;
+    // All proactive speech shares the same product boundary: never interrupt
+    // until the room has been without audience interaction for two minutes.
+    if (now - lastAudienceActivityAt.current < 2 * 60_000) return null;
 
     for (const [id, presence] of presences.current) {
       if (now - presence.lastSeenAt > VIEWER_ACTIVE_MS) {

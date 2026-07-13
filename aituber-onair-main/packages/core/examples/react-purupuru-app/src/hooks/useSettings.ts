@@ -436,6 +436,7 @@ function getDefaultSettings(): AppSettings {
       twitchEnabled: false,
       twitchCommentIntervalMs: 20_000,
       bilibiliEnabled: false,
+      bilibiliReplyEnabled: false,
       customSseEndpoint: '',
       customSseEnabled: false,
     },
@@ -467,11 +468,12 @@ function getDefaultSettings(): AppSettings {
     },
     emptyRoomAwareness: {
       enabled: true,
-      minIntervalMs: 60_000,
+      minIntervalMs: 2 * 60_000,
       maxIntervalMs: 10 * 60_000,
       interfaceWeight: 40,
       memoryWeight: 35,
       inspirationWeight: 25,
+      audienceWeight: 30,
     },
   };
 }
@@ -574,10 +576,25 @@ function loadSettings(): AppSettings {
           ...saved.commentIntelligence,
         },
         manneri: { ...defaults.manneri, ...saved.manneri },
-        emptyRoomAwareness: {
-          ...defaults.emptyRoomAwareness,
-          ...saved.emptyRoomAwareness,
-        },
+        emptyRoomAwareness: (() => {
+          const merged = {
+            ...defaults.emptyRoomAwareness,
+            ...saved.emptyRoomAwareness,
+          };
+          const minIntervalMs = Math.max(
+            2 * 60_000,
+            normalizePositiveInteger(merged.minIntervalMs, 2 * 60_000),
+          );
+          return {
+            ...merged,
+            minIntervalMs,
+            maxIntervalMs: Math.max(
+              minIntervalMs,
+              normalizePositiveInteger(merged.maxIntervalMs, 10 * 60_000),
+            ),
+            audienceWeight: clampNumber(merged.audienceWeight, 0, 100),
+          };
+        })(),
       };
     }
   } catch {
@@ -1389,6 +1406,16 @@ export function useSettings(runtimeRole: RuntimeSettingsRole = 'standalone') {
     }));
   }, []);
 
+  const updateBilibiliReplyEnabled = useCallback(
+    (bilibiliReplyEnabled: boolean) => {
+      setSettings((prev) => ({
+        ...prev,
+        stream: { ...prev.stream, bilibiliReplyEnabled },
+      }));
+    },
+    [],
+  );
+
   const updateCustomSseEndpoint = useCallback((customSseEndpoint: string) => {
     setSettings((prev) => ({
       ...prev,
@@ -1745,8 +1772,8 @@ export function useSettings(runtimeRole: RuntimeSettingsRole = 'standalone') {
       setSettings((prev) => {
         const merged = { ...prev.emptyRoomAwareness, ...update };
         const minIntervalMs = clampNumber(
-          normalizePositiveInteger(merged.minIntervalMs, 60_000),
-          60_000,
+          normalizePositiveInteger(merged.minIntervalMs, 2 * 60_000),
+          2 * 60_000,
           60 * 60_000,
         );
         const maxIntervalMs = Math.max(
@@ -1766,6 +1793,7 @@ export function useSettings(runtimeRole: RuntimeSettingsRole = 'standalone') {
             interfaceWeight: clampNumber(merged.interfaceWeight, 0, 100),
             memoryWeight: clampNumber(merged.memoryWeight, 0, 100),
             inspirationWeight: clampNumber(merged.inspirationWeight, 0, 100),
+            audienceWeight: clampNumber(merged.audienceWeight, 0, 100),
           },
         };
       });
@@ -1845,6 +1873,7 @@ export function useSettings(runtimeRole: RuntimeSettingsRole = 'standalone') {
     updateTwitchEnabled,
     updateTwitchCommentIntervalMs,
     updateBilibiliEnabled,
+    updateBilibiliReplyEnabled,
     updateCustomSseEndpoint,
     updateCustomSseEnabled,
     updateSocialStream,

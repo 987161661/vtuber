@@ -546,6 +546,27 @@ body {
 .reply-editor button {
   justify-self: start;
 }
+.idle-broadcast-editor {
+  display: grid;
+  gap: 10px;
+}
+.idle-broadcast-editor > p {
+  color: var(--muted);
+  font-size: 0.72rem;
+  line-height: 1.6;
+  margin: 0;
+}
+.idle-broadcast-editor .chat-input {
+  background: transparent;
+  border: 0;
+  padding: 0;
+}
+.idle-broadcast-editor .input-actions {
+  justify-content: space-between;
+}
+.idle-broadcast-editor .send-button {
+  background: #214f60;
+}
 .reply-history {
   display: grid;
   gap: 14px;

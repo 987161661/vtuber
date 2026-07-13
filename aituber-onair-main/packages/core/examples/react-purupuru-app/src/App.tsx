@@ -1,31 +1,32 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { ChatPanel } from './components/ChatPanel';
 import { ControlRoom } from './components/ControlRoom';
-import type { StressRunState } from './components/StressTestPanel';
 import { SettingsPanel } from './components/SettingsPanel';
+import type { StressRunState } from './components/StressTestPanel';
 import {
-  createRuntimeCharacterProfile,
   LINGLAN_PROFILE,
+  createRuntimeCharacterProfile,
 } from './config/characterProfile';
-import { useAudioLipsync } from './hooks/useAudioLipsync';
 import { useAituberCore } from './hooks/useAituberCore';
-import { useLiveCommentIntelligence } from './hooks/useLiveCommentIntelligence';
-import { useInteractionFeed } from './hooks/useInteractionFeed';
-import { useSocialStreamBus } from './hooks/useSocialStreamBus';
-import { useLiveDirector } from './hooks/useLiveDirector';
-import { useInterval } from './hooks/useInterval';
+import { useAudioLipsync } from './hooks/useAudioLipsync';
+import { useBilibiliComments } from './hooks/useBilibiliComments';
 import { useHostExtensions } from './hooks/useHostExtensions';
+import { useInteractionFeed } from './hooks/useInteractionFeed';
+import { useInterval } from './hooks/useInterval';
+import { useLiveCommentIntelligence } from './hooks/useLiveCommentIntelligence';
+import { useLiveDirector } from './hooks/useLiveDirector';
+import { useLivePlatformEvents } from './hooks/useLivePlatformEvents';
 import { useScreenVisionController } from './hooks/useScreenVisionController';
 import { useSettings } from './hooks/useSettings';
+import { useSocialStreamBus } from './hooks/useSocialStreamBus';
 import { useStreamerMemory } from './hooks/useStreamerMemory';
 import { useTwitchComments } from './hooks/useTwitchComments';
 import { useYoutubeComments } from './hooks/useYoutubeComments';
-import { useBilibiliComments } from './hooks/useBilibiliComments';
-import { useLivePlatformEvents } from './hooks/useLivePlatformEvents';
-import type { PuruPuruAvatarPackage } from './lib/purupuruPackage';
 import { digitalHumanAvatarStore } from './lib/digitalHumanAvatarStore';
-import { previewMinimaxVoice } from './lib/minimaxVoicePreview';
 import { EmptyRoomAwarenessPlanner } from './lib/emptyRoomAwareness';
+import { parseFlashHeadBundle } from './lib/flashheadBundle';
+import { previewMinimaxVoice } from './lib/minimaxVoicePreview';
+import type { PuruPuruAvatarPackage } from './lib/purupuruPackage';
 import { loadPuruPuruPackage } from './lib/purupuruPackage';
 import type {
   PuruPuruReaction,
@@ -36,29 +37,33 @@ import {
   createPuruPuruReactionFromScreenplay,
   withReactionId,
 } from './lib/purupuruReactions';
-import type { TwitchChatMessage } from './services/twitch/twitchService';
-import type { YouTubeChatMessage } from './services/youtube/youtubeService';
-import { createCustomSseEventAdapter } from './services/live-platform/customSse';
-import type { LiveRoomEvent, LiveRoomStatus } from './services/live-platform/types';
 import {
   getHostBridgeMessageKind,
   hostBridgeType,
   isLegacyHostBridgeMessage,
 } from './services/host-bridge/protocol';
+import { bilibiliReplyAdapter } from './services/live-platform/bilibili';
+import { createCustomSseEventAdapter } from './services/live-platform/customSse';
+import type {
+  LiveRoomEvent,
+  LiveRoomStatus,
+} from './services/live-platform/types';
+import type { TwitchChatMessage } from './services/twitch/twitchService';
+import type { YouTubeChatMessage } from './services/youtube/youtubeService';
 import './styles/app.css';
 import type { AvatarMotion } from './lib/avatarMotion';
 import { normalizeAvatarMotion } from './lib/avatarMotion';
-import type { LiveLifecycleTransition } from './lib/liveResponseScheduler';
 import {
-  updateOperatorQueue,
-  type OperatorQueueItem,
-} from './lib/operatorQueue';
-import {
+  type RecentLiveTurn,
   buildLiveResponseContract,
   buildLiveRoomTranscript,
   mergeRecentLiveTurns,
-  type RecentLiveTurn,
 } from './lib/liveConversationContext';
+import type { LiveLifecycleTransition } from './lib/liveResponseScheduler';
+import {
+  type OperatorQueueItem,
+  updateOperatorQueue,
+} from './lib/operatorQueue';
 import { STRESS_TEST_PLAN } from './lib/stressTestPlan';
 
 type AvatarPackageSource = 'default' | 'user';
@@ -81,13 +86,19 @@ function parseStressDiagnostics(value: unknown): StressRunState['diagnostics'] {
     const check = raw as StressApiRecord;
     const level = check.level;
     if (level !== 'pass' && level !== 'warning' && level !== 'error') return [];
-    return [{
-      id: typeof check.id === 'string' ? check.id : `diagnostic-${index}`,
-      level,
-      code: typeof check.code === 'string' ? check.code : 'unknown_diagnostic',
-      summary: typeof check.summary === 'string' ? check.summary : 'No diagnostic summary.',
-      detail: typeof check.detail === 'string' ? check.detail : undefined,
-    }];
+    return [
+      {
+        id: typeof check.id === 'string' ? check.id : `diagnostic-${index}`,
+        level,
+        code:
+          typeof check.code === 'string' ? check.code : 'unknown_diagnostic',
+        summary:
+          typeof check.summary === 'string'
+            ? check.summary
+            : 'No diagnostic summary.',
+        detail: typeof check.detail === 'string' ? check.detail : undefined,
+      },
+    ];
   });
 }
 
@@ -110,6 +121,8 @@ type ConversationOrigin = {
 };
 type ActiveLifecycle = ConversationOrigin & {
   eventId: string;
+  replyText?: string;
+  bilibiliMirrorStarted?: boolean;
   ttsStartAt?: number;
   testRunId?: string;
   stepId?: string;
@@ -201,9 +214,7 @@ function toInteractionTransition(
         : [],
     queueDepth: typeof event.queueDepth === 'number' ? event.queueDepth : 0,
     oldestQueueAgeMs:
-      typeof event.oldestQueueAgeMs === 'number'
-        ? event.oldestQueueAgeMs
-        : 0,
+      typeof event.oldestQueueAgeMs === 'number' ? event.oldestQueueAgeMs : 0,
   };
 }
 
@@ -257,9 +268,7 @@ export default function App() {
   const isObsOverlay = query.get('overlay') === '1';
   const [isTemporaryStressOwner, setIsTemporaryStressOwner] = useState(false);
   const isLiveRuntimeOwner =
-    isObsOverlay ||
-    query.get('listener') === '1' ||
-    isTemporaryStressOwner;
+    isObsOverlay || query.get('listener') === '1' || isTemporaryStressOwner;
   // FlashHead is the production audio-driven avatar renderer. Set
   // ?avatar=purupuru to disable rendered speaking video for troubleshooting.
   const useSpeakingAvatar = query.get('avatar') !== 'purupuru';
@@ -405,7 +414,6 @@ export default function App() {
   const activeLifecycleRef = useRef<ActiveLifecycle | null>(null);
   const speechRenderTraceRef = useRef<SpeechRenderTrace | null>(null);
   const replyLatencyRef = useRef<ReplyLatencyTrace | null>(null);
-  const lastExternalNarrationAtRef = useRef(0);
   const [avatarReaction, setAvatarReaction] = useState<PuruPuruReaction | null>(
     null,
   );
@@ -573,19 +581,7 @@ export default function App() {
           );
         }
         const payload = new Uint8Array(await response.arrayBuffer());
-        if (payload.byteLength < 5)
-          throw new Error('Speaking avatar bundle is empty');
-        const audioLength = new DataView(
-          payload.buffer,
-          payload.byteOffset,
-          4,
-        ).getUint32(0);
-        const videoOffset = 4 + audioLength;
-        if (audioLength === 0 || videoOffset >= payload.byteLength) {
-          throw new Error('Speaking avatar bundle is invalid');
-        }
-        const normalizedAudio = arrayBuffer.slice(0);
-        const video = payload.slice(videoOffset);
+        const { audioBuffer, videoBuffer } = parseFlashHeadBundle(payload);
         const frameCount = Number(response.headers.get('X-FlashHead-Frames'));
         const replyLatency = replyLatencyRef.current;
         if (
@@ -597,9 +593,9 @@ export default function App() {
           replyLatency.flashHeadFirstFrameAt = Date.now();
         }
         return {
-          audioBuffer: normalizedAudio,
+          audioBuffer,
           videoUrl: URL.createObjectURL(
-            new Blob([video], { type: 'video/webm' }),
+            new Blob([videoBuffer], { type: 'video/webm' }),
           ),
           durationSeconds:
             Number.isFinite(frameCount) && frameCount > 0 ? frameCount / 25 : 0,
@@ -897,6 +893,31 @@ export default function App() {
           viewerName: active.viewerName,
           sourcesSeen: active.sourcesSeen,
         });
+        if (
+          settingsHook.settings.stream.bilibiliReplyEnabled &&
+          !active.testRunId &&
+          !active.bilibiliMirrorStarted
+        ) {
+          const message = (active.replyText || text).trim();
+          if (message) {
+            // Mirror exactly once when TTS really starts. This covers replies,
+            // proactive speech and operator-authored broadcasts through the
+            // same playback lifecycle.
+            active.bilibiliMirrorStarted = true;
+            void bilibiliReplyAdapter
+              .send({
+                message,
+                idempotencyKey: `speech:${active.eventId}`,
+              })
+              .then(() => setStreamErrorMessage(''))
+              .catch((error) => {
+                const reason =
+                  error instanceof Error ? error.message : String(error);
+                setStreamErrorMessage(`B 站同步主播台词失败：${reason}`);
+                console.warn('Bilibili speech mirror failed.', error);
+              });
+          }
+        }
       }
       speechReactionRef.current =
         createPuruPuruReactionFromScreenplay(screenplay);
@@ -906,7 +927,12 @@ export default function App() {
           : normalizeAvatarMotion(screenplay.motion),
       );
     },
-    [armOperatorSpeechWatchdog, emitRuntimeEvent, useSpeakingAvatar],
+    [
+      armOperatorSpeechWatchdog,
+      emitRuntimeEvent,
+      settingsHook.settings.stream.bilibiliReplyEnabled,
+      useSpeakingAvatar,
+    ],
   );
 
   const handleSpeechEnd = useCallback(() => {
@@ -915,7 +941,8 @@ export default function App() {
     }
     const active = activeLifecycleRef.current;
     const isOperatorPlayback =
-      Boolean(active?.eventId) && speakingOperatorTaskRef.current === active?.eventId;
+      Boolean(active?.eventId) &&
+      speakingOperatorTaskRef.current === active?.eventId;
     const hasCompleteOperatorAudio =
       operatorBeatCountRef.current > 0 &&
       operatorCompletedBeatCountRef.current >= operatorBeatCountRef.current &&
@@ -1090,9 +1117,16 @@ export default function App() {
           llmStartAt: metadata?.processingAt,
           llmEndAt: Date.now(),
           sourcesSeen: metadata?.sourcesSeen,
-          testRunId: active?.eventId === metadata?.eventId ? active?.testRunId : undefined,
-          stepId: active?.eventId === metadata?.eventId ? active?.stepId : undefined,
-          scenarioId: active?.eventId === metadata?.eventId ? active?.scenarioId : undefined,
+          testRunId:
+            active?.eventId === metadata?.eventId
+              ? active?.testRunId
+              : undefined,
+          stepId:
+            active?.eventId === metadata?.eventId ? active?.stepId : undefined,
+          scenarioId:
+            active?.eventId === metadata?.eventId
+              ? active?.scenarioId
+              : undefined,
           replyAt: Date.now(),
         }),
       }).catch((error) => {
@@ -1159,6 +1193,8 @@ export default function App() {
         ttsConfigured:
           settingsHook.settings.tts.engine !== 'minimax' ||
           Boolean(settingsHook.settings.tts.minimaxApiKey?.trim()),
+        nextProactiveAt:
+          emptyRoomAwarenessPlannerRef.current?.getNextAt() || null,
         at: Date.now(),
       });
     heartbeat();
@@ -1193,7 +1229,13 @@ export default function App() {
       recoverChatRuntime();
     }, OPERATOR_GENERATION_RECOVERY_MS);
     return () => window.clearTimeout(timer);
-  }, [emitRuntimeEvent, isLiveRuntimeOwner, isProcessing, isSpeaking, recoverChatRuntime]);
+  }, [
+    emitRuntimeEvent,
+    isLiveRuntimeOwner,
+    isProcessing,
+    isSpeaking,
+    recoverChatRuntime,
+  ]);
 
   // Some avatar renderers finish their browser audio without forwarding the
   // core SPEECH_END event. Release the operator queue from the real playback
@@ -1256,46 +1298,53 @@ export default function App() {
   const liveDirector = useLiveDirector(runtimeProfile);
   const getShortTermLiveContext = useCallback(async (before = Date.now()) => {
     try {
-      const response = await fetch(`/api/conversation-history?shortTerm=1&before=${before}`, {
-        cache: 'no-store',
-        signal: AbortSignal.timeout(900),
-      });
+      const response = await fetch(
+        `/api/conversation-history?shortTerm=1&before=${before}`,
+        {
+          cache: 'no-store',
+          signal: AbortSignal.timeout(900),
+        },
+      );
       if (response.ok) {
         const payload = (await response.json()) as { records?: unknown };
         if (Array.isArray(payload.records)) {
-          const restored = payload.records.flatMap((record): RecentLiveTurn[] => {
-            if (!record || typeof record !== 'object') return [];
-            const value = record as Record<string, unknown>;
-            if (
-              typeof value.at !== 'number' ||
-              typeof value.input !== 'string'
-            ) {
-              return [];
-            }
-            return [
-              {
-                eventId:
-                  typeof value.eventId === 'string' ? value.eventId : undefined,
-                at: value.at,
-                input: value.input,
-                reply:
-                  typeof value.reply === 'string' ? value.reply : undefined,
-                viewerName:
-                  typeof value.viewerName === 'string'
-                    ? value.viewerName
-                    : undefined,
-                skills: Array.isArray(value.skills)
-                  ? value.skills.filter(
-                      (skill): skill is string => typeof skill === 'string',
-                    )
-                  : [],
-                status:
-                  typeof value.status === 'string'
-                    ? (value.status as OperatorQueueItem['status'])
-                    : undefined,
-              },
-            ];
-          });
+          const restored = payload.records.flatMap(
+            (record): RecentLiveTurn[] => {
+              if (!record || typeof record !== 'object') return [];
+              const value = record as Record<string, unknown>;
+              if (
+                typeof value.at !== 'number' ||
+                typeof value.input !== 'string'
+              ) {
+                return [];
+              }
+              return [
+                {
+                  eventId:
+                    typeof value.eventId === 'string'
+                      ? value.eventId
+                      : undefined,
+                  at: value.at,
+                  input: value.input,
+                  reply:
+                    typeof value.reply === 'string' ? value.reply : undefined,
+                  viewerName:
+                    typeof value.viewerName === 'string'
+                      ? value.viewerName
+                      : undefined,
+                  skills: Array.isArray(value.skills)
+                    ? value.skills.filter(
+                        (skill): skill is string => typeof skill === 'string',
+                      )
+                    : [],
+                  status:
+                    typeof value.status === 'string'
+                      ? (value.status as OperatorQueueItem['status'])
+                      : undefined,
+                },
+              ];
+            },
+          );
           recentLiveTurnsRef.current = mergeRecentLiveTurns(
             recentLiveTurnsRef.current,
             restored,
@@ -1308,7 +1357,22 @@ export default function App() {
     }
     return buildLiveRoomTranscript(recentLiveTurnsRef.current);
   }, []);
-  const emptyRoomAwarenessSettings = settingsHook.settings.emptyRoomAwareness;
+  // Runtime settings are synchronized from the coordinator every ten seconds.
+  // Keep this object stable when its values did not change; otherwise the
+  // scheduler effect below mistakes every sync for a configuration edit and
+  // postpones proactive speech forever.
+  const emptyRoomAwarenessSettings = useMemo(
+    () => settingsHook.settings.emptyRoomAwareness,
+    [
+      settingsHook.settings.emptyRoomAwareness.enabled,
+      settingsHook.settings.emptyRoomAwareness.minIntervalMs,
+      settingsHook.settings.emptyRoomAwareness.maxIntervalMs,
+      settingsHook.settings.emptyRoomAwareness.interfaceWeight,
+      settingsHook.settings.emptyRoomAwareness.memoryWeight,
+      settingsHook.settings.emptyRoomAwareness.inspirationWeight,
+      settingsHook.settings.emptyRoomAwareness.audienceWeight,
+    ],
+  );
   const markLiveActivity = useCallback(() => {
     liveDirector.markActivity();
     emptyRoomAwarenessPlannerRef.current?.markActivity(
@@ -1363,7 +1427,9 @@ export default function App() {
     ) => {
       const eventId = options?.eventId ?? crypto.randomUUID();
       const displayText = options?.displayText ?? text;
-      const shortTermLiveContext = await getShortTermLiveContext(options?.createdAt);
+      const shortTermLiveContext = await getShortTermLiveContext(
+        options?.createdAt,
+      );
       const responseContract = buildLiveResponseContract(
         displayText,
         recentLiveTurnsRef.current,
@@ -1393,7 +1459,9 @@ export default function App() {
         Boolean(options?.testRunId) &&
         options?.faultKind === 'typhoon-skill-timeout';
       if (simulateSkillTimeout) {
-        await updateOperatorQueue(eventId, 'consume-fault').catch(() => undefined);
+        await updateOperatorQueue(eventId, 'consume-fault').catch(
+          () => undefined,
+        );
       }
       const enrichment = await hostExtensions.enrich({
         query: responseContract.skillQuery,
@@ -1406,10 +1474,7 @@ export default function App() {
       // Operator-queue preparation must return a writable text draft. The
       // screenshot/vision route speaks directly and has no draft callback, so
       // reserve it for one-off direct broadcasts only.
-      if (
-        enrichment.vision &&
-        !options?.silent
-      ) {
+      if (enrichment.vision && !options?.silent) {
         const liveRadarImage = await enrichment.vision.capture();
         if (liveRadarImage) {
           return processVisionChat(
@@ -1434,10 +1499,9 @@ export default function App() {
           // fallback is policy/reference material, not a structured fact feed.
           isWeather: Boolean(enrichment.isDomainSensitive),
           viewerText: options?.displayText ?? text,
-          requiredAnswer:
-            enrichment.isDomainSensitive
-              ? enrichment.fallbackReply
-              : undefined,
+          requiredAnswer: enrichment.isDomainSensitive
+            ? enrichment.fallbackReply
+            : undefined,
           claims: Array.isArray(payload?.claims) ? payload.claims : undefined,
           placeResolution: payload?.placeResolution,
           rawEvidence: payload,
@@ -1445,11 +1509,7 @@ export default function App() {
           forceFallback: enrichment.forceFallback,
         },
         silent: options?.silent,
-        onPrepared: (reply) =>
-          options?.onPrepared?.(
-            reply,
-            enrichment.skills,
-          ),
+        onPrepared: (reply) => options?.onPrepared?.(reply, enrichment.skills),
       });
     },
     [
@@ -1469,7 +1529,9 @@ export default function App() {
         { cache: 'no-store' },
       );
       if (!response.ok) return;
-      const payload = (await response.json()) as { items?: OperatorQueueItem[] };
+      const payload = (await response.json()) as {
+        items?: OperatorQueueItem[];
+      };
       if (Array.isArray(payload.items)) setOperatorQueue(payload.items);
     } catch {
       // The control room remains usable while the local Vite host reloads.
@@ -1481,69 +1543,108 @@ export default function App() {
       const response = await fetch('/api/stress-test', { cache: 'no-store' });
       if (!response.ok) return;
       const raw = (await response.json()) as StressApiRecord;
-      const testItems = operatorQueue.filter((item) => item.testRunId === raw.runId || (raw.lifecycle === 'idle' && item.testRunId));
+      const testItems = operatorQueue.filter(
+        (item) =>
+          item.testRunId === raw.runId ||
+          (raw.lifecycle === 'idle' && item.testRunId),
+      );
       const status: StressRunState['status'] =
         raw.cleanupState === 'running'
           ? 'cleaning'
           : raw.lifecycle === 'completed' && raw.hardPass !== true
             ? 'failed'
-          : raw.lifecycle === 'running' || raw.lifecycle === 'paused' || raw.lifecycle === 'completed' || raw.lifecycle === 'aborted' || raw.lifecycle === 'failed'
-            ? raw.lifecycle
-            : raw.lifecycle === 'aborting'
-              ? 'paused'
-              : testItems.length > 0
-                ? 'failed'
-                : 'idle';
+            : raw.lifecycle === 'running' ||
+                raw.lifecycle === 'paused' ||
+                raw.lifecycle === 'completed' ||
+                raw.lifecycle === 'aborted' ||
+                raw.lifecycle === 'failed'
+              ? raw.lifecycle
+              : raw.lifecycle === 'aborting'
+                ? 'paused'
+                : testItems.length > 0
+                  ? 'failed'
+                  : 'idle';
       setStressRun({
         status,
-        runId: typeof raw.runId === 'string' ? raw.runId : testItems[0]?.testRunId,
+        runId:
+          typeof raw.runId === 'string' ? raw.runId : testItems[0]?.testRunId,
         completedSteps: Number(raw.terminalCount || 0),
         totalSteps: Number(raw.messageCount || STRESS_TEST_PLAN.messageCount),
-        startedAt: typeof raw.startedAt === 'number' ? raw.startedAt : undefined,
-        updatedAt: typeof raw.updatedAt === 'number' ? raw.updatedAt : undefined,
-        etaMs: typeof raw.estimatedRemainingMs === 'number' ? raw.estimatedRemainingMs : undefined,
-        reportPath: typeof raw.reportDirectory === 'string' ? raw.reportDirectory : undefined,
+        startedAt:
+          typeof raw.startedAt === 'number' ? raw.startedAt : undefined,
+        updatedAt:
+          typeof raw.updatedAt === 'number' ? raw.updatedAt : undefined,
+        etaMs:
+          typeof raw.estimatedRemainingMs === 'number'
+            ? raw.estimatedRemainingMs
+            : undefined,
+        reportPath:
+          typeof raw.reportDirectory === 'string'
+            ? raw.reportDirectory
+            : undefined,
         phase: typeof raw.phaseLabel === 'string' ? raw.phaseLabel : undefined,
         viewers: Array.isArray(raw.viewers)
           ? raw.viewers.map((value) => {
               const viewer = value as StressApiRecord;
               return {
-              id: String(viewer.viewerId || ''),
-              name: String(viewer.viewerName || ''),
-              role: String(viewer.viewerId || ''),
-              status: viewer.currentStepId ? `当前 ${viewer.currentStepId}` : '等待',
-              completedSteps: Number(viewer.terminal || 0),
-              totalSteps: Number(viewer.quota || 0),
-              currentStep: typeof viewer.currentStepId === 'string' ? viewer.currentStepId : undefined,
+                id: String(viewer.viewerId || ''),
+                name: String(viewer.viewerName || ''),
+                role: String(viewer.viewerId || ''),
+                status: viewer.currentStepId
+                  ? `当前 ${viewer.currentStepId}`
+                  : '等待',
+                completedSteps: Number(viewer.terminal || 0),
+                totalSteps: Number(viewer.quota || 0),
+                currentStep:
+                  typeof viewer.currentStepId === 'string'
+                    ? viewer.currentStepId
+                    : undefined,
               };
             })
           : [],
         queue: {
           waiting: testItems.filter((item) => item.status === 'pending').length,
-          drafting: testItems.filter((item) => item.status === 'preparing').length,
+          drafting: testItems.filter((item) => item.status === 'preparing')
+            .length,
           ready: testItems.filter((item) => item.status === 'ready').length,
-          speaking: testItems.filter((item) => item.status === 'speaking').length,
+          speaking: testItems.filter((item) => item.status === 'speaking')
+            .length,
         },
-        currentPlayback: raw.currentBroadcast && typeof raw.currentBroadcast === 'object'
-          ? {
-              viewerName: String((raw.currentBroadcast as StressApiRecord).viewerName || ''),
-              stepId: String((raw.currentBroadcast as StressApiRecord).stepId || ''),
-              text: testItems.find((item) => item.eventId === (raw.currentBroadcast as StressApiRecord).eventId)?.preparedReply,
-            }
-          : undefined,
+        currentPlayback:
+          raw.currentBroadcast && typeof raw.currentBroadcast === 'object'
+            ? {
+                viewerName: String(
+                  (raw.currentBroadcast as StressApiRecord).viewerName || '',
+                ),
+                stepId: String(
+                  (raw.currentBroadcast as StressApiRecord).stepId || '',
+                ),
+                text: testItems.find(
+                  (item) =>
+                    item.eventId ===
+                    (raw.currentBroadcast as StressApiRecord).eventId,
+                )?.preparedReply,
+              }
+            : undefined,
         failures: Array.isArray(raw.failures)
           ? raw.failures.map((value, index: number) => {
               const failure = value as StressApiRecord;
               return {
-              id: `${failure.code || 'failure'}-${failure.at || index}`,
-              code: typeof failure.code === 'string' ? failure.code : undefined,
-              stepId: typeof failure.stepId === 'string' ? failure.stepId : undefined,
-              message: String(failure.message || failure.code || 'unknown failure'),
-              at: Number(failure.at || Date.now()),
-              diagnostic:
-                failure.diagnostic && typeof failure.diagnostic === 'object'
-                  ? failure.diagnostic as StressRunState['failures'][number]['diagnostic']
-                  : undefined,
+                id: `${failure.code || 'failure'}-${failure.at || index}`,
+                code:
+                  typeof failure.code === 'string' ? failure.code : undefined,
+                stepId:
+                  typeof failure.stepId === 'string'
+                    ? failure.stepId
+                    : undefined,
+                message: String(
+                  failure.message || failure.code || 'unknown failure',
+                ),
+                at: Number(failure.at || Date.now()),
+                diagnostic:
+                  failure.diagnostic && typeof failure.diagnostic === 'object'
+                    ? (failure.diagnostic as StressRunState['failures'][number]['diagnostic'])
+                    : undefined,
               };
             })
           : [],
@@ -1554,96 +1655,105 @@ export default function App() {
     }
   }, [operatorQueue]);
 
-  const runStressAction = useCallback(async (action: 'diagnose' | 'start' | 'pause' | 'resume' | 'abort' | 'cleanup') => {
-    // Stress injection is initiated by a button, but its first TTS result
-    // arrives after an LLM round trip. Resume Web Audio synchronously while
-    // the click still carries browser user-activation; otherwise a perfectly
-    // valid TTS response can stall until the playback watchdog fires.
-    if (action === 'start') {
-      void unlock().catch(() => undefined);
-    }
-    if (action === 'cleanup') {
-      for (const viewerId of ['stress-viewer-a', 'stress-viewer-b', 'stress-viewer-c']) {
-        liveDirector.removeViewer(viewerId);
-        await streamerMemory.removeViewer(viewerId);
+  const runStressAction = useCallback(
+    async (
+      action: 'diagnose' | 'start' | 'pause' | 'resume' | 'abort' | 'cleanup',
+    ) => {
+      // Stress injection is initiated by a button, but its first TTS result
+      // arrives after an LLM round trip. Resume Web Audio synchronously while
+      // the click still carries browser user-activation; otherwise a perfectly
+      // valid TTS response can stall until the playback watchdog fires.
+      if (action === 'start') {
+        void unlock().catch(() => undefined);
       }
-    }
-    const response = await fetch('/api/stress-test', {
-      method: action === 'start' || action === 'diagnose' ? 'POST' : 'PATCH',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        action,
-        mode: 'live',
-        messageCount: STRESS_TEST_PLAN.messageCount,
-        seed: STRESS_TEST_PLAN.defaultSeed,
-        provisionalOwnerId:
-          action === 'start' || action === 'diagnose'
-            ? runtimeOwnerIdRef.current
-            : undefined,
-        ttsConfigured:
-          (action === 'start' || action === 'diagnose') &&
-          (settingsHook.settings.tts.engine !== 'minimax' ||
-            Boolean(settingsHook.settings.tts.minimaxApiKey?.trim())),
-      }),
-    });
-    if (!response.ok && action === 'cleanup') {
-      await Promise.all(
-        operatorQueue
-          .filter((item) => item.testRunId)
-          .map((item) => updateOperatorQueue(item.eventId, 'delete')),
-      );
-    } else if (!response.ok) {
-      const payload = (await response.json().catch(() => ({}))) as {
-        error?: unknown;
-        diagnostics?: unknown;
-      };
-      const diagnostics = parseStressDiagnostics(payload.diagnostics);
-      setStressRun((previous) => ({
-        ...previous,
-        status: 'failed',
-        diagnostics,
-        failures: [
-          ...previous.failures,
-          ...(diagnostics || [])
-            .filter((check) => check.level === 'error')
-            .map((check, index) => ({
-              id: `diagnostic-${check.code}-${Date.now()}-${index}`,
-              message: `${check.code}: ${check.summary}${check.detail ? ` (${check.detail})` : ''}`,
+      if (action === 'cleanup') {
+        for (const viewerId of [
+          'stress-viewer-a',
+          'stress-viewer-b',
+          'stress-viewer-c',
+        ]) {
+          liveDirector.removeViewer(viewerId);
+          await streamerMemory.removeViewer(viewerId);
+        }
+      }
+      const response = await fetch('/api/stress-test', {
+        method: action === 'start' || action === 'diagnose' ? 'POST' : 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          action,
+          mode: 'live',
+          messageCount: STRESS_TEST_PLAN.messageCount,
+          seed: STRESS_TEST_PLAN.defaultSeed,
+          provisionalOwnerId:
+            action === 'start' || action === 'diagnose'
+              ? runtimeOwnerIdRef.current
+              : undefined,
+          ttsConfigured:
+            (action === 'start' || action === 'diagnose') &&
+            (settingsHook.settings.tts.engine !== 'minimax' ||
+              Boolean(settingsHook.settings.tts.minimaxApiKey?.trim())),
+        }),
+      });
+      if (!response.ok && action === 'cleanup') {
+        await Promise.all(
+          operatorQueue
+            .filter((item) => item.testRunId)
+            .map((item) => updateOperatorQueue(item.eventId, 'delete')),
+        );
+      } else if (!response.ok) {
+        const payload = (await response.json().catch(() => ({}))) as {
+          error?: unknown;
+          diagnostics?: unknown;
+        };
+        const diagnostics = parseStressDiagnostics(payload.diagnostics);
+        setStressRun((previous) => ({
+          ...previous,
+          status: 'failed',
+          diagnostics,
+          failures: [
+            ...previous.failures,
+            ...(diagnostics || [])
+              .filter((check) => check.level === 'error')
+              .map((check, index) => ({
+                id: `diagnostic-${check.code}-${Date.now()}-${index}`,
+                message: `${check.code}: ${check.summary}${check.detail ? ` (${check.detail})` : ''}`,
+                at: Date.now(),
+              })),
+            {
+              id: `start-preflight-${Date.now()}`,
+              message:
+                typeof payload.error === 'string'
+                  ? payload.error
+                  : 'Stress test could not start.',
               at: Date.now(),
-            })),
-          {
-            id: `start-preflight-${Date.now()}`,
-            message:
-              typeof payload.error === 'string'
-                ? payload.error
-                : 'Stress test could not start.',
-            at: Date.now(),
-          },
-        ],
-      }));
-      return;
-    }
-    if (action === 'start') {
-      const result = (await response.json().catch(() => ({}))) as {
-        claimedRuntimeOwner?: unknown;
-      };
-      if (result.claimedRuntimeOwner === true) {
-        setIsTemporaryStressOwner(true);
-        setStressRun((previous) => ({ ...previous, status: 'running' }));
+            },
+          ],
+        }));
+        return;
       }
-    }
-    await refreshOperatorQueue();
-    await refreshStressRun();
-  }, [
-    liveDirector,
-    operatorQueue,
-    refreshOperatorQueue,
-    refreshStressRun,
-    settingsHook.settings.tts.engine,
-    settingsHook.settings.tts.minimaxApiKey,
-    streamerMemory,
-    unlock,
-  ]);
+      if (action === 'start') {
+        const result = (await response.json().catch(() => ({}))) as {
+          claimedRuntimeOwner?: unknown;
+        };
+        if (result.claimedRuntimeOwner === true) {
+          setIsTemporaryStressOwner(true);
+          setStressRun((previous) => ({ ...previous, status: 'running' }));
+        }
+      }
+      await refreshOperatorQueue();
+      await refreshStressRun();
+    },
+    [
+      liveDirector,
+      operatorQueue,
+      refreshOperatorQueue,
+      refreshStressRun,
+      settingsHook.settings.tts.engine,
+      settingsHook.settings.tts.minimaxApiKey,
+      streamerMemory,
+      unlock,
+    ],
+  );
 
   useEffect(() => {
     if (['running', 'paused'].includes(stressRun.status)) return;
@@ -1678,6 +1788,33 @@ export default function App() {
     [emitRuntimeEvent, refreshOperatorQueue],
   );
 
+  const enqueueManualBroadcast = useCallback(
+    async (text: string) => {
+      const preparedReply = text.trim();
+      if (!preparedReply) return;
+      void unlock();
+      markLiveActivity();
+      const now = Date.now();
+      await fetch('/api/operator-queue', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          action: 'manual-broadcast',
+          eventId: crypto.randomUUID(),
+          text: preparedReply,
+          reply: preparedReply,
+          source: 'operator-manual',
+          sourceLabel: '总控手动播报',
+          viewerName: '主播总控',
+          sourcesSeen: ['operator-manual'],
+          createdAt: now,
+        }),
+      });
+      await refreshOperatorQueue();
+    },
+    [markLiveActivity, refreshOperatorQueue, unlock],
+  );
+
   useEffect(() => {
     void refreshOperatorQueue();
     const timer = window.setInterval(() => void refreshOperatorQueue(), 700);
@@ -1696,7 +1833,8 @@ export default function App() {
       !isCoreReady ||
       isProcessing ||
       preparingOperatorTaskRef.current
-    ) return;
+    )
+      return;
     const next = operatorQueue.find(
       (item) =>
         item.status === 'pending' &&
@@ -1737,117 +1875,138 @@ export default function App() {
         let prepared = false;
         let chatAccepted = true;
         try {
-        if (!next.interactionObservedAt && next.viewerId) {
-          const beforeRelationships = liveDirector.getRelationshipSnapshot();
-          liveDirector.observeViewerInteraction({ id: next.viewerId, name: next.viewerName });
-          const afterRelationships = liveDirector.getRelationshipSnapshot();
-          const beforeVisits = beforeRelationships[next.viewerId]?.visits ?? 0;
-          const afterVisits = afterRelationships[next.viewerId]?.visits ?? 0;
-          const otherViewerRelationshipMutated = Object.keys({
-            ...beforeRelationships,
-            ...afterRelationships,
-          }).some(
-            (viewerId) =>
-              viewerId !== next.viewerId &&
-              JSON.stringify(beforeRelationships[viewerId] ?? null) !==
-                JSON.stringify(afterRelationships[viewerId] ?? null),
-          );
-          await updateOperatorQueue(next.eventId, 'mark-observed', {
-            relationshipVisitDelta: afterVisits - beforeVisits,
-            otherViewerRelationshipMutated,
-          });
-        }
-        if (!next.engagementAppliedAt && next.viewerId && next.engagementSignals?.length) {
-          for (const signal of next.engagementSignals) {
-            liveDirector.recordRelationshipSignal({ id: next.viewerId, name: next.viewerName }, signal);
+          if (!next.interactionObservedAt && next.viewerId) {
+            const beforeRelationships = liveDirector.getRelationshipSnapshot();
+            liveDirector.observeViewerInteraction({
+              id: next.viewerId,
+              name: next.viewerName,
+            });
+            const afterRelationships = liveDirector.getRelationshipSnapshot();
+            const beforeVisits =
+              beforeRelationships[next.viewerId]?.visits ?? 0;
+            const afterVisits = afterRelationships[next.viewerId]?.visits ?? 0;
+            const otherViewerRelationshipMutated = Object.keys({
+              ...beforeRelationships,
+              ...afterRelationships,
+            }).some(
+              (viewerId) =>
+                viewerId !== next.viewerId &&
+                JSON.stringify(beforeRelationships[viewerId] ?? null) !==
+                  JSON.stringify(afterRelationships[viewerId] ?? null),
+            );
+            await updateOperatorQueue(next.eventId, 'mark-observed', {
+              relationshipVisitDelta: afterVisits - beforeVisits,
+              otherViewerRelationshipMutated,
+            });
           }
-          await updateOperatorQueue(next.eventId, 'mark-engagement');
-        }
-        if (
-          next.testRunId &&
-          next.faultKind === 'model-truncation' &&
-          !next.faultConsumed
-        ) {
-          emitRuntimeEvent({
-            eventId: next.eventId,
-            testRunId: next.testRunId,
-            stepId: next.stepId,
-            scenarioId: next.scenarioId,
-            stage: 'model-truncated',
-            at: Date.now(),
-            reason: 'injected_test_failure',
-          });
-          await updateOperatorQueue(next.eventId, 'consume-fault');
-          await updateOperatorQueue(next.eventId, 'retry');
-          return;
-        }
-        await refreshOperatorQueue();
-        chatAccepted = (await processWithHostExtensions(next.text, {
-          displayText: next.text,
-          source: 'chat',
-          eventId: next.eventId,
-          sourceLabel: next.sourceLabel || next.source,
-          viewerId: next.viewerId,
-          viewerName: next.viewerName,
-          sourcesSeen: next.sourcesSeen,
-          createdAt: next.createdAt,
-          testRunId: next.testRunId,
-          stepId: next.stepId,
-          scenarioId: next.scenarioId,
-          faultKind: next.faultKind,
-          faultConsumed: next.faultConsumed,
-          memoryContext: streamerMemory.contextFor(next.text, {
-            id: next.viewerId,
-            name: next.viewerName,
-          }),
-          silent: true,
-          onPrepared: (reply, skills) => {
-            prepared = true;
-            if (reply === NO_REPLY_TOKEN) {
-              emitRuntimeEvent({
-                eventId: next.eventId,
-                stage: 'dropped',
-                at: Date.now(),
-                text: next.text,
-                source: next.source,
-                sourceLabel: next.sourceLabel,
-                viewerId: next.viewerId,
-                viewerName: next.viewerName,
-                sourcesSeen: next.sourcesSeen,
-                reason: 'llm_no_reply',
-              });
-              void updateOperatorQueue(next.eventId, 'skip', {
-                reason: 'llm_no_reply',
-              })
-                .then(() => refreshOperatorQueue())
-                .catch(() => undefined);
-              return;
+          if (
+            !next.engagementAppliedAt &&
+            next.viewerId &&
+            next.engagementSignals?.length
+          ) {
+            for (const signal of next.engagementSignals) {
+              liveDirector.recordRelationshipSignal(
+                { id: next.viewerId, name: next.viewerName },
+                signal,
+              );
             }
+            await updateOperatorQueue(next.eventId, 'mark-engagement');
+          }
+          if (
+            next.testRunId &&
+            next.faultKind === 'model-truncation' &&
+            !next.faultConsumed
+          ) {
             emitRuntimeEvent({
               eventId: next.eventId,
-              stage: 'generated',
+              testRunId: next.testRunId,
+              stepId: next.stepId,
+              scenarioId: next.scenarioId,
+              stage: 'model-truncated',
               at: Date.now(),
-              text: next.text,
-              source: next.source,
-              sourceLabel: next.sourceLabel,
+              reason: 'injected_test_failure',
+            });
+            await updateOperatorQueue(next.eventId, 'consume-fault');
+            await updateOperatorQueue(next.eventId, 'retry');
+            return;
+          }
+          await refreshOperatorQueue();
+          chatAccepted =
+            (await processWithHostExtensions(next.text, {
+              displayText: next.text,
+              source: 'chat',
+              eventId: next.eventId,
+              sourceLabel: next.sourceLabel || next.source,
               viewerId: next.viewerId,
               viewerName: next.viewerName,
               sourcesSeen: next.sourcesSeen,
-              preparedReply: reply,
-              skills,
-            });
-            void updateOperatorQueue(next.eventId, 'ready', { reply, skills })
-              .then(() => refreshOperatorQueue())
-              .catch(() => undefined);
-          },
-        })) !== false;
+              createdAt: next.createdAt,
+              testRunId: next.testRunId,
+              stepId: next.stepId,
+              scenarioId: next.scenarioId,
+              faultKind: next.faultKind,
+              faultConsumed: next.faultConsumed,
+              memoryContext: streamerMemory.contextFor(next.text, {
+                id: next.viewerId,
+                name: next.viewerName,
+              }),
+              silent: true,
+              onPrepared: (reply, skills) => {
+                prepared = true;
+                if (reply === NO_REPLY_TOKEN) {
+                  emitRuntimeEvent({
+                    eventId: next.eventId,
+                    stage: 'dropped',
+                    at: Date.now(),
+                    text: next.text,
+                    source: next.source,
+                    sourceLabel: next.sourceLabel,
+                    viewerId: next.viewerId,
+                    viewerName: next.viewerName,
+                    sourcesSeen: next.sourcesSeen,
+                    reason: 'llm_no_reply',
+                  });
+                  void updateOperatorQueue(next.eventId, 'skip', {
+                    reason: 'llm_no_reply',
+                  })
+                    .then(() => refreshOperatorQueue())
+                    .catch(() => undefined);
+                  return;
+                }
+                emitRuntimeEvent({
+                  eventId: next.eventId,
+                  stage: 'generated',
+                  at: Date.now(),
+                  text: next.text,
+                  source: next.source,
+                  sourceLabel: next.sourceLabel,
+                  viewerId: next.viewerId,
+                  viewerName: next.viewerName,
+                  sourcesSeen: next.sourcesSeen,
+                  preparedReply: reply,
+                  skills,
+                });
+                void updateOperatorQueue(next.eventId, 'ready', {
+                  reply,
+                  skills,
+                })
+                  .then(() => refreshOperatorQueue())
+                  .catch(() => undefined);
+              },
+            })) !== false;
         } finally {
           window.clearInterval(leaseTimer);
         }
         if (!prepared) {
-          const response = await fetch('/api/operator-queue', { cache: 'no-store' });
-          const payload = (await response.json()) as { items?: OperatorQueueItem[] };
-          const current = payload.items?.find((item) => item.eventId === next.eventId);
+          const response = await fetch('/api/operator-queue', {
+            cache: 'no-store',
+          });
+          const payload = (await response.json()) as {
+            items?: OperatorQueueItem[];
+          };
+          const current = payload.items?.find(
+            (item) => item.eventId === next.eventId,
+          );
           if (
             current?.status === 'preparing' &&
             current.leaseOwnerId === runtimeOwnerIdRef.current
@@ -1905,7 +2064,8 @@ export default function App() {
       isSpeaking ||
       isProcessing ||
       speakingOperatorTaskRef.current
-    ) return;
+    )
+      return;
     const next = operatorQueue.find(
       (item) =>
         item.status === 'ready' &&
@@ -1914,6 +2074,7 @@ export default function App() {
           item.assignedOwnerId === runtimeOwnerIdRef.current),
     );
     if (!next?.preparedReply) return;
+    const preparedReply = next.preparedReply;
     speakingOperatorTaskRef.current = next.eventId;
     void (async () => {
       let leaseTimer: number | null = null;
@@ -1951,6 +2112,7 @@ export default function App() {
         }
         activeLifecycleRef.current = {
           eventId: next.eventId,
+          replyText: preparedReply,
           channel: next.source,
           label: next.sourceLabel || next.source,
           viewerId: next.viewerId,
@@ -1960,7 +2122,7 @@ export default function App() {
           stepId: next.stepId,
           scenarioId: next.scenarioId,
         };
-        await speakPrepared(next.preparedReply!);
+        await speakPrepared(preparedReply);
       } catch (error) {
         if (operatorSpeechWatchdogRef.current !== null) {
           window.clearTimeout(operatorSpeechWatchdogRef.current);
@@ -2135,40 +2297,10 @@ export default function App() {
         return;
       }
 
-      if (messageKind !== 'narrate') return;
-      if (
-        isProcessing ||
-        isSpeaking ||
-        !liveDirector.isRoomLive() ||
-        now - lastExternalNarrationAtRef.current < 60_000
-      )
-        return;
-
-      lastExternalNarrationAtRef.current = now;
-      const scene = data.scene === 'analysis' ? 'analysis' : 'briefing';
-      const prompt =
-        scene === 'analysis'
-          ? '当前直播画面正在展示专业台风数据。请基于最新可验证资料，用一句话讲清最重要的变化或不确定性；不要罗列全部数字，不要索要关注点赞。'
-          : '当前直播画面正在展示台风总体态势。请基于最新可验证资料，用一句话直接说明观众现在最该知道的结论；不要夸大风险，不要索要关注点赞。';
-      const lifecycle = beginConversationLifecycle({
-        channel: 'parent-narration',
-        label: '父页面自动讲解',
-      });
-      replyLatencyRef.current = {
-        requestId: crypto.randomUUID(),
-        source: 'live',
-        inputAt: now,
-        models: replyModelTrace,
-        input: prompt,
-        eventId: lifecycle.eventId,
-        origin: { channel: 'parent-narration' },
-      };
-      void processWithHostExtensions(prompt, {
-        displayText: '直播版台风自动讲解',
-        source: 'live',
-        eventId: lifecycle.eventId,
-        sourceLabel: lifecycle.label,
-      });
+      // Parent-page narration is intentionally disabled. The avatar reports
+      // typhoon facts only after a real viewer asks, which avoids synthetic
+      // rolling bulletins that make the live room feel staged.
+      return;
     };
     window.addEventListener('message', handleNarrationRequest);
     // The parent must wait for this handshake instead of guessing when HMR or
@@ -2213,8 +2345,10 @@ export default function App() {
           text,
           source: 'external-chat-bridge',
           sourceLabel: '外部聊天桥接',
-          viewerId: typeof data.viewerId === 'string' ? data.viewerId : '001号人类',
-          viewerName: typeof data.viewerName === 'string' ? data.viewerName : '001号人类',
+          viewerId:
+            typeof data.viewerId === 'string' ? data.viewerId : '001号人类',
+          viewerName:
+            typeof data.viewerName === 'string' ? data.viewerName : '001号人类',
         });
         return;
         void unlock();
@@ -2338,9 +2472,10 @@ export default function App() {
         sourcesSeen: options?.sourcesSeen,
       });
       return Promise.resolve();
-      const liveSourceLabel = (options ?? { sourcesSeen: [] }).sourcesSeen?.length
-        // @ts-expect-error legacy direct dispatch below is intentionally unreachable
-        ? `直播弹幕（${options.sourcesSeen.join(' / ')}）`
+      const liveSourceLabel = (options ?? { sourcesSeen: [] }).sourcesSeen
+        ?.length
+        ? // @ts-expect-error legacy direct dispatch below is intentionally unreachable
+          `直播弹幕（${options.sourcesSeen.join(' / ')}）`
         : '直播弹幕';
       markLiveActivity();
       replyLatencyRef.current = {
@@ -2506,7 +2641,7 @@ export default function App() {
         digitalHumanName: runtimeProfile.displayName,
         digitalHumanTitle: runtimeProfile.title,
         isLive: room.isLive,
-        roomEmpty: room.estimatedAudience === 0,
+        audiencePresent: room.estimatedAudience > 0,
         busy:
           isProcessing || isSpeaking || queueDepth > 0 || oldestQueueAgeMs > 0,
         interfaceContext,
@@ -2514,12 +2649,23 @@ export default function App() {
       },
     );
     if (awareness) {
+      const proactiveEventId = `proactive:${crypto.randomUUID()}`;
+      emitRuntimeEvent({
+        eventId: proactiveEventId,
+        stage: 'proactive-selected',
+        at: Date.now(),
+        source: 'quiet-room-awareness',
+        awarenessSource: awareness.source,
+        audiencePresent: room.estimatedAudience > 0,
+        scheduledNextAt: awareness.scheduledNextAt,
+      });
       proactiveSpeechRef.current = true;
       void processChat(awareness.prompt, {
         displayText: `${runtimeProfile.displayName}的空场独白`,
         source: 'live',
         showInput: false,
         persistInteraction: false,
+        eventId: proactiveEventId,
       });
     }
   }, 10_000);
@@ -2615,16 +2761,13 @@ export default function App() {
   const handleLiveRoomStatus = useCallback(
     (status: LiveRoomStatus) => {
       liveDirector.updateRoomState(status);
-      if ((status.onlineCount || 0) > 0) {
-        markLiveActivity();
-      }
       if (status.state === 'online') {
         setStreamErrorMessage('');
       } else if (status.state === 'error') {
         setStreamErrorMessage(status.error || 'B 站直播间守护脚本正在重连。');
       }
     },
-    [liveDirector, markLiveActivity],
+    [liveDirector],
   );
 
   const handleBackgroundImageChange = useCallback((file: File | null) => {
@@ -2939,13 +3082,19 @@ export default function App() {
           onAbortStressTest={() => runStressAction('abort')}
           onCleanupStressTest={() => runStressAction('cleanup')}
           onDeleteQueueItem={(eventId) => {
-            void updateOperatorQueue(eventId, 'delete').then(() => refreshOperatorQueue());
+            void updateOperatorQueue(eventId, 'delete').then(() =>
+              refreshOperatorQueue(),
+            );
           }}
           onMoveQueueItem={(eventId, order) => {
-            void updateOperatorQueue(eventId, 'move', { order }).then(() => refreshOperatorQueue());
+            void updateOperatorQueue(eventId, 'move', { order }).then(() =>
+              refreshOperatorQueue(),
+            );
           }}
           onEditQueueReply={(eventId, reply) => {
-            void updateOperatorQueue(eventId, 'edit-reply', { reply }).then(() => refreshOperatorQueue());
+            void updateOperatorQueue(eventId, 'edit-reply', { reply }).then(
+              () => refreshOperatorQueue(),
+            );
           }}
           settings={settingsHook.settings}
           avatarPackage={avatarPackage}
@@ -2955,6 +3104,9 @@ export default function App() {
           avatarViewTransform={avatarViewTransform}
           onAvatarViewTransformChange={settingsHook.updateVisualAvatarView}
           onSend={handleSend}
+          onBroadcast={(text) => {
+            void enqueueManualBroadcast(text);
+          }}
           onStop={() => {
             stop();
             resetAvatarReaction();

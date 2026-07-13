@@ -307,6 +307,7 @@ export function SettingsPanel({
   updateTwitchEnabled,
   updateTwitchCommentIntervalMs,
   updateBilibiliEnabled,
+  updateBilibiliReplyEnabled,
   updateCustomSseEndpoint,
   updateCustomSseEnabled,
   updateCommentIntelligenceEnabled,
@@ -2482,6 +2483,7 @@ export function SettingsPanel({
         updateTwitchEnabled={updateTwitchEnabled}
         updateTwitchCommentIntervalMs={updateTwitchCommentIntervalMs}
         updateBilibiliEnabled={updateBilibiliEnabled}
+        updateBilibiliReplyEnabled={updateBilibiliReplyEnabled}
         updateCustomSseEndpoint={updateCustomSseEndpoint}
         updateCustomSseEnabled={updateCustomSseEnabled}
         updateCommentIntelligenceEnabled={updateCommentIntelligenceEnabled}

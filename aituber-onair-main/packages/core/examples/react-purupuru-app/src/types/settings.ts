@@ -144,6 +144,7 @@ export interface StreamSettings {
   twitchEnabled: boolean;
   twitchCommentIntervalMs: number;
   bilibiliEnabled: boolean;
+  bilibiliReplyEnabled: boolean;
   customSseEndpoint: string;
   customSseEnabled: boolean;
 }
@@ -185,6 +186,7 @@ export interface EmptyRoomAwarenessSettings {
   interfaceWeight: number;
   memoryWeight: number;
   inspirationWeight: number;
+  audienceWeight: number;
 }
 
 export interface VisualSettings {

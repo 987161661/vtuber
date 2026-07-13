@@ -31,7 +31,11 @@ const LIVE_RUNTIME_LOG_PATH = join(
   'logs',
   'linglan-live-runtime-events.jsonl',
 );
-const OPERATOR_QUEUE_PATH = join(APP_ROOT, 'logs', 'linglan-operator-queue.json');
+const OPERATOR_QUEUE_PATH = join(
+  APP_ROOT,
+  'logs',
+  'linglan-operator-queue.json',
+);
 const REPLY_LATENCY_LOG_PATH = join(
   WORKSPACE_ROOT,
   '.runtime',
@@ -47,7 +51,13 @@ const pendingTtsUpdates = new Map<
 let historyMutationQueue: Promise<void> = Promise.resolve();
 const externalChatQueue = new Map<
   string,
-  { requestId: string; text: string; requestedAt: number; viewerId?: string; viewerName?: string }
+  {
+    requestId: string;
+    text: string;
+    requestedAt: number;
+    viewerId?: string;
+    viewerName?: string;
+  }
 >();
 
 type OperatorQueueStatus =
@@ -203,7 +213,8 @@ async function collectStressDiagnostics(): Promise<StressDiagnosticSnapshot> {
       level: 'error',
       code: 'runtime_owner_missing',
       summary: 'No live runtime owner heartbeat was received.',
-      detail: 'Open or refresh the overlay/runtime page that actually plays audio, then retry.',
+      detail:
+        'Open or refresh the overlay/runtime page that actually plays audio, then retry.',
     });
   } else if (!owner.available) {
     checks.push({
@@ -234,32 +245,40 @@ async function collectStressDiagnostics(): Promise<StressDiagnosticSnapshot> {
       id: 'tts-provider',
       level: 'error',
       code: 'minimax_key_missing',
-      summary: 'MiniMax is selected but no API key is present in runtime settings.',
-      detail: 'Enter the key in the Settings UI used by the active runtime owner.',
+      summary:
+        'MiniMax is selected but no API key is present in runtime settings.',
+      detail:
+        'Enter the key in the Settings UI used by the active runtime owner.',
     });
   } else if (owner.active && !owner.ttsConfigured) {
     checks.push({
       id: 'tts-provider',
       level: 'error',
       code: 'owner_tts_config_mismatch',
-      summary: 'The server has a MiniMax key, but the active runtime owner reports TTS unconfigured.',
-      detail: 'Refresh the audio-playing runtime page so it synchronizes its local settings.',
+      summary:
+        'The server has a MiniMax key, but the active runtime owner reports TTS unconfigured.',
+      detail:
+        'Refresh the audio-playing runtime page so it synchronizes its local settings.',
     });
   } else {
     try {
       const parsed = JSON.parse(runtimeSettings || '{}') as {
         tts?: { minimaxApiKey?: unknown };
       };
-      const key = typeof parsed.tts?.minimaxApiKey === 'string'
-        ? parsed.tts.minimaxApiKey.trim()
-        : '';
+      const key =
+        typeof parsed.tts?.minimaxApiKey === 'string'
+          ? parsed.tts.minimaxApiKey.trim()
+          : '';
       const response = await fetch('https://api.minimaxi.com/v1/get_voice', {
         method: 'POST',
-        headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' },
+        headers: {
+          Authorization: `Bearer ${key}`,
+          'Content-Type': 'application/json',
+        },
         body: JSON.stringify({ voice_type: 'system' }),
         signal: AbortSignal.timeout(8_000),
       });
-      const payload = await response.json().catch(() => ({})) as {
+      const payload = (await response.json().catch(() => ({}))) as {
         base_resp?: { status_code?: unknown; status_msg?: unknown };
       };
       const providerStatus = Number(payload.base_resp?.status_code ?? 0);
@@ -275,82 +294,98 @@ async function collectStressDiagnostics(): Promise<StressDiagnosticSnapshot> {
         // a revoked entitlement, bad voice id, or endpoint mismatch is shown
         // before a long stress run turns it into a generic playback timeout.
         try {
-        const synthesis = await fetch('https://api.minimaxi.com/v1/t2a_v2', {
-          method: 'POST',
-          headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            model: 'speech-2.8-turbo',
-            text: '语音链路诊断。',
-            stream: false,
-            voice_setting: {
-              voice_id: tts.speaker,
-              speed: 1,
-              vol: 1,
-              pitch: 0,
-              emotion: 'neutral',
+          const synthesis = await fetch('https://api.minimaxi.com/v1/t2a_v2', {
+            method: 'POST',
+            headers: {
+              Authorization: `Bearer ${key}`,
+              'Content-Type': 'application/json',
             },
-            audio_setting: {
-              sample_rate: 44100,
-              bitrate: 128000,
-              format: 'mp3',
-              channel: 1,
-            },
-            language_boost: 'Chinese',
-          }),
-          signal: AbortSignal.timeout(12_000),
-        });
-        const synthesisPayload = await synthesis.json().catch(() => ({})) as {
-          base_resp?: { status_code?: unknown; status_msg?: unknown };
-          data?: { audio?: unknown };
-        };
-        const synthesisStatus = Number(synthesisPayload.base_resp?.status_code ?? 0);
-        const audio = synthesisPayload.data?.audio;
-        if (
-          synthesis.ok &&
-          synthesisStatus === 0 &&
-          typeof audio === 'string' &&
-          audio.length > 0
-        ) {
-          checks.push({
-            id: 'tts-synthesis',
-            level: 'pass',
-            code: 'minimax_tts_smoke_passed',
-            summary: 'Configured MiniMax voice synthesized a non-empty MP3 response.',
+            body: JSON.stringify({
+              model: 'speech-2.8-turbo',
+              text: '语音链路诊断。',
+              stream: false,
+              voice_setting: {
+                voice_id: tts.speaker,
+                speed: 1,
+                vol: 1,
+                pitch: 0,
+                emotion: 'neutral',
+              },
+              audio_setting: {
+                sample_rate: 44100,
+                bitrate: 128000,
+                format: 'mp3',
+                channel: 1,
+              },
+              language_boost: 'Chinese',
+            }),
+            signal: AbortSignal.timeout(12_000),
           });
-        } else {
-          checks.push({
-            id: 'tts-synthesis',
-            level: 'error',
-            code: synthesis.status === 429 ? 'minimax_tts_rate_limited' : 'minimax_tts_smoke_failed',
-            summary: `MiniMax accepted the key but the configured voice could not synthesize (HTTP ${synthesis.status}).`,
-            detail: typeof synthesisPayload.base_resp?.status_msg === 'string'
-              ? synthesisPayload.base_resp.status_msg.slice(0, 180)
-              : 'The response did not contain audio data.',
-          });
-        }
+          const synthesisPayload = (await synthesis
+            .json()
+            .catch(() => ({}))) as {
+            base_resp?: { status_code?: unknown; status_msg?: unknown };
+            data?: { audio?: unknown };
+          };
+          const synthesisStatus = Number(
+            synthesisPayload.base_resp?.status_code ?? 0,
+          );
+          const audio = synthesisPayload.data?.audio;
+          if (
+            synthesis.ok &&
+            synthesisStatus === 0 &&
+            typeof audio === 'string' &&
+            audio.length > 0
+          ) {
+            checks.push({
+              id: 'tts-synthesis',
+              level: 'pass',
+              code: 'minimax_tts_smoke_passed',
+              summary:
+                'Configured MiniMax voice synthesized a non-empty MP3 response.',
+            });
+          } else {
+            checks.push({
+              id: 'tts-synthesis',
+              level: 'error',
+              code:
+                synthesis.status === 429
+                  ? 'minimax_tts_rate_limited'
+                  : 'minimax_tts_smoke_failed',
+              summary: `MiniMax accepted the key but the configured voice could not synthesize (HTTP ${synthesis.status}).`,
+              detail:
+                typeof synthesisPayload.base_resp?.status_msg === 'string'
+                  ? synthesisPayload.base_resp.status_msg.slice(0, 180)
+                  : 'The response did not contain audio data.',
+            });
+          }
         } catch (error) {
           checks.push({
             id: 'tts-synthesis',
             level: 'error',
             code: 'minimax_tts_smoke_unreachable',
-            summary: 'MiniMax authentication succeeded but the TTS synthesis probe could not complete.',
-            detail: error instanceof Error ? error.message.slice(0, 180) : undefined,
+            summary:
+              'MiniMax authentication succeeded but the TTS synthesis probe could not complete.',
+            detail:
+              error instanceof Error ? error.message.slice(0, 180) : undefined,
           });
         }
       } else {
-        const code = response.status === 401 || response.status === 403
-          ? 'minimax_auth_rejected'
-          : response.status === 429
-            ? 'minimax_rate_limited'
-            : 'minimax_provider_rejected';
+        const code =
+          response.status === 401 || response.status === 403
+            ? 'minimax_auth_rejected'
+            : response.status === 429
+              ? 'minimax_rate_limited'
+              : 'minimax_provider_rejected';
         checks.push({
           id: 'tts-provider',
           level: 'error',
           code,
           summary: `MiniMax voice API rejected the credential/request (HTTP ${response.status}).`,
-          detail: typeof payload.base_resp?.status_msg === 'string'
-            ? payload.base_resp.status_msg.slice(0, 180)
-            : undefined,
+          detail:
+            typeof payload.base_resp?.status_msg === 'string'
+              ? payload.base_resp.status_msg.slice(0, 180)
+              : undefined,
         });
       }
     } catch (error) {
@@ -359,7 +394,8 @@ async function collectStressDiagnostics(): Promise<StressDiagnosticSnapshot> {
         level: 'error',
         code: 'minimax_probe_unreachable',
         summary: 'MiniMax credential probe could not reach the provider.',
-        detail: error instanceof Error ? error.message.slice(0, 180) : undefined,
+        detail:
+          error instanceof Error ? error.message.slice(0, 180) : undefined,
       });
     }
   }
@@ -405,13 +441,16 @@ function releaseExpiredOperatorLeases(now = Date.now()): boolean {
 
 async function restoreOperatorQueue() {
   try {
-    const saved = JSON.parse(await readFile(OPERATOR_QUEUE_PATH, 'utf8')) as OperatorQueueItem[];
+    const saved = JSON.parse(
+      await readFile(OPERATOR_QUEUE_PATH, 'utf8'),
+    ) as OperatorQueueItem[];
     if (!Array.isArray(saved)) return;
     for (const item of saved) {
       if (!item?.eventId || item.status === 'deleted') continue;
       // Browser audio cannot survive a local Vite restart. Requeue any
       // in-flight work instead of leaving the scheduler permanently locked.
-      if (item.status === 'speaking') item.status = item.preparedReply ? 'ready' : 'pending';
+      if (item.status === 'speaking')
+        item.status = item.preparedReply ? 'ready' : 'pending';
       if (item.status === 'preparing') item.status = 'pending';
       operatorQueue.set(item.eventId, item);
     }
@@ -423,14 +462,21 @@ async function restoreOperatorQueue() {
 
 async function persistOperatorQueue() {
   await mkdir(dirname(OPERATOR_QUEUE_PATH), { recursive: true });
-  await writeFile(OPERATOR_QUEUE_PATH, JSON.stringify(operatorQueueSnapshot()), 'utf8');
+  await writeFile(
+    OPERATOR_QUEUE_PATH,
+    JSON.stringify(operatorQueueSnapshot()),
+    'utf8',
+  );
 }
 
 function operatorQueueSnapshot() {
   releaseExpiredOperatorLeases();
   return [...operatorQueue.values()]
     .filter((item) => item.status !== 'deleted')
-    .sort((left, right) => left.order - right.order || left.createdAt - right.createdAt);
+    .sort(
+      (left, right) =>
+        left.order - right.order || left.createdAt - right.createdAt,
+    );
 }
 
 function normalizeOperatorQueueOrder() {
@@ -454,8 +500,8 @@ function ingestStressQueueItem(message: StressIngestMessage) {
     retryCount: 0,
     beatCount: 0,
     completedBeatCount: 0,
-      engagementSignals: message.engagementSignals?.map((signal) => signal.kind),
-      assignedOwnerId: message.assignedOwnerId,
+    engagementSignals: message.engagementSignals?.map((signal) => signal.kind),
+    assignedOwnerId: message.assignedOwnerId,
   });
   void persistOperatorQueue();
 }
@@ -476,14 +522,24 @@ const stressTestController = createStressTestController(
       await withHistoryMutation(async () => {
         try {
           const raw = await readFile(CONVERSATION_LOG_PATH, 'utf8');
-          const kept = raw.split(/\r?\n/).filter(Boolean).filter((line) => {
-            try {
-              return (JSON.parse(line) as { testRunId?: string }).testRunId !== testRunId;
-            } catch {
-              return true;
-            }
-          });
-          await writeFile(CONVERSATION_LOG_PATH, kept.length ? `${kept.join('\n')}\n` : '', 'utf8');
+          const kept = raw
+            .split(/\r?\n/)
+            .filter(Boolean)
+            .filter((line) => {
+              try {
+                return (
+                  (JSON.parse(line) as { testRunId?: string }).testRunId !==
+                  testRunId
+                );
+              } catch {
+                return true;
+              }
+            });
+          await writeFile(
+            CONVERSATION_LOG_PATH,
+            kept.length ? `${kept.join('\n')}\n` : '',
+            'utf8',
+          );
         } catch {
           // No production history exists yet.
         }
@@ -669,7 +725,10 @@ function conversationHistoryPlugin(): Plugin {
                 // only messages that happened to receive an answer.
                 const cutoff = Number(requestUrl.searchParams.get('before'));
                 const liveSession = operatorQueueSnapshot()
-                  .filter((item) => !Number.isFinite(cutoff) || item.createdAt <= cutoff)
+                  .filter(
+                    (item) =>
+                      !Number.isFinite(cutoff) || item.createdAt <= cutoff,
+                  )
                   .map((item) => ({
                     eventId: item.eventId,
                     at: item.createdAt,
@@ -839,9 +898,18 @@ function conversationHistoryPlugin(): Plugin {
                     .slice(0, 10)
                 : [],
               replyAt: finiteTimestamp(value.replyAt) ?? Date.now(),
-              testRunId: typeof value.testRunId === 'string' ? value.testRunId.slice(0, 200) : undefined,
-              stepId: typeof value.stepId === 'string' ? value.stepId.slice(0, 100) : undefined,
-              scenarioId: typeof value.scenarioId === 'string' ? value.scenarioId.slice(0, 200) : undefined,
+              testRunId:
+                typeof value.testRunId === 'string'
+                  ? value.testRunId.slice(0, 200)
+                  : undefined,
+              stepId:
+                typeof value.stepId === 'string'
+                  ? value.stepId.slice(0, 100)
+                  : undefined,
+              scenarioId:
+                typeof value.scenarioId === 'string'
+                  ? value.scenarioId.slice(0, 200)
+                  : undefined,
             };
             await mkdir(join(CONVERSATION_LOG_PATH, '..'), { recursive: true });
             await withHistoryMutation(() =>
@@ -903,7 +971,11 @@ function runtimeSettingsPlugin(): Plugin {
           try {
             const raw = Buffer.concat(chunks).toString('utf8');
             const next = JSON.parse(raw) as {
-              tts?: { speaker?: unknown; minimaxApiKey?: unknown; minimaxGroupId?: unknown };
+              tts?: {
+                speaker?: unknown;
+                minimaxApiKey?: unknown;
+                minimaxGroupId?: unknown;
+              };
               digitalHumans?: {
                 activeId?: unknown;
                 profiles?: Array<{ id?: unknown; voiceSpeaker?: unknown }>;
@@ -963,11 +1035,13 @@ function runtimeSettingsPlugin(): Plugin {
                 ? error.message.slice(0, 160)
                 : 'unknown_settings_error';
             res.statusCode = 400;
-            res.end(JSON.stringify({
-              error: 'invalid_settings',
-              stage: 'runtime_settings_parse_or_normalize',
-              reason,
-            }));
+            res.end(
+              JSON.stringify({
+                error: 'invalid_settings',
+                stage: 'runtime_settings_parse_or_normalize',
+                reason,
+              }),
+            );
           }
         });
       });
@@ -1001,10 +1075,13 @@ function minimaxAudioBridgePlugin(): Plugin {
         req.on('end', async () => {
           try {
             if (size > 64 * 1024) throw new Error('tts_request_too_large');
-            const request = JSON.parse(Buffer.concat(chunks).toString('utf8')) as {
+            const request = JSON.parse(
+              Buffer.concat(chunks).toString('utf8'),
+            ) as {
               text?: unknown;
             };
-            const text = typeof request.text === 'string' ? request.text.trim() : '';
+            const text =
+              typeof request.text === 'string' ? request.text.trim() : '';
             if (!text) throw new Error('tts_text_missing');
             const settings = JSON.parse(runtimeSettings || '{}') as {
               tts?: { minimaxApiKey?: unknown; speaker?: unknown };
@@ -1014,7 +1091,8 @@ function minimaxAudioBridgePlugin(): Plugin {
                 ? settings.tts.minimaxApiKey.trim()
                 : '';
             const speaker =
-              typeof settings.tts?.speaker === 'string' && settings.tts.speaker.trim()
+              typeof settings.tts?.speaker === 'string' &&
+              settings.tts.speaker.trim()
                 ? settings.tts.speaker.trim()
                 : 'Chinese (Mandarin)_Wise_Women';
             if (!apiKey) throw new Error('minimax_key_missing');
@@ -1028,8 +1106,19 @@ function minimaxAudioBridgePlugin(): Plugin {
                 model: 'speech-2.8-turbo',
                 text,
                 stream: false,
-                voice_setting: { voice_id: speaker, speed: 1, vol: 1, pitch: 0, emotion: 'neutral' },
-                audio_setting: { sample_rate: 44100, bitrate: 128000, format: 'mp3', channel: 1 },
+                voice_setting: {
+                  voice_id: speaker,
+                  speed: 1,
+                  vol: 1,
+                  pitch: 0,
+                  emotion: 'neutral',
+                },
+                audio_setting: {
+                  sample_rate: 44100,
+                  bitrate: 128000,
+                  format: 'mp3',
+                  channel: 1,
+                },
                 language_boost: 'Chinese',
               }),
             });
@@ -1037,7 +1126,11 @@ function minimaxAudioBridgePlugin(): Plugin {
               base_resp?: { status_code?: number; status_msg?: string };
               data?: { audio?: string };
             };
-            if (!upstream.ok || payload.base_resp?.status_code || !payload.data?.audio) {
+            if (
+              !upstream.ok ||
+              payload.base_resp?.status_code ||
+              !payload.data?.audio
+            ) {
               throw new Error(
                 `minimax_synthesis_failed:${payload.base_resp?.status_code ?? upstream.status}`,
               );
@@ -1051,9 +1144,14 @@ function minimaxAudioBridgePlugin(): Plugin {
           } catch (error) {
             res.statusCode = 502;
             res.setHeader('Content-Type', 'application/json; charset=utf-8');
-            res.end(JSON.stringify({
-              error: error instanceof Error ? error.message.slice(0, 160) : 'minimax_audio_bridge_failed',
-            }));
+            res.end(
+              JSON.stringify({
+                error:
+                  error instanceof Error
+                    ? error.message.slice(0, 160)
+                    : 'minimax_audio_bridge_failed',
+              }),
+            );
           }
         });
       });
@@ -1087,7 +1185,10 @@ function stressTestPlugin(): Plugin {
         req.on('end', async () => {
           try {
             const body = chunks.length
-              ? (JSON.parse(Buffer.concat(chunks).toString('utf8')) as Record<string, unknown>)
+              ? (JSON.parse(Buffer.concat(chunks).toString('utf8')) as Record<
+                  string,
+                  unknown
+                >)
               : {};
             const action = String(body.action || 'start');
             let ownerAvailability = runtimeOwnerAvailability();
@@ -1159,11 +1260,20 @@ function stressTestPlugin(): Plugin {
                       ? await stressTestController.abort()
                       : action === 'cleanup'
                         ? await stressTestController.cleanup()
-                        : (() => { throw new Error('invalid stress action'); })();
+                        : (() => {
+                            throw new Error('invalid stress action');
+                          })();
             res.end(JSON.stringify({ ...result, claimedRuntimeOwner }));
           } catch (error) {
             res.statusCode = 400;
-            res.end(JSON.stringify({ error: error instanceof Error ? error.message : 'stress action failed' }));
+            res.end(
+              JSON.stringify({
+                error:
+                  error instanceof Error
+                    ? error.message
+                    : 'stress action failed',
+              }),
+            );
           }
         });
       });
@@ -1204,7 +1314,11 @@ function liveRuntimeMonitorPlugin(): Plugin {
           ['pending', 'preparing', 'ready', 'speaking'].includes(item.status),
         );
         const authoritativeOldestAge = authoritativeQueue.length
-          ? Math.max(0, now - Math.min(...authoritativeQueue.map((item) => item.createdAt)))
+          ? Math.max(
+              0,
+              now -
+                Math.min(...authoritativeQueue.map((item) => item.createdAt)),
+            )
           : 0;
         const oldestQueueAgeMs = Math.max(
           measuredOldestAge,
@@ -1306,8 +1420,14 @@ function liveRuntimeMonitorPlugin(): Plugin {
                 requestId,
                 text,
                 requestedAt: finiteTimestamp(value.requestedAt) ?? Date.now(),
-                viewerId: typeof value.viewerId === 'string' ? value.viewerId : undefined,
-                viewerName: typeof value.viewerName === 'string' ? value.viewerName : undefined,
+                viewerId:
+                  typeof value.viewerId === 'string'
+                    ? value.viewerId
+                    : undefined,
+                viewerName:
+                  typeof value.viewerName === 'string'
+                    ? value.viewerName
+                    : undefined,
               });
             }
             res.statusCode = 202;
@@ -1343,35 +1463,65 @@ function liveRuntimeMonitorPlugin(): Plugin {
         req.on('data', (chunk: Buffer) => chunks.push(chunk));
         req.on('end', () => {
           try {
-            const body = JSON.parse(Buffer.concat(chunks).toString('utf8')) as Record<string, unknown>;
-            const action = String(body.action || (req.method === 'POST' ? 'ingest' : '')).trim();
+            const body = JSON.parse(
+              Buffer.concat(chunks).toString('utf8'),
+            ) as Record<string, unknown>;
+            const action = String(
+              body.action || (req.method === 'POST' ? 'ingest' : ''),
+            ).trim();
             const now = Date.now();
-            if (action === 'ingest') {
+            if (action === 'ingest' || action === 'manual-broadcast') {
               const eventId = String(body.eventId || '').trim();
-              const text = typeof body.text === 'string' ? body.text.trim() : '';
-              if (!eventId || !text || text.length > 1000) throw new Error('invalid queue item');
+              const text =
+                typeof body.text === 'string' ? body.text.trim() : '';
+              if (!eventId || !text || text.length > 1000)
+                throw new Error('invalid queue item');
+              const manualReply =
+                action === 'manual-broadcast' && typeof body.reply === 'string'
+                  ? body.reply.trim()
+                  : '';
+              if (action === 'manual-broadcast' && !manualReply) {
+                throw new Error('manual broadcast text is required');
+              }
               const existing = operatorQueue.get(eventId);
               if (!existing) {
-                const viewerId = typeof body.viewerId === 'string' ? body.viewerId : undefined;
-                const normalizedText = text.normalize('NFKC').replace(/\s+/g, ' ').trim().toLowerCase();
+                const viewerId =
+                  typeof body.viewerId === 'string' ? body.viewerId : undefined;
+                const normalizedText = text
+                  .normalize('NFKC')
+                  .replace(/\s+/g, ' ')
+                  .trim()
+                  .toLowerCase();
                 const repeatedByViewer = Boolean(
                   viewerId &&
                     operatorQueueSnapshot().some(
                       (item) =>
                         item.viewerId === viewerId &&
                         now - item.createdAt <= 15_000 &&
-                        item.text.normalize('NFKC').replace(/\s+/g, ' ').trim().toLowerCase() === normalizedText,
+                        item.text
+                          .normalize('NFKC')
+                          .replace(/\s+/g, ' ')
+                          .trim()
+                          .toLowerCase() === normalizedText,
                     ),
                 );
                 operatorQueue.set(eventId, {
                   eventId,
                   text,
                   source: String(body.source || 'external-chat'),
-                  sourceLabel: typeof body.sourceLabel === 'string' ? body.sourceLabel : undefined,
+                  sourceLabel:
+                    typeof body.sourceLabel === 'string'
+                      ? body.sourceLabel
+                      : undefined,
                   viewerId,
-                  viewerName: typeof body.viewerName === 'string' ? body.viewerName : undefined,
+                  viewerName:
+                    typeof body.viewerName === 'string'
+                      ? body.viewerName
+                      : undefined,
                   sourcesSeen: Array.isArray(body.sourcesSeen)
-                    ? body.sourcesSeen.filter((item): item is string => typeof item === 'string')
+                    ? body.sourcesSeen.filter(
+                        (item): item is string => typeof item === 'string',
+                      )
                     : [],
                   createdAt: finiteTimestamp(body.createdAt) ?? now,
                   updatedAt: now,
@@ -1379,22 +1529,66 @@ function liveRuntimeMonitorPlugin(): Plugin {
                   // Exact repeat from the same viewer is an emphasis candidate,
                   // not a second answer. Keep it visible in grey for the
                   // operator and leave semantic non-repeats to LLM judgment.
-                  status: repeatedByViewer ? 'skipped' : 'pending',
+                  status: manualReply
+                    ? 'ready'
+                    : repeatedByViewer
+                      ? 'skipped'
+                      : 'pending',
                   skipReason: repeatedByViewer ? 'duplicate_text' : undefined,
+                  preparedReply: manualReply || undefined,
+                  preparedAt: manualReply ? now : undefined,
                   skills: [],
-                  testRunId: typeof body.testRunId === 'string' ? body.testRunId : undefined,
-                  stepId: typeof body.stepId === 'string' ? body.stepId : undefined,
-                  scenarioId: typeof body.scenarioId === 'string' ? body.scenarioId : undefined,
+                  testRunId:
+                    typeof body.testRunId === 'string'
+                      ? body.testRunId
+                      : undefined,
+                  stepId:
+                    typeof body.stepId === 'string' ? body.stepId : undefined,
+                  scenarioId:
+                    typeof body.scenarioId === 'string'
+                      ? body.scenarioId
+                      : undefined,
                   retryCount: 0,
-                  beatCount: 0,
+                  beatCount: manualReply
+                    ? Math.max(
+                        1,
+                        manualReply
+                          .split(/(?<=[。！？!?])/u)
+                          .filter((part) => part.trim()).length,
+                      )
+                    : 0,
                   completedBeatCount: 0,
+                  replyHash: manualReply
+                    ? createHash('sha256')
+                        .update(manualReply)
+                        .digest('hex')
+                        .slice(0, 16)
+                    : undefined,
                   faultKind:
-                    body.testRunId && ['typhoon-skill-timeout', 'model-truncation', 'tts-first-beat-failure', 'prepare-lease-expiry'].includes(String(body.faultKind))
-                      ? body.faultKind as OperatorQueueItem['faultKind']
+                    body.testRunId &&
+                    [
+                      'typhoon-skill-timeout',
+                      'model-truncation',
+                      'tts-first-beat-failure',
+                      'prepare-lease-expiry',
+                    ].includes(String(body.faultKind))
+                      ? (body.faultKind as OperatorQueueItem['faultKind'])
                       : undefined,
                   engagementSignals: Array.isArray(body.engagementSignals)
-                    ? body.engagementSignals.filter((signal): signal is NonNullable<OperatorQueueItem['engagementSignals']>[number] =>
-                        ['follow', 'like', 'gift', 'superchat', 'guard'].includes(String(signal)))
+                    ? body.engagementSignals.filter(
+                        (
+                          signal,
+                        ): signal is NonNullable<
+                          OperatorQueueItem['engagementSignals']
+                        >[number] =>
+                          [
+                            'follow',
+                            'like',
+                            'gift',
+                            'superchat',
+                            'guard',
+                          ].includes(String(signal)),
+                      )
                     : undefined,
                 });
               }
@@ -1406,12 +1600,28 @@ function liveRuntimeMonitorPlugin(): Plugin {
                 item.status = 'deleted';
               } else if (action === 'move') {
                 const target = Number(body.order);
-                const visible = operatorQueueSnapshot().filter((entry) => entry.eventId !== eventId);
-                visible.splice(Math.max(0, Math.min(visible.length, Number.isFinite(target) ? target : visible.length)), 0, item);
-                visible.forEach((entry, index) => { entry.order = index; });
+                const visible = operatorQueueSnapshot().filter(
+                  (entry) => entry.eventId !== eventId,
+                );
+                visible.splice(
+                  Math.max(
+                    0,
+                    Math.min(
+                      visible.length,
+                      Number.isFinite(target) ? target : visible.length,
+                    ),
+                  ),
+                  0,
+                  item,
+                );
+                visible.forEach((entry, index) => {
+                  entry.order = index;
+                });
               } else if (action === 'edit-reply') {
-                const reply = typeof body.reply === 'string' ? body.reply.trim() : '';
-                if (!reply || reply.length > 3000) throw new Error('invalid prepared reply');
+                const reply =
+                  typeof body.reply === 'string' ? body.reply.trim() : '';
+                if (!reply || reply.length > 3000)
+                  throw new Error('invalid prepared reply');
                 item.preparedReply = reply;
                 item.status = 'ready';
               } else if (action === 'skip') {
@@ -1437,12 +1647,15 @@ function liveRuntimeMonitorPlugin(): Plugin {
                     typeof body.reason === 'string'
                       ? body.reason
                       : 'retry_limit_exceeded';
-                } else if (['preparing', 'speaking', 'ready'].includes(item.status)) {
+                } else if (
+                  ['preparing', 'speaking', 'ready'].includes(item.status)
+                ) {
                   item.status = item.preparedReply ? 'ready' : 'pending';
                 }
               } else if (action === 'mark-observed') {
                 item.interactionObservedAt = now;
-                item.relationshipVisitDelta = Number(body.relationshipVisitDelta) || 0;
+                item.relationshipVisitDelta =
+                  Number(body.relationshipVisitDelta) || 0;
                 item.otherViewerRelationshipMutated = Boolean(
                   body.otherViewerRelationshipMutated,
                 );
@@ -1453,23 +1666,36 @@ function liveRuntimeMonitorPlugin(): Plugin {
                 item.faultConsumed = true;
               } else if (action === 'beat-progress') {
                 const replaceBeatPlan = body.replaceBeatPlan === true;
-                const reportedBeatCount = Math.max(1, Number(body.beatCount) || 0);
-                const reportedCompletedBeats = Math.max(0, Number(body.completedBeatCount) || 0);
+                const reportedBeatCount = Math.max(
+                  1,
+                  Number(body.beatCount) || 0,
+                );
+                const reportedCompletedBeats = Math.max(
+                  0,
+                  Number(body.completedBeatCount) || 0,
+                );
                 item.beatCount = replaceBeatPlan
                   ? reportedBeatCount
                   : Math.max(item.beatCount || 0, reportedBeatCount);
                 item.completedBeatCount = replaceBeatPlan
                   ? Math.min(reportedCompletedBeats, item.beatCount)
-                  : Math.max(item.completedBeatCount || 0, reportedCompletedBeats);
+                  : Math.max(
+                      item.completedBeatCount || 0,
+                      reportedCompletedBeats,
+                    );
                 item.audioByteLength =
-                  (item.audioByteLength || 0) + Math.max(0, Number(body.byteLength) || 0);
+                  (item.audioByteLength || 0) +
+                  Math.max(0, Number(body.byteLength) || 0);
               } else if (action === 'claim-prepare') {
                 releaseExpiredOperatorLeases(now);
-                if (item.status !== 'pending') throw new Error('queue item is not pending');
+                if (item.status !== 'pending')
+                  throw new Error('queue item is not pending');
                 const ownerId = String(body.ownerId || '').trim();
                 if (!ownerId) throw new Error('queue lease owner is required');
                 if (item.assignedOwnerId && item.assignedOwnerId !== ownerId) {
-                  throw new Error('queue item is assigned to another runtime owner');
+                  throw new Error(
+                    'queue item is assigned to another runtime owner',
+                  );
                 }
                 item.status = 'preparing';
                 item.leaseOwnerId = ownerId;
@@ -1483,11 +1709,19 @@ function liveRuntimeMonitorPlugin(): Plugin {
                   throw new Error('queue item has no renewable lease');
                 }
                 item.leaseExpiresAt =
-                  now + (item.status === 'speaking' ? SPEAK_LEASE_MS : PREPARE_LEASE_MS);
+                  now +
+                  (item.status === 'speaking'
+                    ? SPEAK_LEASE_MS
+                    : PREPARE_LEASE_MS);
               } else if (action === 'ready') {
-                item.preparedReply = typeof body.reply === 'string' ? body.reply.trim() : item.preparedReply;
+                item.preparedReply =
+                  typeof body.reply === 'string'
+                    ? body.reply.trim()
+                    : item.preparedReply;
                 item.skills = Array.isArray(body.skills)
-                  ? body.skills.filter((skill): skill is string => typeof skill === 'string')
+                  ? body.skills.filter(
+                      (skill): skill is string => typeof skill === 'string',
+                    )
                   : item.skills;
                 // A late LLM callback may arrive after this item has already
                 // begun playback. Never regress a live or completed item back
@@ -1499,18 +1733,29 @@ function liveRuntimeMonitorPlugin(): Plugin {
                 item.leaseOwnerId = undefined;
                 item.leaseExpiresAt = undefined;
                 if (item.preparedReply) {
-                  item.beatCount = Math.max(1, item.preparedReply.split(/(?<=[。！？!?])/u).filter((part) => part.trim()).length);
+                  item.beatCount = Math.max(
+                    1,
+                    item.preparedReply
+                      .split(/(?<=[。！？!?])/u)
+                      .filter((part) => part.trim()).length,
+                  );
                   item.completedBeatCount = 0;
                   item.audioByteLength = 0;
-                  item.replyHash = createHash('sha256').update(item.preparedReply).digest('hex').slice(0, 16);
+                  item.replyHash = createHash('sha256')
+                    .update(item.preparedReply)
+                    .digest('hex')
+                    .slice(0, 16);
                 }
               } else if (action === 'claim-speak') {
                 releaseExpiredOperatorLeases(now);
-                if (item.status !== 'ready' || !item.preparedReply) throw new Error('queue item is not ready');
+                if (item.status !== 'ready' || !item.preparedReply)
+                  throw new Error('queue item is not ready');
                 const ownerId = String(body.ownerId || '').trim();
                 if (!ownerId) throw new Error('queue lease owner is required');
                 if (item.assignedOwnerId && item.assignedOwnerId !== ownerId) {
-                  throw new Error('queue item is assigned to another runtime owner');
+                  throw new Error(
+                    'queue item is assigned to another runtime owner',
+                  );
                 }
                 if (
                   operatorQueueSnapshot().some(
@@ -1545,11 +1790,14 @@ function liveRuntimeMonitorPlugin(): Plugin {
                   (item.completedBeatCount || 0) < (item.beatCount || 0) ||
                   (item.audioByteLength || 0) <= 0
                 ) {
-                  throw new Error('cannot finish without complete audio evidence');
+                  throw new Error(
+                    'cannot finish without complete audio evidence',
+                  );
                 }
                 item.status = 'done';
                 item.doneAt = now;
-                item.finishReason = typeof body.reason === 'string' ? body.reason : 'played';
+                item.finishReason =
+                  typeof body.reason === 'string' ? body.reason : 'played';
                 item.leaseOwnerId = undefined;
                 item.leaseExpiresAt = undefined;
               } else {
@@ -1559,10 +1807,22 @@ function liveRuntimeMonitorPlugin(): Plugin {
               normalizeOperatorQueueOrder();
             }
             void persistOperatorQueue();
-            res.end(JSON.stringify({ item: operatorQueue.get(String(body.eventId || '')), items: operatorQueueSnapshot() }));
+            res.end(
+              JSON.stringify({
+                item: operatorQueue.get(String(body.eventId || '')),
+                items: operatorQueueSnapshot(),
+              }),
+            );
           } catch (error) {
             res.statusCode = 400;
-            res.end(JSON.stringify({ error: error instanceof Error ? error.message : 'invalid queue request' }));
+            res.end(
+              JSON.stringify({
+                error:
+                  error instanceof Error
+                    ? error.message
+                    : 'invalid queue request',
+              }),
+            );
           }
         });
       });
@@ -2048,7 +2308,8 @@ export default defineConfig({
                 typeof settings.tts?.minimaxApiKey === 'string'
                   ? settings.tts.minimaxApiKey.trim()
                   : '';
-              if (apiKey) proxyReq.setHeader('Authorization', `Bearer ${apiKey}`);
+              if (apiKey)
+                proxyReq.setHeader('Authorization', `Bearer ${apiKey}`);
             } catch {
               // The downstream provider returns the authoritative error when
               // no valid local runtime setting exists.
@@ -2067,8 +2328,7 @@ export default defineConfig({
         rewrite: (path) => path.replace(/^\/api\/flashhead/, ''),
       },
       '/api/bilibili': {
-        target:
-          process.env.BILIBILI_SUPERVISOR_URL || 'http://127.0.0.1:8197',
+        target: process.env.BILIBILI_SUPERVISOR_URL || 'http://127.0.0.1:8197',
         changeOrigin: true,
         rewrite: (path) => path.replace(/^\/api\/bilibili/, ''),
       },

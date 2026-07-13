@@ -1,6 +1,5 @@
 # Local orchestration state and downloaded archives
 .runtime/
-.agents/
 .codex/
 *.zip
 

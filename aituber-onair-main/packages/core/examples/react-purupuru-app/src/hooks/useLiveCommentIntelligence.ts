@@ -225,7 +225,7 @@ export function useLiveCommentIntelligence({
           },
           metadata: {
             ...comment.metadata,
-            sourcePlatform: 'bridge',
+            sourcePlatform: 'bilibili',
             eventType: comment.type,
             superChat: comment.type === 'superchat',
           },

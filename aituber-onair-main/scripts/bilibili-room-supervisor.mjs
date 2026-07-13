@@ -1,5 +1,8 @@
 import { createServer } from 'node:http';
 import { createHash } from 'node:crypto';
+import { readFileSync } from 'node:fs';
+import { dirname, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { brotliDecompressSync, inflateSync } from 'node:zlib';
 
 const HEADER_SIZE = 16;
@@ -11,6 +14,15 @@ const OP_AUTH_REPLY = 8;
 const DEFAULT_PORT = 8197;
 const COMMENT_DEDUPLICATION_MS = 2 * 60_000;
 const CROSS_SOURCE_TEXT_DEDUPLICATION_MS = 90_000;
+const DEFAULT_DANMU_INTERVAL_MS = 1_600;
+const DEFAULT_DANMU_MAX_LENGTH = 20;
+const DEFAULT_AUTH_FILE = resolve(
+  dirname(fileURLToPath(import.meta.url)),
+  '..',
+  '..',
+  '.runtime',
+  'bilibili-auth.json',
+);
 const SELF_UIDS = new Set(
   String(process.env.BILIBILI_SELF_UIDS || '')
     .split(',')
@@ -21,6 +33,249 @@ const BROWSER_USER_AGENT =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/136.0.0.0 Safari/537.36';
 let anonymousDeviceCookie = '';
 let wbiKeys;
+
+function cookieValue(cookie, name) {
+  const match = String(cookie || '').match(
+    new RegExp(`(?:^|;\\s*)${name}=([^;]+)`),
+  );
+  return match?.[1]?.trim() || '';
+}
+
+function loadBilibiliAuth() {
+  const authFile = process.env.BILIBILI_AUTH_FILE || DEFAULT_AUTH_FILE;
+  try {
+    const parsed = JSON.parse(readFileSync(authFile, 'utf8'));
+    const cookie = String(parsed?.cookie || '').trim();
+    const csrf = String(parsed?.csrf || cookieValue(cookie, 'bili_jct')).trim();
+    return {
+      cookie,
+      csrf,
+      configured: Boolean(
+        cookieValue(cookie, 'SESSDATA') &&
+          cookieValue(cookie, 'bili_jct') &&
+          csrf,
+      ),
+    };
+  } catch {
+    return { cookie: '', csrf: '', configured: false };
+  }
+}
+
+export function splitDanmuText(input, maxLength = DEFAULT_DANMU_MAX_LENGTH) {
+  const normalized = String(input || '')
+    .replace(/[\r\n]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (!normalized) return [];
+  const limit = Math.max(1, Math.min(100, Number(maxLength) || 1));
+  const remaining = Array.from(normalized);
+  const chunks = [];
+  const boundary = /[，。！？；、,.!?;：:\s]/;
+  while (remaining.length > limit) {
+    let end = limit;
+    for (let index = limit - 1; index >= Math.floor(limit / 2); index -= 1) {
+      if (boundary.test(remaining[index])) {
+        end = index + 1;
+        break;
+      }
+    }
+    chunks.push(remaining.splice(0, end).join('').trim());
+  }
+  const tail = remaining.join('').trim();
+  if (tail) chunks.push(tail);
+  return chunks.filter(Boolean);
+}
+
+export class BilibiliDanmuSender {
+  constructor({
+    authProvider = loadBilibiliAuth,
+    fetchImpl = fetch,
+    intervalMs = Number(
+      process.env.BILIBILI_DANMU_INTERVAL_MS || DEFAULT_DANMU_INTERVAL_MS,
+    ),
+    maxLength = Number(
+      process.env.BILIBILI_DANMU_MAX_LENGTH || DEFAULT_DANMU_MAX_LENGTH,
+    ),
+  } = {}) {
+    this.authProvider = authProvider;
+    this.fetchImpl = fetchImpl;
+    this.intervalMs = Math.max(0, intervalMs);
+    this.maxLength = Math.max(1, Math.min(100, maxLength));
+    this.idempotency = new Map();
+    this.authFingerprint = '';
+    this.userId = '';
+    this.lastSentAt = 0;
+    this.sentCount = 0;
+    this.lastError = '';
+  }
+
+  currentAuth() {
+    const auth = this.authProvider();
+    const fingerprint = auth.configured
+      ? createHash('sha256').update(auth.cookie).digest('hex')
+      : '';
+    if (fingerprint !== this.authFingerprint) {
+      this.authFingerprint = fingerprint;
+      this.userId = '';
+    }
+    return auth;
+  }
+
+  safeStatus() {
+    const auth = this.currentAuth();
+    return {
+      configured: auth.configured,
+      authenticated: Boolean(auth.configured && this.userId),
+      accountUid: this.userId || undefined,
+      maxLength: this.maxLength,
+      minIntervalMs: this.intervalMs,
+      sentCount: this.sentCount,
+      lastSentAt: this.lastSentAt || null,
+      lastError: this.lastError || undefined,
+    };
+  }
+
+  async ensureAuthenticated(auth) {
+    if (this.userId) return;
+    const response = await this.fetchImpl(
+      'https://api.bilibili.com/x/web-interface/nav',
+      {
+        headers: {
+          Accept: 'application/json',
+          Referer: 'https://www.bilibili.com/',
+          'User-Agent': BROWSER_USER_AGENT,
+          Cookie: auth.cookie,
+        },
+      },
+    );
+    if (!response.ok) {
+      throw new Error(`bilibili_auth_http_${response.status}`);
+    }
+    const payload = await response.json();
+    if (
+      payload.code !== 0 ||
+      payload.data?.isLogin !== true ||
+      !payload.data?.mid
+    ) {
+      throw new Error('bilibili_auth_invalid');
+    }
+    this.userId = String(payload.data.mid);
+    SELF_UIDS.add(this.userId);
+  }
+
+  async waitForRateLimit() {
+    const waitMs = this.lastSentAt + this.intervalMs - Date.now();
+    if (waitMs > 0) {
+      await new Promise((resolveWait) => setTimeout(resolveWait, waitMs));
+    }
+  }
+
+  async send({ roomId, message, idempotencyKey }) {
+    const auth = this.currentAuth();
+    if (!auth.configured) throw new Error('bilibili_outbound_auth_missing');
+    const key = String(idempotencyKey || '').trim();
+    if (!key || key.length > 200) {
+      throw new Error('bilibili_idempotency_key_invalid');
+    }
+    const chunks = splitDanmuText(message, this.maxLength);
+    if (chunks.length === 0) throw new Error('bilibili_message_empty');
+    if (chunks.length > 8) throw new Error('bilibili_message_too_long');
+
+    let delivery = this.idempotency.get(key);
+    if (delivery && delivery.message !== chunks.join('')) {
+      throw new Error('bilibili_idempotency_key_conflict');
+    }
+    if (delivery?.completed) {
+      return {
+        ok: true,
+        duplicate: true,
+        chunksTotal: delivery.chunks.length,
+        chunksSent: delivery.sent,
+      };
+    }
+    if (!delivery) {
+      delivery = {
+        message: chunks.join(''),
+        chunks,
+        sent: 0,
+        completed: false,
+        createdAt: Date.now(),
+      };
+      this.idempotency.set(key, delivery);
+    }
+
+    if (delivery.inFlight) {
+      const result = await delivery.inFlight;
+      return { ...result, duplicate: true };
+    }
+
+    delivery.inFlight = (async () => {
+      try {
+        await this.ensureAuthenticated(auth);
+        while (delivery.sent < delivery.chunks.length) {
+          await this.waitForRateLimit();
+          const chunk = delivery.chunks[delivery.sent];
+          const response = await this.fetchImpl(
+            'https://api.live.bilibili.com/msg/send',
+            {
+              method: 'POST',
+              headers: {
+                Accept: 'application/json',
+                'Content-Type': 'application/x-www-form-urlencoded',
+                Origin: 'https://live.bilibili.com',
+                Referer: `https://live.bilibili.com/${roomId}`,
+                'User-Agent': BROWSER_USER_AGENT,
+                Cookie: auth.cookie,
+              },
+              body: new URLSearchParams({
+                bubble: '0',
+                msg: chunk,
+                color: '16777215',
+                mode: '1',
+                fontsize: '25',
+                rnd: String(Math.floor(Date.now() / 1000)),
+                roomid: String(roomId),
+                csrf: auth.csrf,
+                csrf_token: auth.csrf,
+              }),
+            },
+          );
+          if (!response.ok) {
+            throw new Error(`bilibili_send_http_${response.status}`);
+          }
+          const payload = await response.json();
+          if (payload.code !== 0) {
+            throw new Error(`bilibili_send_rejected_${payload.code}`);
+          }
+          delivery.sent += 1;
+          this.sentCount += 1;
+          this.lastSentAt = Date.now();
+        }
+        delivery.completed = true;
+        this.lastError = '';
+        while (this.idempotency.size > 1_000) {
+          const oldest = this.idempotency.keys().next().value;
+          if (oldest === undefined) break;
+          this.idempotency.delete(oldest);
+        }
+        return {
+          ok: true,
+          duplicate: false,
+          chunksTotal: delivery.chunks.length,
+          chunksSent: delivery.sent,
+        };
+      } catch (error) {
+        this.lastError = error instanceof Error ? error.message : String(error);
+        throw error;
+      }
+    })();
+    try {
+      return await delivery.inFlight;
+    } finally {
+      delivery.inFlight = undefined;
+    }
+  }
+}
 
 function eventSource(event) {
   return String(event.metadata?.source || event.metadata?.command || 'unknown');
@@ -466,7 +721,8 @@ export class EventHub {
     const fingerprintSeenAt = this.recentFingerprints.get(fingerprint) || 0;
     const textEvents = this.recentTextEvents.get(textFingerprint) || [];
     const crossSourceDuplicate = textEvents.some(({ event: previous }) =>
-      sameCrossSourceComment(previous, event));
+      sameCrossSourceComment(previous, event),
+    );
     if (
       this.recentIds.has(event.id) ||
       (fingerprintSeenAt > 0 &&
@@ -483,7 +739,9 @@ export class EventHub {
     this.recentFingerprints.set(fingerprint, now);
     if (textFingerprint) {
       const recent = textEvents
-        .filter((item) => now - item.seenAt < CROSS_SOURCE_TEXT_DEDUPLICATION_MS)
+        .filter(
+          (item) => now - item.seenAt < CROSS_SOURCE_TEXT_DEDUPLICATION_MS,
+        )
         .concat({ event, seenAt: now })
         .slice(-20);
       this.recentTextEvents.set(textFingerprint, recent);
@@ -525,7 +783,8 @@ export class EventHub {
       .toLowerCase();
     const textEvents = this.recentTextEvents.get(textFingerprint) || [];
     const crossSourceDuplicate = textEvents.some(({ event: previous }) =>
-      sameCrossSourceComment(previous, event));
+      sameCrossSourceComment(previous, event),
+    );
     if (
       this.recentIds.has(event.id) ||
       (fingerprintSeenAt > 0 &&
@@ -553,9 +812,14 @@ export class EventHub {
 }
 
 export class BilibiliRoomSupervisor {
-  constructor({ roomId, hub = new EventHub() }) {
+  constructor({
+    roomId,
+    hub = new EventHub(),
+    sender = new BilibiliDanmuSender(),
+  }) {
     this.requestedRoomId = roomId;
     this.hub = hub;
+    this.sender = sender;
     this.stopped = false;
     this.ignoredSelfEventIds = new Set();
     this.audiencePresences = new Map();
@@ -569,6 +833,7 @@ export class BilibiliRoomSupervisor {
       state: 'starting',
       requestedRoomId: roomId,
       configuredSelfUidCount: SELF_UIDS.size,
+      outbound: this.sender.safeStatus(),
       ...this.metrics,
     };
   }
@@ -580,6 +845,8 @@ export class BilibiliRoomSupervisor {
       state,
       at: Date.now(),
       ...details,
+      configuredSelfUidCount: SELF_UIDS.size,
+      outbound: this.sender.safeStatus(),
     };
     this.hub.publish('status', this.status);
     log(
@@ -587,6 +854,21 @@ export class BilibiliRoomSupervisor {
       `Bilibili supervisor: ${state}`,
       details,
     );
+  }
+
+  async sendDanmu(message, idempotencyKey) {
+    const result = await this.sender.send({
+      roomId: this.connection?.roomId || this.requestedRoomId,
+      message,
+      idempotencyKey,
+    });
+    this.status = {
+      ...this.status,
+      configuredSelfUidCount: SELF_UIDS.size,
+      outbound: this.sender.safeStatus(),
+      at: Date.now(),
+    };
+    return result;
   }
 
   async run() {
@@ -927,19 +1209,84 @@ export class BilibiliRoomSupervisor {
 export function createLocalServer(supervisor, port = DEFAULT_PORT) {
   const server = createServer((request, response) => {
     const requestUrl = new URL(request.url || '/', 'http://127.0.0.1');
-    response.setHeader(
-      'Access-Control-Allow-Origin',
-      process.env.BILIBILI_SUPERVISOR_ALLOWED_ORIGIN || 'http://127.0.0.1:5173',
-    );
+    const allowedOrigin =
+      process.env.BILIBILI_SUPERVISOR_ALLOWED_ORIGIN || 'http://127.0.0.1:5173';
+    response.setHeader('Access-Control-Allow-Origin', allowedOrigin);
+    response.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+    response.setHeader('Access-Control-Allow-Headers', 'Content-Type');
     response.setHeader('Cache-Control', 'no-store');
+    if (request.method === 'OPTIONS') {
+      response.statusCode = 204;
+      response.end();
+      return;
+    }
     if (requestUrl.pathname === '/health') {
       response.setHeader('Content-Type', 'application/json; charset=utf-8');
       response.end(
         JSON.stringify({
           ...supervisor.status,
+          configuredSelfUidCount: SELF_UIDS.size,
+          outbound: supervisor.sender.safeStatus(),
           connectedClients: supervisor.hub.clients.size,
         }),
       );
+      return;
+    }
+    if (requestUrl.pathname === '/send') {
+      response.setHeader('Content-Type', 'application/json; charset=utf-8');
+      if (request.method !== 'POST') {
+        response.statusCode = 405;
+        response.end(JSON.stringify({ error: 'method_not_allowed' }));
+        return;
+      }
+      const origin = String(request.headers.origin || '');
+      if (origin && origin !== allowedOrigin) {
+        response.statusCode = 403;
+        response.end(JSON.stringify({ error: 'origin_not_allowed' }));
+        return;
+      }
+      if (
+        !String(request.headers['content-type'] || '').startsWith(
+          'application/json',
+        )
+      ) {
+        response.statusCode = 415;
+        response.end(JSON.stringify({ error: 'json_required' }));
+        return;
+      }
+      const chunks = [];
+      let size = 0;
+      request.on('data', (chunk) => {
+        size += chunk.length;
+        if (size <= 4_096) chunks.push(chunk);
+      });
+      request.on('end', () => {
+        void (async () => {
+          try {
+            if (size > 4_096) throw new Error('request_too_large');
+            const payload = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+            const result = await supervisor.sendDanmu(
+              String(payload?.message || ''),
+              String(payload?.idempotencyKey || ''),
+            );
+            response.statusCode = 200;
+            response.end(JSON.stringify(result));
+          } catch (error) {
+            const reason =
+              error instanceof Error ? error.message : 'bilibili_send_failed';
+            const statusCode =
+              reason === 'bilibili_outbound_auth_missing'
+                ? 503
+                : reason === 'bilibili_auth_invalid'
+                  ? 401
+                  : reason.startsWith('bilibili_send_rejected_')
+                    ? 502
+                    : 400;
+            response.statusCode = statusCode;
+            response.end(JSON.stringify({ error: reason }));
+          }
+        })();
+      });
       return;
     }
     if (requestUrl.pathname === '/events') {

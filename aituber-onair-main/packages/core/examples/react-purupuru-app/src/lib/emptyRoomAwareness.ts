@@ -1,6 +1,10 @@
 import type { EmptyRoomAwarenessSettings } from '../types/settings';
 
-export type EmptyRoomAwarenessSource = 'interface' | 'memory' | 'inspiration';
+export type EmptyRoomAwarenessSource =
+  | 'interface'
+  | 'memory'
+  | 'inspiration'
+  | 'audience';
 
 export interface EmptyRoomMemoryCue {
   id: string;
@@ -12,7 +16,7 @@ export interface EmptyRoomAwarenessContext {
   digitalHumanName: string;
   digitalHumanTitle: string;
   isLive: boolean;
-  roomEmpty: boolean;
+  audiencePresent: boolean;
   busy: boolean;
   interfaceContext: string;
   memoryCues: EmptyRoomMemoryCue[];
@@ -89,7 +93,9 @@ function scheduleDelay(
   settings: EmptyRoomAwarenessSettings,
   random: () => number,
 ) {
-  const min = Math.max(60_000, settings.minIntervalMs);
+  // Two quiet minutes is a hard product boundary, even while an older browser
+  // tab is still migrating its saved one-minute setting.
+  const min = Math.max(2 * 60_000, settings.minIntervalMs);
   const max = Math.max(min, settings.maxIntervalMs);
   return Math.round(min + clampRandom(random()) * (max - min));
 }
@@ -136,7 +142,7 @@ export class EmptyRoomAwarenessPlanner {
     if (at < this.nextAt) return null;
 
     this.markActivity(settings, at);
-    if (!context.isLive || !context.roomEmpty || context.busy) return null;
+    if (!context.isLive || context.busy) return null;
 
     const candidates: Array<{
       source: EmptyRoomAwarenessSource;
@@ -157,6 +163,12 @@ export class EmptyRoomAwarenessPlanner {
       {
         source: 'inspiration',
         weight: Math.max(0, settings.inspirationWeight),
+      },
+      {
+        source: 'audience',
+        weight: context.audiencePresent
+          ? Math.max(0, settings.audienceWeight)
+          : 0,
       },
     ];
     const available = candidates.filter((candidate) => candidate.weight > 0);
@@ -195,7 +207,7 @@ export class EmptyRoomAwarenessPlanner {
       cueId = memory.id;
       this.recentMemoryIds = [memory.id, ...this.recentMemoryIds].slice(0, 4);
       cue = `睡眠整理后，一段记忆忽然被轻轻唤起：${memory.title}——${memory.content}。只借它产生当下联想，不要照读档案。`;
-    } else {
+    } else if (source === 'inspiration') {
       const fresh = INSPIRATION_SEEDS.filter(
         (seed) => seed.id !== this.lastInspirationId,
       );
@@ -203,10 +215,17 @@ export class EmptyRoomAwarenessPlanner {
       this.lastInspirationId = seed.id;
       cueId = seed.id;
       cue = seed.instruction;
+    } else {
+      cue =
+        '直播间仍有观众，但已经一段时间没有弹幕互动。主动面向仍在观看的观众寒暄一两句；可以聊此刻的感受或抛出容易接话的小话题，但不要假装认识某个具体观众，不要催弹幕，也不要连续追问。';
     }
 
     const prompt = `<empty_room_awareness>
-这是直播总控在空场时触发的一次内部意识脉冲，不是观众消息。当前在线观众数已确认为 0。
+这是直播总控在持续没有弹幕互动时触发的一次内部意识脉冲，不是观众消息。${
+      context.audiencePresent
+        ? '直播间仍有观众，可以自然地主动寒暄。'
+        : '当前没有检测到观众，只做自然的自言自语。'
+    }
 当前主播：${context.digitalHumanName}（${context.digitalHumanTitle}）。
 随机触发源：${source}。
 情境种子：${cue}

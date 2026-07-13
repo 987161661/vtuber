@@ -56,6 +56,7 @@ interface ControlRoomProps {
   avatarViewTransform: AvatarViewTransform;
   onAvatarViewTransformChange: (transform: AvatarViewTransform) => void;
   onSend: (text: string) => void;
+  onBroadcast: (text: string) => void;
   onStop: () => void;
   autoBroadcastEnabled: boolean;
   onToggleAutoBroadcast: () => void;
@@ -176,11 +177,6 @@ export function ControlRoom(props: ControlRoomProps) {
   const [queueFilter, setQueueFilter] = useState<
     'active' | 'replied' | 'skipped'
   >('active');
-  const selectedQueueItem =
-    props.operatorQueue.find((item) => item.eventId === selectedQueueId) ??
-    props.operatorQueue[0];
-  const selectedReplyIsHistory = selectedQueueItem?.status === 'done';
-  const selectedQueueIsSkipped = selectedQueueItem?.status === 'skipped';
   const visibleQueue = useMemo(() => {
     const matching = props.operatorQueue.filter((item) => {
       if (queueFilter === 'replied') return item.status === 'done';
@@ -197,6 +193,11 @@ export function ControlRoom(props: ControlRoomProps) {
     }
     return matching;
   }, [props.operatorQueue, queueFilter]);
+  const selectedQueueItem =
+    visibleQueue.find((item) => item.eventId === selectedQueueId) ??
+    visibleQueue[0];
+  const selectedReplyIsHistory = selectedQueueItem?.status === 'done';
+  const selectedQueueIsSkipped = selectedQueueItem?.status === 'skipped';
 
   useEffect(() => {
     if (!visibleQueue.some((item) => item.eventId === selectedQueueId)) {
@@ -320,7 +321,7 @@ export function ControlRoom(props: ControlRoomProps) {
                 <header>
                   <div>
                     <span>EMPTY ROOM PULSE</span>
-                    <strong>无观众时偶尔产生一个念头</strong>
+                    <strong>无弹幕互动时偶尔产生一个念头</strong>
                   </div>
                   <label className="awareness-master-switch">
                     <input
@@ -336,7 +337,7 @@ export function ControlRoom(props: ControlRoomProps) {
                   </label>
                 </header>
                 <p>
-                  这是直播总控能力，自动作用于当前数字人；有人进入、发言或正在播出时会重新计时。
+                  这是直播总控能力，自动作用于当前数字人；弹幕、礼物、进场等互动会重新计时，安静至少两分钟后才可能触发。
                 </p>
                 <div className="awareness-window">
                   <label>
@@ -344,7 +345,7 @@ export function ControlRoom(props: ControlRoomProps) {
                     <span>
                       <input
                         type="number"
-                        min="1"
+                        min="2"
                         max="60"
                         value={Math.round(
                           props.settings.emptyRoomAwareness.minIntervalMs /
@@ -353,7 +354,7 @@ export function ControlRoom(props: ControlRoomProps) {
                         onChange={(event) =>
                           props.onUpdateEmptyRoomAwareness({
                             minIntervalMs:
-                              Number(event.target.value || 1) * 60_000,
+                              Number(event.target.value || 2) * 60_000,
                           })
                         }
                       />
@@ -370,7 +371,7 @@ export function ControlRoom(props: ControlRoomProps) {
                     <span>
                       <input
                         type="number"
-                        min="1"
+                        min="2"
                         max="60"
                         value={Math.round(
                           props.settings.emptyRoomAwareness.maxIntervalMs /
@@ -379,7 +380,7 @@ export function ControlRoom(props: ControlRoomProps) {
                         onChange={(event) =>
                           props.onUpdateEmptyRoomAwareness({
                             maxIntervalMs:
-                              Number(event.target.value || 1) * 60_000,
+                              Number(event.target.value || 2) * 60_000,
                           })
                         }
                       />
@@ -393,6 +394,7 @@ export function ControlRoom(props: ControlRoomProps) {
                       ['interfaceWeight', '当前界面'],
                       ['memoryWeight', '睡眠记忆'],
                       ['inspirationWeight', '灵感种子'],
+                      ['audienceWeight', '观众寒暄'],
                     ] as const
                   ).map(([key, label]) => (
                     <label key={key}>
@@ -914,8 +916,12 @@ export function ControlRoom(props: ControlRoomProps) {
 
             <section className="console-panel program-panel">
               <div className="panel-heading">
-                <span>模型回复草稿</span>
-                <small>点选左侧队列后查看与编辑</small>
+                <span>{selectedQueueItem ? '模型回复草稿' : '主播台词'}</span>
+                <small>
+                  {selectedQueueItem
+                    ? '点选左侧队列后查看与编辑'
+                    : '空闲时可直接安排主播说话'}
+                </small>
               </div>
               <div className="program-stage">
                 <span className="stage-label">NOW</span>
@@ -930,14 +936,18 @@ export function ControlRoom(props: ControlRoomProps) {
               <div className="reply-editor">
                 <div className="panel-heading">
                   <span>
-                    {selectedReplyIsHistory ? '回复历史' : '待播回复'}
+                    {selectedReplyIsHistory
+                      ? '回复历史'
+                      : selectedQueueItem
+                        ? '待播回复'
+                        : '手动播报'}
                   </span>
                   <small>
                     {selectedQueueItem
                       ? selectedQueueItem.skills.length
                         ? `已使用 ${selectedQueueItem.skills.join('、')}`
                         : '未使用 Skills'
-                      : '点选左侧消息查看'}
+                      : '输入内容将原样进入播报队列'}
                   </small>
                 </div>
                 {selectedQueueItem && selectedReplyIsHistory ? (
@@ -1011,7 +1021,19 @@ export function ControlRoom(props: ControlRoomProps) {
                       保存待播回复
                     </button>
                   </>
-                ) : null}
+                ) : (
+                  <div className="idle-broadcast-editor">
+                    <p>
+                      当前没有待回复消息。输入主播接下来要说的话，发送后会直接进入现有播报队列。
+                    </p>
+                    <ChatInput
+                      onSend={props.onBroadcast}
+                      disabled={props.isProcessing}
+                      placeholder="输入主播要说的话（Enter 立即播报，Shift+Enter 换行）"
+                      sendLabel="安排播报"
+                    />
+                  </div>
+                )}
               </div>
               <div className="manual-send">
                 <div className="panel-heading">

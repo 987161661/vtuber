@@ -56,6 +56,17 @@ export function buildLiveResponseContract(
   input: string,
   turns: RecentLiveTurn[],
 ): LiveResponseContract {
+  const currentBeijingTime = new Intl.DateTimeFormat('zh-CN', {
+    timeZone: 'Asia/Shanghai',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hour12: false,
+  }).format(new Date());
+  const runtimeClockContext = `\n\n<runtime_clock>\n当前北京时间：${currentBeijingTime}。这是判断“现在、今晚、凌晨”等时间词的唯一当前时钟；历史转写和上一轮数据时次只能作为过去记录，禁止拿它们推断当前时间。\n</runtime_clock>`;
   const recentAnswered = [...turns]
     .reverse()
     .filter((turn) => turn.reply && turn.status !== 'skipped');
@@ -121,7 +132,7 @@ export function buildLiveResponseContract(
       : '无需为了表演强行拆句。'
   }\n拟人要求：只有当观众明确询问台风、天气、雷达或相关的上一轮追问时，才调用或提及台风。普通问候、情绪、玩笑、关系和生活话题，就像一个有自己性格的主播一样直接回应，不要拿台风实况做转场。\n长度要求：大多数情况下用 2 到 4 句完成，总长不超过 160 个中文字；不要重复题目、不要带出推理过程或内部规则。\n</live_response_contract>`;
   return {
-    contract,
+    contract: runtimeClockContext + contract,
     inheritedSkills,
     // Route inheritance is carried separately. Keep the viewer's exact words
     // for the skill endpoint because its structured query parser understands

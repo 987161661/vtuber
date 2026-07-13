@@ -4,9 +4,16 @@ import { useSpeechRecognition } from '../hooks/useSpeechRecognition';
 interface ChatInputProps {
   onSend: (text: string) => void;
   disabled: boolean;
+  placeholder?: string;
+  sendLabel?: string;
 }
 
-export function ChatInput({ onSend, disabled }: ChatInputProps) {
+export function ChatInput({
+  onSend,
+  disabled,
+  placeholder,
+  sendLabel = '送信',
+}: ChatInputProps) {
   const [text, setText] = useState('');
   const composingRef = useRef(false);
   const appendRecognizedText = useCallback((recognizedText: string) => {
@@ -57,7 +64,7 @@ export function ChatInput({ onSend, disabled }: ChatInputProps) {
           placeholder={
             speech.listening
               ? '音声認識中...'
-              : 'メッセージを入力 (Enter で送信)'
+              : placeholder || 'メッセージを入力 (Enter で送信)'
           }
           disabled={disabled}
           rows={2}
@@ -86,7 +93,7 @@ export function ChatInput({ onSend, disabled }: ChatInputProps) {
           className="send-button"
           disabled={disabled || !text.trim()}
         >
-          送信
+          {sendLabel}
         </button>
       </div>
     </div>

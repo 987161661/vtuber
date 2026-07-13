@@ -50,6 +50,7 @@ interface StreamSettingsProps {
   updateTwitchEnabled: (value: boolean) => void;
   updateTwitchCommentIntervalMs: (value: number) => void;
   updateBilibiliEnabled: (value: boolean) => void;
+  updateBilibiliReplyEnabled: (value: boolean) => void;
   updateCustomSseEndpoint: (value: string) => void;
   updateCustomSseEnabled: (value: boolean) => void;
   updateCommentIntelligenceEnabled: (value: boolean) => void;
@@ -104,6 +105,7 @@ export function StreamSettings({
   updateTwitchEnabled,
   updateTwitchCommentIntervalMs,
   updateBilibiliEnabled,
+  updateBilibiliReplyEnabled,
   updateCustomSseEndpoint,
   updateCustomSseEnabled,
   updateCommentIntelligenceEnabled,
@@ -398,6 +400,25 @@ export function StreamSettings({
                     />
                     启用 B 站直播间监听
                   </label>
+                </div>
+                <div className="settings-field">
+                  <label htmlFor="stream-bilibili-reply-enabled">
+                    <input
+                      id="stream-bilibili-reply-enabled"
+                      type="checkbox"
+                      checked={stream.bilibiliReplyEnabled}
+                      onChange={(event) =>
+                        updateBilibiliReplyEnabled(event.target.checked)
+                      }
+                      disabled={disabled || !stream.bilibiliEnabled}
+                      style={{ marginRight: 8 }}
+                    />
+                    主播说话时同步发送文字到 B 站弹幕区
+                  </label>
+                  <p className="settings-field-hint">
+                    回复、主动搭话和总控手动播报都会在 TTS 开始时同步；
+                    登录凭据仅由 Supervisor 读取，不会保存到浏览器设置或仓库。
+                  </p>
                 </div>
               </>
             )}
