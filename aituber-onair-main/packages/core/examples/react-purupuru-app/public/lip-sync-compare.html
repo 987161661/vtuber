@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>新旧口型对比</title>
+    <style>
+      :root { color-scheme: dark; font-family: system-ui, sans-serif; background: #10131a; color: #edf2ff; }
+      body { margin: 0; padding: 28px; }
+      h1 { margin: 0 0 8px; font-size: 24px; }
+      p { color: #b7c1d9; }
+      #status { min-height: 24px; color: #85d7ff; }
+      button { border: 0; border-radius: 8px; padding: 10px 14px; margin: 0 8px 18px 0; background: #4d73ff; color: white; cursor: pointer; font-weight: 700; }
+      button:disabled { opacity: .55; cursor: wait; }
+      .grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 20px; }
+      .card { overflow: hidden; border: 1px solid #33415f; border-radius: 12px; background: #171c27; }
+      .label { padding: 12px 14px; font-weight: 750; background: #202a3f; }
+      .meta { padding: 0 14px; min-height: 20px; color: #aab7d1; font-size: 13px; }
+      video { display: block; width: 100%; aspect-ratio: 1; background: #06080d; object-fit: contain; }
+      audio { width: calc(100% - 28px); margin: 10px 14px 14px; }
+      @media (max-width: 800px) { body { padding: 16px; } .grid { grid-template-columns: 1fr; } }
+    </style>
+  </head>
+  <body>
+    <h1>同一段语音：MuseTalk vs FlashHead</h1>
+    <p>点击“加载并渲染”。两侧使用同一份刚刚捕获的 TTS 音频；“同时播放”可直接观察口型同步与画面差异。</p>
+    <button id="render">加载并渲染</button>
+    <button id="play" disabled>同时播放</button>
+    <div id="status">等待加载语音。</div>
+    <main class="grid">
+      <section class="card"><div class="label">旧：MuseTalk V1.5</div><div class="meta" id="muse-meta"></div><video id="muse-video" muted playsinline></video><audio id="muse-audio" controls></audio></section>
+      <section class="card"><div class="label">新：SoulX-FlashHead Lite</div><div class="meta" id="flash-meta"></div><video id="flash-video" muted playsinline></video><audio id="flash-audio" controls></audio></section>
+    </main>
+    <script>
+      const $ = (id) => document.getElementById(id);
+      const urls = [];
+      function setMedia(id, bytes, type) {
+        const url = URL.createObjectURL(new Blob([bytes], { type }));
+        urls.push(url);
+        $(id).src = url;
+      }
+      function parseBundle(buffer) {
+        const view = new DataView(buffer);
+        const audioLength = view.getUint32(0);
+        if (audioLength <= 0 || buffer.byteLength <= 4 + audioLength) throw new Error('渲染服务返回了无效音视频包。');
+        return { audio: buffer.slice(4, 4 + audioLength), video: buffer.slice(4 + audioLength) };
+      }
+      async function render() {
+        $('render').disabled = true;
+        $('play').disabled = true;
+        $('status').textContent = '正在读取刚刚生成的语音并并行渲染…';
+        urls.splice(0).forEach(URL.revokeObjectURL);
+        try {
+          const audio = await fetch('/api/tts-capture/latest?cache=' + Date.now());
+          if (!audio.ok) throw new Error('尚未捕获到语音。请先在主页面发送测试句。');
+          const source = await audio.arrayBuffer();
+          const [muse, flash] = await Promise.all([
+            fetch('/api/musetalk/render?bundle=true', { method: 'POST', headers: { 'Content-Type': 'application/octet-stream' }, body: source.slice(0) }),
+            fetch('/api/flashhead/render?reset=true&end=true', { method: 'POST', headers: { 'Content-Type': 'application/octet-stream' }, body: source.slice(0) }),
+          ]);
+          if (!muse.ok) throw new Error('MuseTalk 渲染失败：' + muse.status);
+          if (!flash.ok) throw new Error('FlashHead 渲染失败：' + flash.status);
+          const museBundle = parseBundle(await muse.arrayBuffer());
+          const flashBundle = parseBundle(await flash.arrayBuffer());
+          setMedia('muse-video', museBundle.video, 'video/webm');
+          setMedia('muse-audio', museBundle.audio, 'audio/wav');
+          setMedia('flash-video', flashBundle.video, 'video/webm');
+          setMedia('flash-audio', flashBundle.audio, 'audio/wav');
+          $('muse-meta').textContent = '已渲染 ' + museBundle.video.byteLength.toLocaleString() + ' 字节视频';
+          $('flash-meta').textContent = '已渲染 ' + flashBundle.video.byteLength.toLocaleString() + ' 字节视频，' + (flash.headers.get('X-FlashHead-Frames') || '?') + ' 帧';
+          $('status').textContent = '渲染完成。可分别播放，或点击“同时播放”。';
+          $('play').disabled = false;
+        } catch (error) {
+          $('status').textContent = error instanceof Error ? error.message : String(error);
+        } finally {
+          $('render').disabled = false;
+        }
+      }
+      async function playTogether() {
+        for (const id of ['muse-video', 'muse-audio', 'flash-video', 'flash-audio']) { $(id).pause(); $(id).currentTime = 0; }
+        await Promise.all(['muse-video', 'muse-audio', 'flash-video', 'flash-audio'].map((id) => $(id).play()));
+      }
+      $('render').addEventListener('click', render);
+      $('play').addEventListener('click', playTogether);
+    </script>
+  </body>
+</html>

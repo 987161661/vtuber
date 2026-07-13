@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>凌岚女王音色盲听</title>
+    <style>
+      :root {
+        color: #eef2ff;
+        background: #080b14;
+        font-family: "Microsoft YaHei", system-ui, sans-serif;
+      }
+      body {
+        max-width: 760px;
+        margin: 0 auto;
+        padding: 48px 24px;
+      }
+      h1 { margin-bottom: 8px; font-size: 30px; }
+      p { color: #aeb7cf; line-height: 1.7; }
+      .grid {
+        display: grid;
+        gap: 14px;
+        margin-top: 28px;
+      }
+      .sample {
+        display: grid;
+        grid-template-columns: 52px 1fr;
+        align-items: center;
+        gap: 18px;
+        padding: 18px;
+        border: 1px solid #27304b;
+        border-radius: 14px;
+        background: #101625;
+      }
+      .label {
+        display: grid;
+        place-items: center;
+        width: 52px;
+        height: 52px;
+        border-radius: 50%;
+        background: #242f52;
+        color: #dfe6ff;
+        font-size: 22px;
+        font-weight: 700;
+      }
+      audio { width: 100%; }
+      .hint { margin-top: 26px; color: #d4b26a; }
+    </style>
+  </head>
+  <body>
+    <h1>凌岚女王音色盲听</h1>
+    <p>五段音频使用完全相同的台词、语速、音调和情绪。只比较“像不像你期待的御姐”，不要根据字母顺序判断。</p>
+    <main class="grid">
+      <section class="sample"><span class="label">A</span><audio controls preload="metadata" src="/voice-audition/A.mp3"></audio></section>
+      <section class="sample"><span class="label">B</span><audio controls preload="metadata" src="/voice-audition/B.mp3"></audio></section>
+      <section class="sample"><span class="label">C</span><audio controls preload="metadata" src="/voice-audition/C.mp3"></audio></section>
+      <section class="sample"><span class="label">D</span><audio controls preload="metadata" src="/voice-audition/D.mp3"></audio></section>
+      <section class="sample"><span class="label">E</span><audio controls preload="metadata" src="/voice-audition/E.mp3"></audio></section>
+    </main>
+    <p class="hint">听完告诉我最接近预期的字母；如果都不像，直接说“都不像”，下一步改用定制音色而不是继续猜系统音色。</p>
+  </body>
+</html>

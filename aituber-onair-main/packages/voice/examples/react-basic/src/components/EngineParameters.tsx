@@ -1,0 +1,1817 @@
+import type {
+  GradiumOutputFormat,
+  InworldAudioEncoding,
+  MinimaxAudioFormat,
+  MinimaxModel,
+  UnrealSpeechCodec,
+  XaiBitRate,
+  XaiCodec,
+  XaiSampleRate,
+} from '@aituber-onair/voice';
+import {
+  ELEVENLABS_MODELS,
+  ELEVENLABS_OUTPUT_FORMATS,
+  GRADIUM_OUTPUT_FORMATS,
+  INWORLD_AUDIO_ENCODINGS,
+  INWORLD_DELIVERY_MODES,
+  INWORLD_MODELS,
+  MINIMAX_MODELS,
+  SLIDER_CONFIG,
+  UNREAL_SPEECH_CODECS,
+  type AivisCloudBooleanOption,
+  type AivisCloudOutputChannelOption,
+  type AivisCloudOutputFormatOption,
+  type AivisCloudOutputSamplingRateOption,
+  type DefaultBooleanOption,
+  type ElevenLabsApplyTextNormalizationOption,
+  type EngineType,
+  type InworldDeliveryModeOption,
+  type LocalOutputSamplingRateOption,
+  type OutputStereoOption,
+  type VoicePeakEmotionOption,
+  type VoicepeakEmotionMode,
+  VOICEPEAK_WEIGHT_KEYS,
+} from '../constants';
+import { CollapsibleCard } from './CollapsibleCard';
+import { NumberSliderField } from './NumberSliderField';
+
+interface StringField {
+  value: string;
+  onChange: (nextValue: string) => void;
+}
+
+interface SelectField<T extends string> {
+  value: T;
+  onChange: (nextValue: T) => void;
+}
+
+interface EngineParametersProps {
+  engine: EngineType;
+  openai: {
+    speed: StringField;
+  };
+  xai: {
+    language: StringField;
+    codec: SelectField<XaiCodec>;
+    sampleRate: SelectField<`${XaiSampleRate}`>;
+    bitRate: SelectField<`${XaiBitRate}`>;
+  };
+  unrealSpeech: {
+    bitrate: StringField;
+    speed: StringField;
+    pitch: StringField;
+    codec: SelectField<UnrealSpeechCodec>;
+    temperature: StringField;
+  };
+  elevenLabs: {
+    model: SelectField<string>;
+    models: typeof ELEVENLABS_MODELS;
+    outputFormat: SelectField<string>;
+    outputFormats: typeof ELEVENLABS_OUTPUT_FORMATS;
+    languageCode: StringField;
+    stability: StringField;
+    similarityBoost: StringField;
+    style: StringField;
+    useSpeakerBoost: SelectField<DefaultBooleanOption>;
+    speed: StringField;
+    seed: StringField;
+    previousText: StringField;
+    nextText: StringField;
+    applyTextNormalization: SelectField<ElevenLabsApplyTextNormalizationOption>;
+    applyLanguageTextNormalization: SelectField<DefaultBooleanOption>;
+    enableLogging: SelectField<DefaultBooleanOption>;
+  };
+  inworld: {
+    model: SelectField<string>;
+    models: typeof INWORLD_MODELS;
+    audioEncoding: SelectField<InworldAudioEncoding>;
+    audioEncodings: typeof INWORLD_AUDIO_ENCODINGS;
+    sampleRateHertz: StringField;
+    bitRate: StringField;
+    speakingRate: StringField;
+    language: StringField;
+    deliveryMode: SelectField<InworldDeliveryModeOption>;
+    deliveryModes: typeof INWORLD_DELIVERY_MODES;
+    temperature: StringField;
+  };
+  gradium: {
+    outputFormat: SelectField<GradiumOutputFormat>;
+    outputFormats: typeof GRADIUM_OUTPUT_FORMATS;
+    temperature: StringField;
+    voiceSimilarity: StringField;
+    paddingBonus: StringField;
+    rewriteRules: StringField;
+  };
+  geminiTts: {
+    model: SelectField<string>;
+    languageCode: StringField;
+    prompt: StringField;
+    models: Record<string, string>;
+  };
+  openaiCompatible: {
+    model: StringField;
+    speed: StringField;
+  };
+  voicevox: {
+    speedScale: StringField;
+    pitchScale: StringField;
+    intonationScale: StringField;
+    volumeScale: StringField;
+    prePhonemeLength: StringField;
+    postPhonemeLength: StringField;
+    pauseLength: StringField;
+    pauseLengthScale: StringField;
+    outputSamplingRate: SelectField<LocalOutputSamplingRateOption>;
+    outputStereo: SelectField<OutputStereoOption>;
+    enableKatakanaEnglish: SelectField<DefaultBooleanOption>;
+    enableInterrogativeUpspeak: SelectField<DefaultBooleanOption>;
+    coreVersion: StringField;
+  };
+  voicepeak: {
+    mode: VoicepeakEmotionMode;
+    setMode: (nextMode: VoicepeakEmotionMode) => void;
+    emotion: SelectField<VoicePeakEmotionOption>;
+    weights: Record<(typeof VOICEPEAK_WEIGHT_KEYS)[number], string>;
+    setWeight: (
+      key: (typeof VOICEPEAK_WEIGHT_KEYS)[number],
+      nextValue: string,
+    ) => void;
+    weightSum: number;
+    speed: StringField;
+    pitch: StringField;
+  };
+  aivisCloud: {
+    modelUuid: StringField;
+    speakerUuid: StringField;
+    styleId: StringField;
+    styleName: StringField;
+    useSsml: SelectField<AivisCloudBooleanOption>;
+    language: StringField;
+    speakingRate: StringField;
+    emotionalIntensity: StringField;
+    tempoDynamics: StringField;
+    pitch: StringField;
+    volume: StringField;
+    leadingSilence: StringField;
+    trailingSilence: StringField;
+    lineBreakSilence: StringField;
+    outputFormat: SelectField<AivisCloudOutputFormatOption>;
+    outputBitrate: StringField;
+    outputSamplingRate: SelectField<AivisCloudOutputSamplingRateOption>;
+    outputChannels: SelectField<AivisCloudOutputChannelOption>;
+    userDictionaryUuid: StringField;
+    enableBillingLogs: SelectField<AivisCloudBooleanOption>;
+  };
+  aivisSpeech: {
+    speedScale: StringField;
+    pitchScale: StringField;
+    intonationScale: StringField;
+    tempoDynamicsScale: StringField;
+    volumeScale: StringField;
+    prePhonemeLength: StringField;
+    postPhonemeLength: StringField;
+    pauseLength: StringField;
+    pauseLengthScale: StringField;
+    outputSamplingRate: SelectField<LocalOutputSamplingRateOption>;
+    outputStereo: SelectField<OutputStereoOption>;
+  };
+  minimax: {
+    model: SelectField<MinimaxModel>;
+    languageBoost: StringField;
+    speed: StringField;
+    volume: StringField;
+    pitch: StringField;
+    sampleRate: StringField;
+    bitrate: StringField;
+    audioFormat: SelectField<MinimaxAudioFormat>;
+    audioChannel: SelectField<'1' | '2'>;
+  };
+  piperPlus: {
+    speed: StringField;
+    noiseScale: StringField;
+  };
+}
+
+export function EngineParameters({
+  engine,
+  openai,
+  xai,
+  unrealSpeech,
+  elevenLabs,
+  inworld,
+  gradium,
+  geminiTts,
+  openaiCompatible,
+  voicevox,
+  voicepeak,
+  aivisCloud,
+  aivisSpeech,
+  minimax,
+  piperPlus,
+}: EngineParametersProps) {
+  return (
+    <>
+      {engine === 'openai' && (
+        <CollapsibleCard
+          className="parameter-card openai-card"
+          title="OpenAI TTS パラメータ"
+          description="現在のOpenAI TTSでは音声速度のみ数値指定が可能です。未入力の場合は既定値 1.0 が使用されます。"
+        >
+          <div className="parameter-section">
+            <div className="parameter-section__title">話速</div>
+            <NumberSliderField
+              id="openaiSpeed"
+              label="Speed (0.25 - 4.0)"
+              value={openai.speed.value}
+              onChange={openai.speed.onChange}
+              config={SLIDER_CONFIG.openaiSpeed}
+              placeholder="例: 1.25（標準は 1.0）"
+            />
+          </div>
+
+          <p className="parameter-card__note">
+            モデルや声色は `speaker` の指定で切り替えられます。
+          </p>
+        </CollapsibleCard>
+      )}
+
+      {engine === 'xai' && (
+        <CollapsibleCard
+          className="parameter-card openai-card"
+          title="xAI TTS パラメータ"
+          description="xAI の `/v1/tts` エンドポイント向け設定です。voice は上部の Speaker で選択し、ここでは言語と出力形式を調整できます。"
+        >
+          <div className="parameter-section">
+            <div className="parameter-section__title">言語</div>
+            <div className="parameter-grid parameter-grid--two">
+              <div className="form-group">
+                <label htmlFor="xaiLanguage">Language</label>
+                <input
+                  id="xaiLanguage"
+                  type="text"
+                  value={xai.language.value}
+                  onChange={(e) => xai.language.onChange(e.target.value)}
+                  placeholder="例: auto, ja, en"
+                />
+              </div>
+            </div>
+          </div>
+
+          <div className="parameter-section">
+            <div className="parameter-section__title">出力フォーマット</div>
+            <div className="parameter-grid parameter-grid--two">
+              <div className="form-group">
+                <label htmlFor="xaiCodec">Codec</label>
+                <select
+                  id="xaiCodec"
+                  value={xai.codec.value}
+                  onChange={(e) =>
+                    xai.codec.onChange(e.target.value as XaiCodec)
+                  }
+                >
+                  <option value="mp3">MP3</option>
+                  <option value="wav">WAV</option>
+                  <option value="pcm">PCM</option>
+                  <option value="mulaw">Mu-law</option>
+                  <option value="alaw">A-law</option>
+                </select>
+              </div>
+              <div className="form-group">
+                <label htmlFor="xaiSampleRate">Sample Rate</label>
+                <select
+                  id="xaiSampleRate"
+                  value={xai.sampleRate.value}
+                  onChange={(e) =>
+                    xai.sampleRate.onChange(
+                      e.target.value as `${XaiSampleRate}`,
+                    )
+                  }
+                >
+                  <option value="8000">8,000 Hz</option>
+                  <option value="16000">16,000 Hz</option>
+                  <option value="22050">22,050 Hz</option>
+                  <option value="24000">24,000 Hz</option>
+                  <option value="44100">44,100 Hz</option>
+                  <option value="48000">48,000 Hz</option>
+                </select>
+              </div>
+              <div className="form-group">
+                <label htmlFor="xaiBitRate">MP3 Bit Rate</label>
+                <select
+                  id="xaiBitRate"
+                  value={xai.bitRate.value}
+                  onChange={(e) =>
+                    xai.bitRate.onChange(e.target.value as `${XaiBitRate}`)
+                  }
+                  disabled={xai.codec.value !== 'mp3'}
+                >
+                  <option value="32000">32 kbps</option>
+                  <option value="64000">64 kbps</option>
+                  <option value="96000">96 kbps</option>
+                  <option value="128000">128 kbps</option>
+                  <option value="192000">192 kbps</option>
+                </select>
+              </div>
+            </div>
+          </div>
+
+          <p className="parameter-card__note">
+            `bit_rate` は MP3 出力時のみ送信されます。
+          </p>
+        </CollapsibleCard>
+      )}
+
+      {engine === 'unrealSpeech' && (
+        <CollapsibleCard
+          className="parameter-card openai-card"
+          title="Unreal Speech パラメータ"
+          description="Unreal Speech v8 `/stream` API 向けの音声合成設定です。VoiceId は上部の Speaker に入力します。"
+        >
+          <div className="parameter-section">
+            <div className="parameter-section__title">出力</div>
+            <div className="parameter-grid parameter-grid--two">
+              <div className="form-group">
+                <label htmlFor="unrealSpeechBitrate">Bitrate</label>
+                <input
+                  id="unrealSpeechBitrate"
+                  type="text"
+                  value={unrealSpeech.bitrate.value}
+                  onChange={(e) =>
+                    unrealSpeech.bitrate.onChange(e.target.value)
+                  }
+                  placeholder="例: 192k"
+                />
+              </div>
+              <div className="form-group">
+                <label htmlFor="unrealSpeechCodec">Codec</label>
+                <select
+                  id="unrealSpeechCodec"
+                  value={unrealSpeech.codec.value}
+                  onChange={(e) =>
+                    unrealSpeech.codec.onChange(
+                      e.target.value as UnrealSpeechCodec,
+                    )
+                  }
+                >
+                  {Object.entries(UNREAL_SPEECH_CODECS).map(
+                    ([codec, label]) => (
+                      <option key={codec} value={codec}>
+                        {label}
+                      </option>
+                    ),
+                  )}
+                </select>
+              </div>
+            </div>
+          </div>
+
+          <div className="parameter-section">
+            <div className="parameter-section__title">音声調整</div>
+            <div className="parameter-grid">
+              <NumberSliderField
+                id="unrealSpeechSpeed"
+                label="Speed (-1.0 - 1.0)"
+                value={unrealSpeech.speed.value}
+                onChange={unrealSpeech.speed.onChange}
+                config={SLIDER_CONFIG.unrealSpeechSpeed}
+                placeholder="例: 0（標準）"
+              />
+              <NumberSliderField
+                id="unrealSpeechPitch"
+                label="Pitch (0.5 - 1.5)"
+                value={unrealSpeech.pitch.value}
+                onChange={unrealSpeech.pitch.onChange}
+                config={SLIDER_CONFIG.unrealSpeechPitch}
+                placeholder="例: 1.0（標準）"
+              />
+              <NumberSliderField
+                id="unrealSpeechTemperature"
+                label="Temperature (0.1 - 0.8)"
+                value={unrealSpeech.temperature.value}
+                onChange={unrealSpeech.temperature.onChange}
+                config={SLIDER_CONFIG.unrealSpeechTemperature}
+                placeholder="空欄で API 既定値"
+              />
+            </div>
+          </div>
+        </CollapsibleCard>
+      )}
+
+      {engine === 'elevenLabs' && (
+        <CollapsibleCard
+          className="parameter-card openai-card"
+          title="ElevenLabs パラメータ"
+          description="ElevenLabs Text to Speech API 向けの設定です。voice_id は上部の Speaker に入力します。"
+        >
+          <div className="parameter-section">
+            <div className="parameter-section__title">モデル・出力</div>
+            <div className="parameter-grid parameter-grid--two">
+              <div className="form-group">
+                <label htmlFor="elevenLabsModel">Model</label>
+                <select
+                  id="elevenLabsModel"
+                  value={elevenLabs.model.value}
+                  onChange={(e) => elevenLabs.model.onChange(e.target.value)}
+                >
+                  {Object.entries(elevenLabs.models).map(
+                    ([modelId, description]) => (
+                      <option key={modelId} value={modelId}>
+                        {modelId} - {description}
+                      </option>
+                    ),
+                  )}
+                </select>
+              </div>
+              <div className="form-group">
+                <label htmlFor="elevenLabsOutputFormat">Output Format</label>
+                <select
+                  id="elevenLabsOutputFormat"
+                  value={elevenLabs.outputFormat.value}
+                  onChange={(e) =>
+                    elevenLabs.outputFormat.onChange(e.target.value)
+                  }
+                >
+                  {Object.entries(elevenLabs.outputFormats).map(
+                    ([format, description]) => (
+                      <option key={format} value={format}>
+                        {format} - {description}
+                      </option>
+                    ),
+                  )}
+                </select>
+              </div>
+              <div className="form-group">
+                <label htmlFor="elevenLabsLanguageCode">Language Code</label>
+                <input
+                  id="elevenLabsLanguageCode"
+                  type="text"
+                  value={elevenLabs.languageCode.value}
+                  onChange={(e) =>
+                    elevenLabs.languageCode.onChange(e.target.value)
+                  }
+                  placeholder="例: ja, en（空欄で自動）"
+                />
+              </div>
+              <div className="form-group">
+                <label htmlFor="elevenLabsSeed">Seed</label>
+                <input
+                  id="elevenLabsSeed"
+                  type="number"
+                  min="0"
+                  step="1"
+                  value={elevenLabs.seed.value}
+                  onChange={(e) => elevenLabs.seed.onChange(e.target.value)}
+                  placeholder="任意の整数"
+                />
+              </div>
+            </div>
+          </div>
+
+          <div className="parameter-section">
+            <div className="parameter-section__title">Voice Settings</div>
+            <div className="parameter-grid">
+              <NumberSliderField
+                id="elevenLabsStability"
+                label="Stability"
+                value={elevenLabs.stability.value}
+                onChange={elevenLabs.stability.onChange}
+                config={SLIDER_CONFIG.elevenLabsStability}
+                placeholder="空欄で voice 既定値"
+              />
+              <NumberSliderField
+                id="elevenLabsSimilarityBoost"
+                label="Similarity Boost"
+                value={elevenLabs.similarityBoost.value}
+                onChange={elevenLabs.similarityBoost.onChange}
+                config={SLIDER_CONFIG.elevenLabsSimilarityBoost}
+                placeholder="空欄で voice 既定値"
+              />
+              <NumberSliderField
+                id="elevenLabsStyle"
+                label="Style"
+                value={elevenLabs.style.value}
+                onChange={elevenLabs.style.onChange}
+                config={SLIDER_CONFIG.elevenLabsStyle}
+                placeholder="空欄で voice 既定値"
+              />
+              <NumberSliderField
+                id="elevenLabsSpeed"
+                label="Speed"
+                value={elevenLabs.speed.value}
+                onChange={elevenLabs.speed.onChange}
+                config={SLIDER_CONFIG.elevenLabsSpeed}
+                placeholder="空欄で voice 既定値"
+              />
+              <div className="form-group">
+                <label htmlFor="elevenLabsUseSpeakerBoost">
+                  Use Speaker Boost
+                </label>
+                <select
+                  id="elevenLabsUseSpeakerBoost"
+                  value={elevenLabs.useSpeakerBoost.value}
+                  onChange={(e) =>
+                    elevenLabs.useSpeakerBoost.onChange(
+                      e.target.value as DefaultBooleanOption,
+                    )
+                  }
+                >
+                  <option value="default">Voice 既定値</option>
+                  <option value="true">有効</option>
+                  <option value="false">無効</option>
+                </select>
+              </div>
+            </div>
+          </div>
+
+          <div className="parameter-section">
+            <div className="parameter-section__title">コンテキスト・正規化</div>
+            <div className="parameter-grid parameter-grid--two">
+              <div className="form-group">
+                <label htmlFor="elevenLabsPreviousText">Previous Text</label>
+                <input
+                  id="elevenLabsPreviousText"
+                  type="text"
+                  value={elevenLabs.previousText.value}
+                  onChange={(e) =>
+                    elevenLabs.previousText.onChange(e.target.value)
+                  }
+                  placeholder="前後の文脈が必要な場合"
+                />
+              </div>
+              <div className="form-group">
+                <label htmlFor="elevenLabsNextText">Next Text</label>
+                <input
+                  id="elevenLabsNextText"
+                  type="text"
+                  value={elevenLabs.nextText.value}
+                  onChange={(e) => elevenLabs.nextText.onChange(e.target.value)}
+                  placeholder="前後の文脈が必要な場合"
+                />
+              </div>
+              <div className="form-group">
+                <label htmlFor="elevenLabsApplyTextNormalization">
+                  Text Normalization
+                </label>
+                <select
+                  id="elevenLabsApplyTextNormalization"
+                  value={elevenLabs.applyTextNormalization.value}
+                  onChange={(e) =>
+                    elevenLabs.applyTextNormalization.onChange(
+                      e.target.value as ElevenLabsApplyTextNormalizationOption,
+                    )
+                  }
+                >
+                  <option value="default">API既定値</option>
+                  <option value="auto">auto</option>
+                  <option value="on">on</option>
+                  <option value="off">off</option>
+                </select>
+              </div>
+              <div className="form-group">
+                <label htmlFor="elevenLabsApplyLanguageTextNormalization">
+                  Language Text Normalization
+                </label>
+                <select
+                  id="elevenLabsApplyLanguageTextNormalization"
+                  value={elevenLabs.applyLanguageTextNormalization.value}
+                  onChange={(e) =>
+                    elevenLabs.applyLanguageTextNormalization.onChange(
+                      e.target.value as DefaultBooleanOption,
+                    )
+                  }
+                >
+                  <option value="default">API既定値</option>
+                  <option value="true">有効</option>
+                  <option value="false">無効</option>
+                </select>
+              </div>
+              <div className="form-group">
+                <label htmlFor="elevenLabsEnableLogging">Enable Logging</label>
+                <select
+                  id="elevenLabsEnableLogging"
+                  value={elevenLabs.enableLogging.value}
+                  onChange={(e) =>
+                    elevenLabs.enableLogging.onChange(
+                      e.target.value as DefaultBooleanOption,
+                    )
+                  }
+                >
+                  <option value="default">API既定値（true）</option>
+                  <option value="true">有効</option>
+                  <option value="false">無効</option>
+                </select>
+              </div>
+            </div>
+          </div>
+        </CollapsibleCard>
+      )}
+
+      {engine === 'inworld' && (
+        <CollapsibleCard
+          className="parameter-card openai-card"
+          title="Inworld パラメータ"
+          description="Inworld TTS の非ストリーミング REST API 向け設定です。voiceId は上部の Speaker に入力します。"
+        >
+          <div className="parameter-section">
+            <div className="parameter-section__title">モデル・出力</div>
+            <div className="parameter-grid parameter-grid--two">
+              <div className="form-group">
+                <label htmlFor="inworldModel">Model</label>
+                <select
+                  id="inworldModel"
+                  value={inworld.model.value}
+                  onChange={(e) => inworld.model.onChange(e.target.value)}
+                >
+                  {Object.entries(inworld.models).map(
+                    ([modelId, description]) => (
+                      <option key={modelId} value={modelId}>
+                        {modelId} - {description}
+                      </option>
+                    ),
+                  )}
+                </select>
+              </div>
+              <div className="form-group">
+                <label htmlFor="inworldAudioEncoding">Audio Encoding</label>
+                <select
+                  id="inworldAudioEncoding"
+                  value={inworld.audioEncoding.value}
+                  onChange={(e) =>
+                    inworld.audioEncoding.onChange(
+                      e.target.value as InworldAudioEncoding,
+                    )
+                  }
+                >
+                  {Object.entries(inworld.audioEncodings).map(
+                    ([encoding, description]) => (
+                      <option key={encoding} value={encoding}>
+                        {description}
+                      </option>
+                    ),
+                  )}
+                </select>
+              </div>
+              <div className="form-group">
+                <label htmlFor="inworldSampleRateHertz">
+                  Sample Rate Hertz
+                </label>
+                <input
+                  id="inworldSampleRateHertz"
+                  type="number"
+                  min="8000"
+                  step="1"
+                  value={inworld.sampleRateHertz.value}
+                  onChange={(e) =>
+                    inworld.sampleRateHertz.onChange(e.target.value)
+                  }
+                  placeholder="48000"
+                />
+              </div>
+              <div className="form-group">
+                <label htmlFor="inworldBitRate">Bit Rate</label>
+                <input
+                  id="inworldBitRate"
+                  type="number"
+                  min="0"
+                  step="1000"
+                  value={inworld.bitRate.value}
+                  onChange={(e) => inworld.bitRate.onChange(e.target.value)}
+                  placeholder="空欄で未送信"
+                />
+              </div>
+            </div>
+          </div>
+
+          <div className="parameter-section">
+            <div className="parameter-section__title">音声調整</div>
+            <div className="parameter-grid">
+              <NumberSliderField
+                id="inworldSpeakingRate"
+                label="Speaking Rate"
+                value={inworld.speakingRate.value}
+                onChange={inworld.speakingRate.onChange}
+                config={SLIDER_CONFIG.inworldSpeakingRate}
+                placeholder="空欄で API 既定値"
+              />
+              <NumberSliderField
+                id="inworldTemperature"
+                label="Temperature"
+                value={inworld.temperature.value}
+                onChange={inworld.temperature.onChange}
+                config={SLIDER_CONFIG.inworldTemperature}
+                placeholder="TTS-2 では deliveryMode を使用"
+              />
+              <div className="form-group">
+                <label htmlFor="inworldLanguage">Language</label>
+                <input
+                  id="inworldLanguage"
+                  type="text"
+                  value={inworld.language.value}
+                  onChange={(e) => inworld.language.onChange(e.target.value)}
+                  placeholder="例: ja-JP（空欄で自動）"
+                />
+              </div>
+              <div className="form-group">
+                <label htmlFor="inworldDeliveryMode">Delivery Mode</label>
+                <select
+                  id="inworldDeliveryMode"
+                  value={inworld.deliveryMode.value}
+                  onChange={(e) =>
+                    inworld.deliveryMode.onChange(
+                      e.target.value as InworldDeliveryModeOption,
+                    )
+                  }
+                >
+                  <option value="default">API既定値</option>
+                  {Object.entries(inworld.deliveryModes).map(
+                    ([mode, description]) => (
+                      <option key={mode} value={mode}>
+                        {description}
+                      </option>
+                    ),
+                  )}
+                </select>
+              </div>
+            </div>
+          </div>
+        </CollapsibleCard>
+      )}
+
+      {engine === 'gradium' && (
+        <CollapsibleCard
+          className="parameter-card openai-card"
+          title="Gradium TTS パラメータ"
+          description="Gradium の REST TTS エンドポイント向け設定です。voice は上部の Speaker で選択し、ここでは出力形式と json_config を調整できます。"
+        >
+          <div className="parameter-section">
+            <div className="parameter-section__title">出力フォーマット</div>
+            <div className="parameter-grid parameter-grid--two">
+              <div className="form-group">
+                <label htmlFor="gradiumOutputFormat">Output Format</label>
+                <select
+                  id="gradiumOutputFormat"
+                  value={gradium.outputFormat.value}
+                  onChange={(e) =>
+                    gradium.outputFormat.onChange(
+                      e.target.value as GradiumOutputFormat,
+                    )
+                  }
+                >
+                  {Object.entries(gradium.outputFormats).map(
+                    ([value, label]) => (
+                      <option key={value} value={value}>
+                        {label}
+                      </option>
+                    ),
+                  )}
+                </select>
+              </div>
+            </div>
+          </div>
+
+          <div className="parameter-section">
+            <div className="parameter-section__title">生成調整</div>
+            <div className="parameter-grid parameter-grid--two">
+              <NumberSliderField
+                id="gradiumTemperature"
+                label="Temperature (0.0 - 1.4)"
+                value={gradium.temperature.value}
+                onChange={gradium.temperature.onChange}
+                config={SLIDER_CONFIG.gradiumTemperature}
+                placeholder="例: 0.7"
+              />
+              <NumberSliderField
+                id="gradiumVoiceSimilarity"
+                label="Voice Similarity / cfg_coef (1.0 - 4.0)"
+                value={gradium.voiceSimilarity.value}
+                onChange={gradium.voiceSimilarity.onChange}
+                config={SLIDER_CONFIG.gradiumVoiceSimilarity}
+                placeholder="例: 2.0"
+              />
+              <NumberSliderField
+                id="gradiumPaddingBonus"
+                label="Padding Bonus (-4.0 - 4.0)"
+                value={gradium.paddingBonus.value}
+                onChange={gradium.paddingBonus.onChange}
+                config={SLIDER_CONFIG.gradiumPaddingBonus}
+                placeholder="負の値で速く、正の値で遅く"
+              />
+              <div className="form-group">
+                <label htmlFor="gradiumRewriteRules">Rewrite Rules</label>
+                <input
+                  id="gradiumRewriteRules"
+                  type="text"
+                  value={gradium.rewriteRules.value}
+                  onChange={(e) =>
+                    gradium.rewriteRules.onChange(e.target.value)
+                  }
+                  placeholder="例: en, TimeEn,Date"
+                />
+              </div>
+            </div>
+          </div>
+
+          <p className="parameter-card__note">
+            Gradium の padding bonus は負の値で速く、正の値で遅くなります。
+          </p>
+        </CollapsibleCard>
+      )}
+
+      {engine === 'geminiTts' && (
+        <>
+          <div className="form-group">
+            <label htmlFor="geminiTtsModel">Model:</label>
+            <select
+              id="geminiTtsModel"
+              value={geminiTts.model.value}
+              onChange={(e) => geminiTts.model.onChange(e.target.value)}
+            >
+              {Object.entries(geminiTts.models).map(([modelId, desc]) => (
+                <option key={modelId} value={modelId}>
+                  {modelId} — {desc}
+                </option>
+              ))}
+            </select>
+          </div>
+          <div className="form-group">
+            <label htmlFor="geminiTtsLanguageCode">Language Code:</label>
+            <input
+              id="geminiTtsLanguageCode"
+              type="text"
+              value={geminiTts.languageCode.value}
+              onChange={(e) => geminiTts.languageCode.onChange(e.target.value)}
+              placeholder="ja-JP"
+            />
+          </div>
+          <div className="form-group">
+            <label htmlFor="geminiTtsPrompt">Style Prompt (optional):</label>
+            <input
+              id="geminiTtsPrompt"
+              type="text"
+              value={geminiTts.prompt.value}
+              onChange={(e) => geminiTts.prompt.onChange(e.target.value)}
+              placeholder="Speak in a cheerful tone"
+            />
+          </div>
+        </>
+      )}
+
+      {engine === 'openaiCompatible' && (
+        <CollapsibleCard
+          className="parameter-card openai-card"
+          title="OpenAI互換 TTS パラメータ"
+          description="`/v1/audio/speech` 互換のセルフホスト / ローカルTTSエンドポイント向けです。"
+        >
+          <div className="parameter-section">
+            <div className="parameter-section__title">モデル・話速</div>
+            <div className="parameter-grid parameter-grid--two">
+              <div className="form-group">
+                <label htmlFor="openaiCompatibleModel">Model</label>
+                <input
+                  id="openaiCompatibleModel"
+                  type="text"
+                  value={openaiCompatible.model.value}
+                  onChange={(e) =>
+                    openaiCompatible.model.onChange(e.target.value)
+                  }
+                  placeholder="例: your-model-id"
+                />
+              </div>
+              <NumberSliderField
+                id="openaiCompatibleSpeed"
+                label="Speed (0.25 - 4.0)"
+                value={openaiCompatible.speed.value}
+                onChange={openaiCompatible.speed.onChange}
+                config={SLIDER_CONFIG.openaiSpeed}
+                placeholder="例: 1.10（標準は 1.0）"
+              />
+            </div>
+          </div>
+
+          <p className="parameter-card__note">
+            Speaker を空欄にすると `voice` は送信されません。API URL の既定値は
+            `http://localhost:8880/v1/audio/speech` です。
+          </p>
+        </CollapsibleCard>
+      )}
+
+      {engine === 'voicevox' && (
+        <CollapsibleCard
+          className="parameter-card voicevox-card"
+          title="VOICEVOX パラメータ"
+          description="テキストから生成される音声の質感を細かく調整できます。未入力のフィールドは API の既定値のまま使用されます。"
+        >
+          <div className="parameter-section">
+            <div className="parameter-section__title">話速・ピッチ</div>
+            <div className="parameter-grid">
+              <NumberSliderField
+                id="voicevoxSpeedScale"
+                label="Speed Scale"
+                value={voicevox.speedScale.value}
+                onChange={voicevox.speedScale.onChange}
+                config={SLIDER_CONFIG.voicevoxSpeedScale}
+                placeholder="例: 1.10（標準は 1.0）"
+              />
+              <NumberSliderField
+                id="voicevoxPitchScale"
+                label="Pitch Scale"
+                value={voicevox.pitchScale.value}
+                onChange={voicevox.pitchScale.onChange}
+                config={SLIDER_CONFIG.voicevoxPitchScale}
+                placeholder="例: 0.15（標準は 0.0）"
+              />
+              <NumberSliderField
+                id="voicevoxIntonationScale"
+                label="Intonation Scale"
+                value={voicevox.intonationScale.value}
+                onChange={voicevox.intonationScale.onChange}
+                config={SLIDER_CONFIG.voicevoxIntonationScale}
+                placeholder="例: 1.20（標準は 1.0）"
+              />
+              <NumberSliderField
+                id="voicevoxVolumeScale"
+                label="Volume Scale"
+                value={voicevox.volumeScale.value}
+                onChange={voicevox.volumeScale.onChange}
+                config={SLIDER_CONFIG.voicevoxVolumeScale}
+                placeholder="例: 0.95（標準は 1.0）"
+              />
+            </div>
+          </div>
+
+          <div className="parameter-section">
+            <div className="parameter-section__title">無音コントロール</div>
+            <div className="parameter-grid">
+              <NumberSliderField
+                id="voicevoxPrePhonemeLength"
+                label="Pre-phoneme Length (sec)"
+                value={voicevox.prePhonemeLength.value}
+                onChange={voicevox.prePhonemeLength.onChange}
+                config={SLIDER_CONFIG.voicevoxPrePhonemeLength}
+                placeholder="例: 0.12"
+              />
+              <NumberSliderField
+                id="voicevoxPostPhonemeLength"
+                label="Post-phoneme Length (sec)"
+                value={voicevox.postPhonemeLength.value}
+                onChange={voicevox.postPhonemeLength.onChange}
+                config={SLIDER_CONFIG.voicevoxPostPhonemeLength}
+                placeholder="例: 0.08"
+              />
+              <NumberSliderField
+                id="voicevoxPauseLength"
+                label="Pause Length (sec)"
+                value={voicevox.pauseLength.value}
+                onChange={voicevox.pauseLength.onChange}
+                config={SLIDER_CONFIG.voicevoxPauseLength}
+                placeholder="例: 0.5（空欄で自動）"
+              />
+              <NumberSliderField
+                id="voicevoxPauseLengthScale"
+                label="Pause Length Scale"
+                value={voicevox.pauseLengthScale.value}
+                onChange={voicevox.pauseLengthScale.onChange}
+                config={SLIDER_CONFIG.voicevoxPauseLengthScale}
+                placeholder="例: 1.1（標準は 1.0）"
+              />
+            </div>
+          </div>
+
+          <div className="parameter-section">
+            <div className="parameter-section__title">出力フォーマット</div>
+            <div className="parameter-grid parameter-grid--two">
+              <div className="form-group">
+                <label htmlFor="voicevoxOutputSamplingRate">
+                  Output Sampling Rate
+                </label>
+                <select
+                  id="voicevoxOutputSamplingRate"
+                  value={voicevox.outputSamplingRate.value}
+                  onChange={(e) =>
+                    voicevox.outputSamplingRate.onChange(
+                      e.target.value as LocalOutputSamplingRateOption,
+                    )
+                  }
+                >
+                  <option value="default">API既定値を使用</option>
+                  <option value="8000">8,000 Hz</option>
+                  <option value="11025">11,025 Hz</option>
+                  <option value="16000">16,000 Hz</option>
+                  <option value="22050">22,050 Hz</option>
+                  <option value="24000">24,000 Hz</option>
+                  <option value="44100">44,100 Hz</option>
+                  <option value="48000">48,000 Hz</option>
+                </select>
+              </div>
+              <div className="form-group">
+                <label htmlFor="voicevoxOutputStereo">Output Stereo</label>
+                <select
+                  id="voicevoxOutputStereo"
+                  value={voicevox.outputStereo.value}
+                  onChange={(e) =>
+                    voicevox.outputStereo.onChange(
+                      e.target.value as OutputStereoOption,
+                    )
+                  }
+                >
+                  <option value="default">API既定値を使用</option>
+                  <option value="mono">モノラル（false）</option>
+                  <option value="stereo">ステレオ（true）</option>
+                </select>
+              </div>
+            </div>
+          </div>
+
+          <div className="parameter-section">
+            <div className="parameter-section__title">クエリオプション</div>
+            <div className="parameter-grid parameter-grid--two">
+              <div className="form-group">
+                <label htmlFor="voicevoxEnableKatakanaEnglish">
+                  Katakana English
+                </label>
+                <select
+                  id="voicevoxEnableKatakanaEnglish"
+                  value={voicevox.enableKatakanaEnglish.value}
+                  onChange={(e) =>
+                    voicevox.enableKatakanaEnglish.onChange(
+                      e.target.value as DefaultBooleanOption,
+                    )
+                  }
+                >
+                  <option value="default">API既定値（true）</option>
+                  <option value="true">有効</option>
+                  <option value="false">無効</option>
+                </select>
+              </div>
+              <div className="form-group">
+                <label htmlFor="voicevoxEnableInterrogativeUpspeak">
+                  Interrogative Upspeak
+                </label>
+                <select
+                  id="voicevoxEnableInterrogativeUpspeak"
+                  value={voicevox.enableInterrogativeUpspeak.value}
+                  onChange={(e) =>
+                    voicevox.enableInterrogativeUpspeak.onChange(
+                      e.target.value as DefaultBooleanOption,
+                    )
+                  }
+                >
+                  <option value="default">API既定値（true）</option>
+                  <option value="true">有効</option>
+                  <option value="false">無効</option>
+                </select>
+              </div>
+            </div>
+          </div>
+
+          <div className="parameter-section">
+            <div className="parameter-section__title">その他</div>
+            <div className="parameter-grid parameter-grid--two">
+              <div className="form-group" style={{ gridColumn: 'span 2' }}>
+                <label htmlFor="voicevoxCoreVersion">Core Version</label>
+                <input
+                  id="voicevoxCoreVersion"
+                  type="text"
+                  value={voicevox.coreVersion.value}
+                  onChange={(e) =>
+                    voicevox.coreVersion.onChange(e.target.value)
+                  }
+                  placeholder="例: 0.15.0（任意指定）"
+                />
+              </div>
+            </div>
+          </div>
+
+          <p className="parameter-card__note">
+            サンプリングレートは 8,000 / 11,025 / 16,000 / 22,050 / 24,000 /
+            44,100 / 48,000 Hz
+            をサポート。未入力の場合はエンジンの既定値が適用されます。
+          </p>
+        </CollapsibleCard>
+      )}
+
+      {engine === 'voicepeak' && (
+        <CollapsibleCard
+          className="parameter-card voicepeak-card"
+          title="VOICEPEAK パラメータ"
+          description="vpeakserver を利用してローカルの VOICEPEAK と連携します。未指定の項目は サーバー側の推奨値が適用されます。"
+        >
+          <div className="parameter-section">
+            <div className="parameter-section__title">Emotion Override</div>
+            <div
+              className="voicepeak-mode-toggle"
+              role="radiogroup"
+              aria-label="VoicePeak emotion mode"
+            >
+              <label className="voicepeak-mode-toggle__option">
+                <input
+                  type="radio"
+                  name="voicepeakEmotionMode"
+                  value="single"
+                  checked={voicepeak.mode === 'single'}
+                  onChange={() => voicepeak.setMode('single')}
+                />
+                <span>Single tag</span>
+              </label>
+              <label className="voicepeak-mode-toggle__option">
+                <input
+                  type="radio"
+                  name="voicepeakEmotionMode"
+                  value="weighted"
+                  checked={voicepeak.mode === 'weighted'}
+                  onChange={() => voicepeak.setMode('weighted')}
+                />
+                <span>Weighted map (vpeakserver v0.2.0+)</span>
+              </label>
+            </div>
+
+            {voicepeak.mode === 'single' ? (
+              <div className="parameter-grid">
+                <div className="form-group">
+                  <label htmlFor="voicepeakEmotion">Emotion Override</label>
+                  <select
+                    id="voicepeakEmotion"
+                    value={voicepeak.emotion.value}
+                    onChange={(e) =>
+                      voicepeak.emotion.onChange(
+                        e.target.value as VoicePeakEmotionOption,
+                      )
+                    }
+                  >
+                    <option value="neutral">neutral</option>
+                    <option value="happy">happy</option>
+                    <option value="fun">fun</option>
+                    <option value="angry">angry</option>
+                    <option value="sad">sad</option>
+                    <option value="surprised">surprised</option>
+                  </select>
+                </div>
+              </div>
+            ) : (
+              <>
+                <div className="parameter-grid">
+                  {VOICEPEAK_WEIGHT_KEYS.map((key) => (
+                    <NumberSliderField
+                      key={key}
+                      id={`voicepeakWeight${key}`}
+                      label={`${key} (0-100)`}
+                      value={voicepeak.weights[key]}
+                      onChange={(nextValue) =>
+                        voicepeak.setWeight(key, nextValue)
+                      }
+                      config={SLIDER_CONFIG.voicepeakEmotionWeight}
+                      placeholder="空欄で未指定"
+                    />
+                  ))}
+                </div>
+                <div
+                  className={`voicepeak-weight-sum${voicepeak.weightSum > 100 ? ' voicepeak-weight-sum--warning' : ''}`}
+                >
+                  Sum: {voicepeak.weightSum} / 100
+                </div>
+                {voicepeak.weightSum > 100 && (
+                  <p className="voicepeak-weight-error">
+                    合計が 100 を超えています。weight は合計 100
+                    以下に抑えてください。
+                  </p>
+                )}
+                <p className="parameter-card__note">
+                  空欄は重み未指定、すべて空欄なら emotion を送信しません。
+                  neutral は仕様上除外されます。vpeakserver v0.2.0+ が必要です。
+                </p>
+              </>
+            )}
+          </div>
+
+          <div className="parameter-section">
+            <div className="parameter-section__title">速度・ピッチ</div>
+            <div className="parameter-grid">
+              <NumberSliderField
+                id="voicepeakSpeed"
+                label="Speed (50-200)"
+                value={voicepeak.speed.value}
+                onChange={voicepeak.speed.onChange}
+                config={SLIDER_CONFIG.voicepeakSpeed}
+                placeholder="整数のみ（未入力で既定値）"
+              />
+              <NumberSliderField
+                id="voicepeakPitch"
+                label="Pitch (-300〜300)"
+                value={voicepeak.pitch.value}
+                onChange={voicepeak.pitch.onChange}
+                config={SLIDER_CONFIG.voicepeakPitch}
+                placeholder="整数のみ（未入力で既定値）"
+              />
+            </div>
+          </div>
+
+          <p className="parameter-card__note">
+            Single tag では選択した値をそのまま送信します。Speed と Pitch
+            を空欄にすると vpeakserver の初期値が利用されます。
+          </p>
+        </CollapsibleCard>
+      )}
+
+      {engine === 'aivisCloud' && (
+        <CollapsibleCard
+          className="parameter-card aiviscloud-card"
+          title="Aivis Cloud パラメータ"
+          description="クラウド版 Aivis のモデル・話者・出力条件を細かく指定できます。空欄や「API既定値」はサービス側のデフォルト設定が利用されます。"
+        >
+          <div className="parameter-grid parameter-grid--two parameter-card__grid">
+            <div className="form-group">
+              <label htmlFor="aivisCloudModelUuid">Model UUID (override)</label>
+              <input
+                id="aivisCloudModelUuid"
+                type="text"
+                value={aivisCloud.modelUuid.value}
+                onChange={(e) => aivisCloud.modelUuid.onChange(e.target.value)}
+                placeholder="空欄なら選択中のモデルを使用"
+              />
+            </div>
+          </div>
+
+          <div className="parameter-section">
+            <div className="parameter-section__title">話者・スタイル</div>
+            <div className="parameter-grid parameter-grid--two">
+              <div className="form-group">
+                <label htmlFor="aivisCloudSpeakerUuid">Speaker UUID</label>
+                <input
+                  id="aivisCloudSpeakerUuid"
+                  type="text"
+                  value={aivisCloud.speakerUuid.value}
+                  onChange={(e) =>
+                    aivisCloud.speakerUuid.onChange(e.target.value)
+                  }
+                  placeholder="複数話者モデルで指定 (任意)"
+                />
+              </div>
+              <div className="form-group">
+                <label htmlFor="aivisCloudStyleId">Style ID (0-31)</label>
+                <input
+                  id="aivisCloudStyleId"
+                  type="number"
+                  min="0"
+                  max="31"
+                  step="1"
+                  value={aivisCloud.styleId.value}
+                  onChange={(e) => aivisCloud.styleId.onChange(e.target.value)}
+                  placeholder="スタイルIDを使用する場合"
+                />
+              </div>
+              <div className="form-group">
+                <label htmlFor="aivisCloudStyleName">Style Name</label>
+                <input
+                  id="aivisCloudStyleName"
+                  type="text"
+                  value={aivisCloud.styleName.value}
+                  onChange={(e) =>
+                    aivisCloud.styleName.onChange(e.target.value)
+                  }
+                  placeholder="スタイル名を直接指定 (IDと併用不可)"
+                />
+              </div>
+              <div className="form-group">
+                <label htmlFor="aivisCloudUseSsml">Use SSML</label>
+                <select
+                  id="aivisCloudUseSsml"
+                  value={aivisCloud.useSsml.value}
+                  onChange={(e) =>
+                    aivisCloud.useSsml.onChange(
+                      e.target.value as AivisCloudBooleanOption,
+                    )
+                  }
+                >
+                  <option value="default">API既定値（true）</option>
+                  <option value="true">有効</option>
+                  <option value="false">無効</option>
+                </select>
+              </div>
+              <div className="form-group">
+                <label htmlFor="aivisCloudLanguage">Language</label>
+                <input
+                  id="aivisCloudLanguage"
+                  type="text"
+                  value={aivisCloud.language.value}
+                  onChange={(e) => aivisCloud.language.onChange(e.target.value)}
+                  placeholder="例: ja （現状日本語のみ）"
+                />
+              </div>
+            </div>
+          </div>
+
+          <div className="parameter-section">
+            <div className="parameter-section__title">話速・感情</div>
+            <div className="parameter-grid parameter-grid--two">
+              <NumberSliderField
+                id="aivisCloudSpeakingRate"
+                label="Speaking Rate"
+                value={aivisCloud.speakingRate.value}
+                onChange={aivisCloud.speakingRate.onChange}
+                config={SLIDER_CONFIG.aivisCloudSpeakingRate}
+                placeholder="例: 1.05 （0.5〜1.5）"
+              />
+              <NumberSliderField
+                id="aivisCloudEmotionalIntensity"
+                label="Emotional Intensity"
+                value={aivisCloud.emotionalIntensity.value}
+                onChange={aivisCloud.emotionalIntensity.onChange}
+                config={SLIDER_CONFIG.aivisCloudEmotionalIntensity}
+                placeholder="例: 1.2 （0.0〜2.0）"
+              />
+              <NumberSliderField
+                id="aivisCloudTempoDynamics"
+                label="Tempo Dynamics"
+                value={aivisCloud.tempoDynamics.value}
+                onChange={aivisCloud.tempoDynamics.onChange}
+                config={SLIDER_CONFIG.aivisCloudTempoDynamics}
+                placeholder="話速の緩急（0.0〜2.0）"
+              />
+              <NumberSliderField
+                id="aivisCloudPitch"
+                label="Pitch"
+                value={aivisCloud.pitch.value}
+                onChange={aivisCloud.pitch.onChange}
+                config={SLIDER_CONFIG.aivisCloudPitch}
+                placeholder="例: 0.10 （-1.0〜1.0）"
+              />
+              <NumberSliderField
+                id="aivisCloudVolume"
+                label="Volume"
+                value={aivisCloud.volume.value}
+                onChange={aivisCloud.volume.onChange}
+                config={SLIDER_CONFIG.aivisCloudVolume}
+                placeholder="例: 1.0 （0.0〜2.0）"
+              />
+            </div>
+          </div>
+
+          <div className="parameter-section">
+            <div className="parameter-section__title">無音コントロール</div>
+            <div className="parameter-grid parameter-grid--two">
+              <NumberSliderField
+                id="aivisCloudLeadingSilence"
+                label="Leading Silence (sec)"
+                value={aivisCloud.leadingSilence.value}
+                onChange={aivisCloud.leadingSilence.onChange}
+                config={SLIDER_CONFIG.aivisCloudLeadingSilence}
+                placeholder="先頭無音 0.0〜0.6"
+              />
+              <NumberSliderField
+                id="aivisCloudTrailingSilence"
+                label="Trailing Silence (sec)"
+                value={aivisCloud.trailingSilence.value}
+                onChange={aivisCloud.trailingSilence.onChange}
+                config={SLIDER_CONFIG.aivisCloudTrailingSilence}
+                placeholder="末尾無音 0.0〜0.6"
+              />
+              <NumberSliderField
+                id="aivisCloudLineBreakSilence"
+                label="Line Break Silence (sec)"
+                value={aivisCloud.lineBreakSilence.value}
+                onChange={aivisCloud.lineBreakSilence.onChange}
+                config={SLIDER_CONFIG.aivisCloudLineBreakSilence}
+                placeholder="改行ごとの無音（0.0〜0.6）"
+              />
+            </div>
+          </div>
+
+          <div className="parameter-section">
+            <div className="parameter-section__title">出力フォーマット</div>
+            <div className="parameter-grid parameter-grid--two">
+              <div className="form-group">
+                <label htmlFor="aivisCloudOutputFormat">Output Format</label>
+                <select
+                  id="aivisCloudOutputFormat"
+                  value={aivisCloud.outputFormat.value}
+                  onChange={(e) =>
+                    aivisCloud.outputFormat.onChange(
+                      e.target.value as AivisCloudOutputFormatOption,
+                    )
+                  }
+                >
+                  <option value="default">API既定値（mp3）</option>
+                  <option value="wav">wav</option>
+                  <option value="flac">flac</option>
+                  <option value="mp3">mp3</option>
+                  <option value="aac">aac</option>
+                  <option value="opus">opus</option>
+                </select>
+              </div>
+              <div className="form-group">
+                <label htmlFor="aivisCloudOutputBitrate">
+                  Output Bitrate (kbps)
+                </label>
+                <input
+                  id="aivisCloudOutputBitrate"
+                  type="number"
+                  step="8"
+                  min="8"
+                  max="320"
+                  value={aivisCloud.outputBitrate.value}
+                  onChange={(e) =>
+                    aivisCloud.outputBitrate.onChange(e.target.value)
+                  }
+                  placeholder="例: 192 （mp3/aac/opus のみ）"
+                />
+              </div>
+              <div className="form-group">
+                <label htmlFor="aivisCloudOutputSamplingRate">
+                  Output Sampling Rate
+                </label>
+                <select
+                  id="aivisCloudOutputSamplingRate"
+                  value={aivisCloud.outputSamplingRate.value}
+                  onChange={(e) =>
+                    aivisCloud.outputSamplingRate.onChange(
+                      e.target.value as AivisCloudOutputSamplingRateOption,
+                    )
+                  }
+                >
+                  <option value="default">API既定値を使用</option>
+                  <option value="8000">8,000 Hz</option>
+                  <option value="11025">11,025 Hz</option>
+                  <option value="12000">12,000 Hz</option>
+                  <option value="16000">16,000 Hz</option>
+                  <option value="22050">22,050 Hz</option>
+                  <option value="24000">24,000 Hz</option>
+                  <option value="44100">44,100 Hz</option>
+                  <option value="48000">48,000 Hz</option>
+                </select>
+              </div>
+              <div className="form-group">
+                <label htmlFor="aivisCloudOutputChannels">
+                  Output Channels
+                </label>
+                <select
+                  id="aivisCloudOutputChannels"
+                  value={aivisCloud.outputChannels.value}
+                  onChange={(e) =>
+                    aivisCloud.outputChannels.onChange(
+                      e.target.value as AivisCloudOutputChannelOption,
+                    )
+                  }
+                >
+                  <option value="default">API既定値（mono）</option>
+                  <option value="mono">モノラル</option>
+                  <option value="stereo">ステレオ</option>
+                </select>
+              </div>
+            </div>
+          </div>
+
+          <div className="parameter-section">
+            <div className="parameter-section__title">その他</div>
+            <div className="parameter-grid parameter-grid--two">
+              <div className="form-group">
+                <label htmlFor="aivisCloudUserDictionaryUuid">
+                  User Dictionary UUID
+                </label>
+                <input
+                  id="aivisCloudUserDictionaryUuid"
+                  type="text"
+                  value={aivisCloud.userDictionaryUuid.value}
+                  onChange={(e) =>
+                    aivisCloud.userDictionaryUuid.onChange(e.target.value)
+                  }
+                  placeholder="適用したいユーザー辞書がある場合"
+                />
+              </div>
+              <div className="form-group">
+                <label htmlFor="aivisCloudEnableBillingLogs">
+                  Billing Logs
+                </label>
+                <select
+                  id="aivisCloudEnableBillingLogs"
+                  value={aivisCloud.enableBillingLogs.value}
+                  onChange={(e) =>
+                    aivisCloud.enableBillingLogs.onChange(
+                      e.target.value as AivisCloudBooleanOption,
+                    )
+                  }
+                >
+                  <option value="default">API既定値（false）</option>
+                  <option value="true">ログを出力する</option>
+                  <option value="false">ログを出力しない</option>
+                </select>
+              </div>
+            </div>
+          </div>
+
+          <p className="parameter-card__note">
+            スタイル ID とスタイル名はどちらか片方のみ指定してください。 SSML
+            を有効にすると改行や &lt;break&gt;
+            タグに基づいて音声が分割されます。
+          </p>
+        </CollapsibleCard>
+      )}
+
+      {engine === 'aivisSpeech' && (
+        <CollapsibleCard
+          className="parameter-card aivisspeech-card"
+          title="AivisSpeech パラメータ"
+          description="テキストから生成される音声の質感を細かく調整できます。未入力のフィールドは API の既定値のまま使用されます。"
+        >
+          <div className="parameter-section">
+            <div className="parameter-section__title">話速・ピッチ</div>
+            <div className="parameter-grid">
+              <NumberSliderField
+                id="aivisSpeedScale"
+                label="Speed Scale"
+                value={aivisSpeech.speedScale.value}
+                onChange={aivisSpeech.speedScale.onChange}
+                config={SLIDER_CONFIG.aivisSpeedScale}
+                placeholder="例: 1.10（標準は 1.0）"
+              />
+              <NumberSliderField
+                id="aivisPitchScale"
+                label="Pitch Scale"
+                value={aivisSpeech.pitchScale.value}
+                onChange={aivisSpeech.pitchScale.onChange}
+                config={SLIDER_CONFIG.aivisPitchScale}
+                placeholder="例: 0.15（標準は 0.0）"
+              />
+              <NumberSliderField
+                id="aivisIntonationScale"
+                label="Intonation Scale"
+                value={aivisSpeech.intonationScale.value}
+                onChange={aivisSpeech.intonationScale.onChange}
+                config={SLIDER_CONFIG.aivisIntonationScale}
+                placeholder="例: 1.20（標準は 1.0）"
+              />
+              <NumberSliderField
+                id="aivisTempoDynamicsScale"
+                label="Tempo Dynamics Scale"
+                value={aivisSpeech.tempoDynamicsScale.value}
+                onChange={aivisSpeech.tempoDynamicsScale.onChange}
+                config={SLIDER_CONFIG.aivisTempoDynamicsScale}
+                placeholder="例: 1.10（標準は 1.0）"
+              />
+              <NumberSliderField
+                id="aivisVolumeScale"
+                label="Volume Scale"
+                value={aivisSpeech.volumeScale.value}
+                onChange={aivisSpeech.volumeScale.onChange}
+                config={SLIDER_CONFIG.aivisVolumeScale}
+                placeholder="例: 0.95（標準は 1.0）"
+              />
+            </div>
+          </div>
+
+          <div className="parameter-section">
+            <div className="parameter-section__title">無音コントロール</div>
+            <div className="parameter-grid">
+              <NumberSliderField
+                id="aivisPrePhonemeLength"
+                label="Pre-phoneme Length (sec)"
+                value={aivisSpeech.prePhonemeLength.value}
+                onChange={aivisSpeech.prePhonemeLength.onChange}
+                config={SLIDER_CONFIG.aivisPrePhonemeLength}
+                placeholder="例: 0.12"
+              />
+              <NumberSliderField
+                id="aivisPostPhonemeLength"
+                label="Post-phoneme Length (sec)"
+                value={aivisSpeech.postPhonemeLength.value}
+                onChange={aivisSpeech.postPhonemeLength.onChange}
+                config={SLIDER_CONFIG.aivisPostPhonemeLength}
+                placeholder="例: 0.08"
+              />
+              <NumberSliderField
+                id="aivisPauseLength"
+                label="Pause Length (sec)"
+                value={aivisSpeech.pauseLength.value}
+                onChange={aivisSpeech.pauseLength.onChange}
+                config={SLIDER_CONFIG.aivisPauseLength}
+                placeholder="例: 0.5（空欄で自動）"
+              />
+              <NumberSliderField
+                id="aivisPauseLengthScale"
+                label="Pause Length Scale"
+                value={aivisSpeech.pauseLengthScale.value}
+                onChange={aivisSpeech.pauseLengthScale.onChange}
+                config={SLIDER_CONFIG.aivisPauseLengthScale}
+                placeholder="例: 1.1（標準は 1.0）"
+              />
+            </div>
+          </div>
+
+          <div className="parameter-section">
+            <div className="parameter-section__title">出力フォーマット</div>
+            <div className="parameter-grid parameter-grid--two">
+              <div className="form-group">
+                <label htmlFor="aivisOutputSamplingRate">
+                  Output Sampling Rate
+                </label>
+                <select
+                  id="aivisOutputSamplingRate"
+                  value={aivisSpeech.outputSamplingRate.value}
+                  onChange={(e) =>
+                    aivisSpeech.outputSamplingRate.onChange(
+                      e.target.value as LocalOutputSamplingRateOption,
+                    )
+                  }
+                >
+                  <option value="default">API既定値を使用</option>
+                  <option value="8000">8,000 Hz</option>
+                  <option value="11025">11,025 Hz</option>
+                  <option value="16000">16,000 Hz</option>
+                  <option value="22050">22,050 Hz</option>
+                  <option value="24000">24,000 Hz</option>
+                  <option value="44100">44,100 Hz</option>
+                  <option value="48000">48,000 Hz</option>
+                </select>
+              </div>
+              <div className="form-group">
+                <label htmlFor="aivisOutputStereo">Output Stereo</label>
+                <select
+                  id="aivisOutputStereo"
+                  value={aivisSpeech.outputStereo.value}
+                  onChange={(e) =>
+                    aivisSpeech.outputStereo.onChange(
+                      e.target.value as OutputStereoOption,
+                    )
+                  }
+                >
+                  <option value="default">API既定値を使用</option>
+                  <option value="mono">モノラル（false）</option>
+                  <option value="stereo">ステレオ（true）</option>
+                </select>
+              </div>
+            </div>
+          </div>
+
+          <p className="parameter-card__note">
+            サンプリングレートは 8,000 / 11,025 / 16,000 / 22,050 / 24,000 /
+            44,100 / 48,000 Hz
+            をサポート。未入力の場合はエンジンの既定値が適用されます。
+          </p>
+        </CollapsibleCard>
+      )}
+
+      {engine === 'minimax' && (
+        <>
+          <div className="form-group">
+            <label htmlFor="minimaxModel">MiniMax Model:</label>
+            <select
+              id="minimaxModel"
+              value={minimax.model.value}
+              onChange={(e) =>
+                minimax.model.onChange(e.target.value as MinimaxModel)
+              }
+            >
+              {Object.entries(MINIMAX_MODELS).map(([model, description]) => (
+                <option key={model} value={model}>
+                  {model} - {description}
+                </option>
+              ))}
+            </select>
+          </div>
+
+          <CollapsibleCard
+            className="advanced-card"
+            title="MiniMax Voice Parameters"
+          >
+            <div className="form-group">
+              <label htmlFor="minimaxLanguageBoost">Language Boost:</label>
+              <input
+                id="minimaxLanguageBoost"
+                type="text"
+                value={minimax.languageBoost.value}
+                onChange={(e) => minimax.languageBoost.onChange(e.target.value)}
+                placeholder="e.g. Japanese"
+              />
+            </div>
+
+            <div className="grid">
+              <NumberSliderField
+                id="minimaxSpeed"
+                label="Speed (1.0 = default)"
+                value={minimax.speed.value}
+                onChange={minimax.speed.onChange}
+                config={SLIDER_CONFIG.minimaxSpeed}
+                placeholder="Auto"
+              />
+              <NumberSliderField
+                id="minimaxVolume"
+                label="Volume (1.0 = default)"
+                value={minimax.volume.value}
+                onChange={minimax.volume.onChange}
+                config={SLIDER_CONFIG.minimaxVolume}
+                placeholder="Auto"
+              />
+              <NumberSliderField
+                id="minimaxPitch"
+                label="Pitch (semitones)"
+                value={minimax.pitch.value}
+                onChange={minimax.pitch.onChange}
+                config={SLIDER_CONFIG.minimaxPitch}
+                placeholder="Auto"
+              />
+            </div>
+
+            <div className="grid">
+              <div className="form-group">
+                <label htmlFor="minimaxSampleRate">Sample Rate:</label>
+                <select
+                  id="minimaxSampleRate"
+                  value={minimax.sampleRate.value}
+                  onChange={(e) => minimax.sampleRate.onChange(e.target.value)}
+                >
+                  <option value="8000">8,000 Hz</option>
+                  <option value="16000">16,000 Hz</option>
+                  <option value="22050">22,050 Hz</option>
+                  <option value="24000">24,000 Hz</option>
+                  <option value="32000">32,000 Hz</option>
+                  <option value="44100">44,100 Hz</option>
+                </select>
+              </div>
+              <div className="form-group">
+                <label htmlFor="minimaxBitrate">Bitrate (bps):</label>
+                <select
+                  id="minimaxBitrate"
+                  value={minimax.bitrate.value}
+                  onChange={(e) => minimax.bitrate.onChange(e.target.value)}
+                >
+                  <option value="32000">32,000</option>
+                  <option value="64000">64,000</option>
+                  <option value="128000">128,000</option>
+                  <option value="256000">256,000</option>
+                </select>
+              </div>
+              <div className="form-group">
+                <label htmlFor="minimaxAudioFormat">Audio Format:</label>
+                <select
+                  id="minimaxAudioFormat"
+                  value={minimax.audioFormat.value}
+                  onChange={(e) =>
+                    minimax.audioFormat.onChange(
+                      e.target.value as MinimaxAudioFormat,
+                    )
+                  }
+                >
+                  <option value="mp3">MP3</option>
+                  <option value="wav">WAV</option>
+                  <option value="aac">AAC</option>
+                  <option value="pcm">PCM</option>
+                  <option value="flac">FLAC</option>
+                  <option value="ogg">OGG</option>
+                </select>
+              </div>
+              <div className="form-group">
+                <label htmlFor="minimaxAudioChannel">Channel:</label>
+                <select
+                  id="minimaxAudioChannel"
+                  value={minimax.audioChannel.value}
+                  onChange={(e) =>
+                    minimax.audioChannel.onChange(
+                      e.target.value === '2' ? '2' : '1',
+                    )
+                  }
+                >
+                  <option value="1">Mono (1ch)</option>
+                  <option value="2">Stereo (2ch)</option>
+                </select>
+              </div>
+            </div>
+
+            <p className="helper-text">
+              Leave fields blank to use MiniMax defaults or emotion-based
+              automatic values.
+            </p>
+          </CollapsibleCard>
+        </>
+      )}
+
+      {engine === 'piperPlus' && (
+        <CollapsibleCard
+          className="parameter-card"
+          title="Piper Plus パラメータ"
+          description="ブラウザ内蔵 WASM 音声合成エンジンです。ONNX Runtime + OpenJTalk を使用します。"
+        >
+          <div className="parameter-section">
+            <div className="parameter-section__title">音声調整</div>
+            <div className="parameter-grid parameter-grid--two">
+              <NumberSliderField
+                id="piperPlusSpeed"
+                label="Speed (0.5 - 2.0)"
+                value={piperPlus.speed.value}
+                onChange={piperPlus.speed.onChange}
+                config={SLIDER_CONFIG.piperPlusSpeed}
+                placeholder="例: 1.0（標準）"
+              />
+              <NumberSliderField
+                id="piperPlusNoiseScale"
+                label="Noise Scale (0.0 - 2.0)"
+                value={piperPlus.noiseScale.value}
+                onChange={piperPlus.noiseScale.onChange}
+                config={SLIDER_CONFIG.piperPlusNoiseScale}
+                placeholder="例: 1.0（標準）"
+              />
+            </div>
+          </div>
+        </CollapsibleCard>
+      )}
+    </>
+  );
+}

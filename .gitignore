@@ -1,0 +1,64 @@
+# Local orchestration state and downloaded archives
+.runtime/
+.agents/
+.codex/
+*.zip
+
+# JavaScript dependencies and generated output
+**/node_modules/
+**/.pnp/
+**/.next/
+**/dist/
+**/build/
+**/coverage/
+**/*.tsbuildinfo
+
+# Python environments and caches
+**/.venv/
+**/venv/
+**/*_env/
+**/__pycache__/
+**/*.py[cod]
+**/.pytest_cache/
+**/.mypy_cache/
+
+# Runtime logs, caches, captures, and generated media
+**/logs/
+**/outputs/
+**/results/
+**/tmp/
+**/temp/
+**/.cache/
+**/.gradio/
+**/gradio_temp/
+**/data/audio/captured/
+**/*.log
+
+# Downloaded model weights and local tool bundles
+**/models/
+**/pretrained_weights/
+**/checkpoints/
+**/weights/
+**/ffmpeg/
+**/*.pth
+**/*.pt
+**/*.ckpt
+**/*.onnx
+**/*.safetensors
+
+# Local credentials
+**/.env
+**/.env.*
+!**/.env.example
+!**/*.example.env
+**/*.pem
+**/*.key
+
+# Preserved metadata while importing nested upstream checkouts
+**/.git-upstream/
+
+# OS/editor noise
+**/.DS_Store
+**/Thumbs.db
+**/.idea/
+**/.vscode/

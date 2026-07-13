@@ -1,0 +1,768 @@
+import type {
+  CommentAnalysisMode,
+  CommentIntelligenceConfig,
+} from './types/config.js';
+import type { AnsweredState } from './types/answered.js';
+import type { LLMCommentAnalysisResult } from './types/llm.js';
+import type {
+  AnalyzeCommentsInput,
+  CommentIntelligenceResult,
+} from './types/result.js';
+import type { SafetyCategory, SafetyReport } from './types/safety.js';
+import type { ViewerSafetyState } from './types/viewer.js';
+import { buildInstruction } from './context/buildInstruction.js';
+import { buildLLMContext } from './context/buildLLMContext.js';
+import { rankComments } from './ranking/rankComments.js';
+import { ruleBasedSafetyProvider } from './safety/ruleBasedSafetyProvider.js';
+import { summarizeIgnoredComments } from './summarization/summarizeIgnoredComments.js';
+import type { RankedComment } from './types/ranking.js';
+
+export const DEFAULT_COMMENT_INTELLIGENCE_CONFIG: CommentIntelligenceConfig = {
+  analysis: {
+    mode: 'rules',
+    llmPolicy: {
+      minComments: 8,
+      timeoutMs: 3000,
+      fallbackToRules: true,
+    },
+  },
+  safety: {
+    enabled: true,
+    ignoreHighRisk: true,
+    ignoreMediumRisk: true,
+    blockPromptInjection: true,
+    blockUrls: false,
+  },
+  ranking: {
+    strategy: 'balanced',
+    topicFilter: 'prefer',
+    maxSelectedComments: 1,
+    minScore: 0.3,
+    answeredMemory: {
+      enabled: true,
+      ttlMs: 10 * 60 * 1000,
+      mode: 'deprioritize',
+      dedupeByViewer: false,
+    },
+  },
+  summary: {
+    enabled: true,
+    includeIgnoredSummary: true,
+    maxExamplesPerCluster: 3,
+  },
+  context: {
+    language: 'ja',
+    style: 'aituber-live',
+  },
+  viewerSafety: {
+    enabled: true,
+    blockOnHighRisk: true,
+    blockDurationMs: 10 * 60 * 1000,
+    violationThreshold: 1,
+  },
+};
+
+export function createCommentIntelligence(config?: CommentIntelligenceConfig) {
+  const baseConfig = mergeConfig(DEFAULT_COMMENT_INTELLIGENCE_CONFIG, config);
+  const viewerSafetyStates = new Map<string, ViewerSafetyState>();
+  const answeredStates = new Map<string, AnsweredState>();
+
+  return {
+    async analyze(
+      input: AnalyzeCommentsInput
+    ): Promise<CommentIntelligenceResult> {
+      const mergedConfig = mergeConfig(baseConfig, input.options);
+      return analyzeWithConfig(
+        input,
+        mergedConfig,
+        viewerSafetyStates,
+        answeredStates
+      );
+    },
+    markAnswered(
+      commentId: string | string[],
+      options?: { authorId?: string; at?: number }
+    ): void {
+      const ids = Array.isArray(commentId) ? commentId : [commentId];
+      const answeredAt = options?.at ?? Date.now();
+      for (const id of ids) {
+        answeredStates.set(id, {
+          commentId: id,
+          authorId: options?.authorId,
+          answeredAt,
+        });
+      }
+    },
+    getAnsweredState(commentId: string): AnsweredState | undefined {
+      const state = answeredStates.get(commentId);
+      return state ? { ...state } : undefined;
+    },
+    listAnsweredStates(): AnsweredState[] {
+      return [...answeredStates.values()].map((state) => ({ ...state }));
+    },
+    clearAnswered(commentId?: string): void {
+      if (commentId) {
+        answeredStates.delete(commentId);
+        return;
+      }
+      answeredStates.clear();
+    },
+    getViewerSafetyState(viewerId: string): ViewerSafetyState | undefined {
+      const state = viewerSafetyStates.get(viewerId);
+      return state
+        ? { ...state, categories: [...state.categories] }
+        : undefined;
+    },
+    resetViewerSafetyState(viewerId?: string): void {
+      if (viewerId) {
+        viewerSafetyStates.delete(viewerId);
+        return;
+      }
+      viewerSafetyStates.clear();
+    },
+  };
+}
+
+export async function analyzeComments(
+  input: AnalyzeCommentsInput & { config?: CommentIntelligenceConfig }
+): Promise<CommentIntelligenceResult> {
+  return createCommentIntelligence(input.config).analyze(input);
+}
+
+function mergeConfig(
+  base: CommentIntelligenceConfig,
+  override?: Partial<CommentIntelligenceConfig>
+): CommentIntelligenceConfig {
+  return {
+    analysis: {
+      ...base.analysis,
+      ...override?.analysis,
+      llmPolicy: {
+        ...base.analysis?.llmPolicy,
+        ...override?.analysis?.llmPolicy,
+      },
+    },
+    safety: { ...base.safety, ...override?.safety },
+    ranking: {
+      ...base.ranking,
+      ...override?.ranking,
+      answeredMemory: {
+        ...base.ranking?.answeredMemory,
+        ...override?.ranking?.answeredMemory,
+      },
+      weights: {
+        ...base.ranking?.weights,
+        ...override?.ranking?.weights,
+      },
+    },
+    summary: { ...base.summary, ...override?.summary },
+    context: { ...base.context, ...override?.context },
+    viewerSafety: { ...base.viewerSafety, ...override?.viewerSafety },
+  };
+}
+
+async function analyzeWithConfig(
+  input: AnalyzeCommentsInput,
+  config: CommentIntelligenceConfig,
+  viewerSafetyStates: Map<string, ViewerSafetyState>,
+  answeredStates: Map<string, AnsweredState>
+): Promise<CommentIntelligenceResult> {
+  const rulesResult = buildRulesResult(
+    input,
+    config,
+    false,
+    viewerSafetyStates,
+    answeredStates
+  );
+  const llmProvider = config.analysis?.llmProvider;
+  const mode = config.analysis?.mode ?? 'rules';
+  const shouldUseLLM =
+    Boolean(llmProvider) &&
+    (mode === 'llm-assisted' ||
+      (mode === 'hybrid' &&
+        input.comments.length >=
+          (config.analysis?.llmPolicy?.minComments ?? 8)));
+
+  if (!shouldUseLLM || !llmProvider) {
+    return rulesResult;
+  }
+
+  try {
+    const llmComments = input.comments.slice(
+      0,
+      config.analysis?.llmPolicy?.maxComments ?? input.comments.length
+    );
+    const llmResult = await withOptionalTimeout(
+      llmProvider.analyze({
+        comments: llmComments,
+        streamState: input.streamState,
+        recentMessages: input.recentMessages ?? input.recentAiMessages,
+        recentAiMessages: input.recentAiMessages ?? input.recentMessages,
+      }),
+      config.analysis?.llmPolicy?.timeoutMs
+    );
+    return applyLLMResult(
+      rulesResult,
+      llmResult,
+      mode,
+      new Set(llmComments.map((comment) => comment.id)),
+      config.ranking,
+      input.streamState
+    );
+  } catch (error) {
+    if (config.analysis?.llmPolicy?.fallbackToRules === false) {
+      throw error;
+    }
+    return rulesResult;
+  }
+}
+
+function buildRulesResult(
+  input: AnalyzeCommentsInput,
+  config: CommentIntelligenceConfig,
+  usedLLM: boolean,
+  viewerSafetyStates: Map<string, ViewerSafetyState>,
+  answeredStates: Map<string, AnsweredState>
+): CommentIntelligenceResult {
+  pruneExpiredViewerBlocks(viewerSafetyStates);
+  pruneExpiredAnsweredStates(answeredStates, config.ranking?.answeredMemory);
+  const answeredInput = buildAnsweredRankingInput(
+    input,
+    answeredStates,
+    config.ranking?.answeredMemory
+  );
+
+  let safetyReports = input.comments.map((comment) =>
+    ruleBasedSafetyProvider.check(comment, config.safety)
+  );
+  updateViewerSafetyStates(input, safetyReports, config, viewerSafetyStates);
+  safetyReports = addViewerBlockedReports(
+    input,
+    safetyReports,
+    config,
+    viewerSafetyStates
+  );
+  const { rankedComments, selectedComments } = rankComments({
+    comments: input.comments,
+    safetyReports,
+    viewerProfiles: input.viewerProfiles,
+    viewerSafetyStates: [...viewerSafetyStates.values()],
+    answeredStates: answeredInput.states,
+    answeredViewerIds: answeredInput.viewerIds,
+    streamState: input.streamState,
+    config: config.ranking,
+  });
+  const selectedIds = new Set(selectedComments.map((comment) => comment.id));
+  const ignoredComments = input.comments.filter(
+    (comment) => !selectedIds.has(comment.id)
+  );
+  const language = input.streamState?.language ?? config.context?.language;
+  const ignoredSummary =
+    config.summary?.enabled === false
+      ? {
+          totalCount: ignoredComments.length,
+          summary: '',
+          clusters: [],
+        }
+      : summarizeIgnoredComments({
+          comments: ignoredComments,
+          language,
+          maxExamplesPerCluster: config.summary?.maxExamplesPerCluster,
+        });
+  if (config.summary?.includeIgnoredSummary === false) {
+    ignoredSummary.summary = '';
+  }
+  const result: CommentIntelligenceResult = {
+    selectedComments,
+    rankedComments,
+    ignoredComments,
+    ignoredSummary,
+    safetyReports,
+    contextForLLM: [],
+    instructionForLLM: '',
+    answeredCommentIds: answeredInput.matchedCommentIds,
+    debug: {
+      mode: config.analysis?.mode ?? 'rules',
+      usedLLM,
+      analyzedCommentCount: input.comments.length,
+      selectedCommentIds: selectedComments.map((comment) => comment.id),
+      blockedViewerIds: getBlockedViewerIds(viewerSafetyStates),
+      llmUnmatchedIds: [],
+    },
+  };
+  result.contextForLLM = buildLLMContext(result, language);
+  result.instructionForLLM = buildDefaultInstruction(result, language);
+
+  return result;
+}
+
+function applyLLMResult(
+  rulesResult: CommentIntelligenceResult,
+  llmResult: LLMCommentAnalysisResult,
+  mode: CommentAnalysisMode,
+  llmCommentIds: Set<string>,
+  rankingConfig: CommentIntelligenceConfig['ranking'],
+  streamState: AnalyzeCommentsInput['streamState']
+): CommentIntelligenceResult {
+  const safetyReports = mergeLLMSafetyFlags(
+    rulesResult.safetyReports,
+    llmResult,
+    llmCommentIds
+  );
+  const rankedComments = applyLLMTopicRelatedReasons(
+    rulesResult.rankedComments,
+    llmResult,
+    llmCommentIds
+  );
+  const rankedById = new Map(
+    rankedComments.map((comment) => [comment.id, comment])
+  );
+  const topicFilter = rankingConfig?.topicFilter ?? 'prefer';
+  const hasTopic = Boolean(streamState?.topic?.trim());
+  const llmReturnedIds = uniqueStrings([
+    ...(llmResult.selectedCommentIds ?? []),
+    ...(llmResult.topicRelatedCommentIds ?? []),
+  ]);
+  const llmUnmatchedIds = llmReturnedIds.filter((id) => !llmCommentIds.has(id));
+  const safetyReportByCommentId = new Map(
+    safetyReports.map((report) => [report.commentId, report])
+  );
+  const isSafeComment = (comment: RankedComment) => {
+    const report = safetyReportByCommentId.get(comment.id);
+    return !report?.shouldIgnore;
+  };
+  const excludesAnswered =
+    rankingConfig?.answeredMemory?.enabled !== false &&
+    rankingConfig?.answeredMemory?.mode === 'exclude';
+  const isSelectableComment = (comment: RankedComment) =>
+    isSafeComment(comment) &&
+    (!excludesAnswered || !comment.reasons.includes('ignored_recently'));
+  const selectedFromLLM =
+    llmResult.selectedCommentIds
+      ?.filter((id) => llmCommentIds.has(id))
+      ?.map((id) => rankedById.get(id))
+      .filter((comment): comment is RankedComment => Boolean(comment))
+      .filter(isSelectableComment) ?? [];
+  const topicRelatedRanked = rankedComments
+    .filter((comment) => llmCommentIds.has(comment.id))
+    .filter((comment) => comment.reasons.includes('topic_related'))
+    .filter(isSelectableComment)
+    .sort((a, b) => b.score - a.score);
+  const maxSelected = rankingConfig?.maxSelectedComments ?? 1;
+  const selectedComments = selectLLMAwareComments({
+    selectedFromLLM,
+    topicRelatedRanked,
+    rulesSelectedComments: rulesResult.selectedComments,
+    topicFilter,
+    hasTopic,
+    maxSelected,
+  });
+  const selectedIds = new Set(selectedComments.map((comment) => comment.id));
+  const ignoredComments = rankedComments.filter(
+    (comment) => !selectedIds.has(comment.id)
+  );
+  const contextForLLM = [
+    ...rulesResult.contextForLLM,
+    ...(llmResult.contextForLLM ?? []),
+  ];
+  const instructionForLLM =
+    llmResult.instructionForLLM ?? rulesResult.instructionForLLM;
+  const ignoredSummary = llmResult.ignoredSummary
+    ? {
+        ...rulesResult.ignoredSummary,
+        summary: llmResult.ignoredSummary,
+      }
+    : rulesResult.ignoredSummary;
+
+  return {
+    ...rulesResult,
+    rankedComments,
+    selectedComments,
+    ignoredComments,
+    ignoredSummary,
+    safetyReports,
+    contextForLLM: [...new Set(contextForLLM)],
+    instructionForLLM,
+    debug: {
+      mode,
+      usedLLM: true,
+      analyzedCommentCount: rulesResult.debug?.analyzedCommentCount ?? 0,
+      selectedCommentIds: selectedComments.map((comment) => comment.id),
+      blockedViewerIds: rulesResult.debug?.blockedViewerIds ?? [],
+      llmUnmatchedIds,
+    },
+  };
+}
+
+function buildAnsweredRankingInput(
+  input: AnalyzeCommentsInput,
+  answeredStates: Map<string, AnsweredState>,
+  config?: NonNullable<CommentIntelligenceConfig['ranking']>['answeredMemory']
+): {
+  states: AnsweredState[];
+  viewerIds: string[];
+  matchedCommentIds: string[];
+} {
+  if (config?.enabled === false) {
+    return { states: [], viewerIds: [], matchedCommentIds: [] };
+  }
+
+  const commentsById = new Map(
+    input.comments.map((comment) => [comment.id, comment])
+  );
+  const states = [...answeredStates.values()].map((state) => ({ ...state }));
+
+  for (const commentId of input.answeredCommentIds ?? []) {
+    const comment = commentsById.get(commentId);
+    states.push({
+      commentId,
+      authorId: comment?.author.id,
+      answeredAt: Date.now(),
+    });
+  }
+
+  const viewerIds = [...new Set(input.answeredViewerIds ?? [])];
+  const answeredCommentIds = new Set(states.map((state) => state.commentId));
+  const answeredViewerIds = new Set(viewerIds);
+  if (config?.dedupeByViewer) {
+    for (const state of states) {
+      if (state.authorId) {
+        answeredViewerIds.add(state.authorId);
+      }
+    }
+  }
+
+  const matchedCommentIds = input.comments
+    .filter(
+      (comment) =>
+        answeredCommentIds.has(comment.id) ||
+        answeredViewerIds.has(comment.author.id)
+    )
+    .map((comment) => comment.id);
+
+  return {
+    states,
+    viewerIds,
+    matchedCommentIds,
+  };
+}
+
+// TODO: topicFilter selection is duplicated between rankComments and this LLM
+// path; keep them separate for now, but eventually use one selection function.
+function selectLLMAwareComments({
+  selectedFromLLM,
+  topicRelatedRanked,
+  rulesSelectedComments,
+  topicFilter,
+  hasTopic,
+  maxSelected,
+}: {
+  selectedFromLLM: RankedComment[];
+  topicRelatedRanked: RankedComment[];
+  rulesSelectedComments: RankedComment[];
+  topicFilter: NonNullable<
+    NonNullable<CommentIntelligenceConfig['ranking']>['topicFilter']
+  >;
+  hasTopic: boolean;
+  maxSelected: number;
+}): RankedComment[] {
+  if (!hasTopic || topicFilter === 'off') {
+    return selectedFromLLM.length > 0
+      ? selectedFromLLM.slice(0, maxSelected)
+      : rulesSelectedComments;
+  }
+
+  if (topicFilter === 'require') {
+    const selectedTopicMatches = selectedFromLLM.filter((comment) =>
+      comment.reasons.includes('topic_related')
+    );
+    return uniqueRankedComments([
+      ...selectedTopicMatches,
+      ...topicRelatedRanked,
+    ]).slice(0, maxSelected);
+  }
+
+  if (topicRelatedRanked.length > 0) {
+    return uniqueRankedComments([
+      ...topicRelatedRanked,
+      ...selectedFromLLM,
+    ]).slice(0, maxSelected);
+  }
+
+  return selectedFromLLM.length > 0
+    ? selectedFromLLM.slice(0, maxSelected)
+    : rulesSelectedComments;
+}
+
+function uniqueRankedComments(comments: RankedComment[]): RankedComment[] {
+  const seen = new Set<string>();
+  return comments.filter((comment) => {
+    if (seen.has(comment.id)) {
+      return false;
+    }
+    seen.add(comment.id);
+    return true;
+  });
+}
+
+function uniqueStrings(values: string[]): string[] {
+  return [...new Set(values)];
+}
+
+function applyLLMTopicRelatedReasons(
+  rankedComments: RankedComment[],
+  llmResult: LLMCommentAnalysisResult,
+  llmCommentIds: Set<string>
+): RankedComment[] {
+  const topicRelatedIds = new Set(
+    (llmResult.topicRelatedCommentIds ?? []).filter((id) =>
+      llmCommentIds.has(id)
+    )
+  );
+  if (topicRelatedIds.size === 0) {
+    return rankedComments;
+  }
+
+  return rankedComments.map((comment) => {
+    if (
+      !topicRelatedIds.has(comment.id) ||
+      comment.reasons.includes('topic_related')
+    ) {
+      return comment;
+    }
+
+    return {
+      ...comment,
+      reasons: [
+        ...comment.reasons.filter((reason) => reason !== 'topic_unrelated'),
+        'topic_related' as const,
+      ],
+      scoreBreakdown: {
+        ...comment.scoreBreakdown,
+        topicRelevance: Math.max(comment.scoreBreakdown.topicRelevance, 1),
+      },
+    };
+  });
+}
+
+function mergeLLMSafetyFlags(
+  safetyReports: SafetyReport[],
+  llmResult: LLMCommentAnalysisResult,
+  llmCommentIds: Set<string>
+): SafetyReport[] {
+  const byId = new Map(
+    safetyReports.map((report) => [report.commentId, report])
+  );
+
+  for (const flag of llmResult.safetyFlags ?? []) {
+    if (!llmCommentIds.has(flag.commentId)) {
+      continue;
+    }
+
+    const category = normalizeSafetyCategory(flag.category);
+    const existing = byId.get(flag.commentId);
+    byId.set(flag.commentId, {
+      commentId: flag.commentId,
+      riskLevel: 'high',
+      categories: [...new Set([...(existing?.categories ?? []), category])],
+      shouldIgnore: true,
+      reason: flag.reason,
+    });
+  }
+
+  return [...byId.values()];
+}
+
+function normalizeSafetyCategory(category: string): SafetyCategory {
+  const known: SafetyCategory[] = [
+    'prompt_injection',
+    'hostile_feedback',
+    'baiting',
+    'demoralizing',
+    'personal_info',
+    'harassment',
+    'sexual',
+    'violence',
+    'spam',
+    'url',
+    'repetition',
+    'viewer_blocked',
+    'unknown',
+  ];
+
+  return known.includes(category as SafetyCategory)
+    ? (category as SafetyCategory)
+    : 'unknown';
+}
+
+function updateViewerSafetyStates(
+  input: AnalyzeCommentsInput,
+  safetyReports: SafetyReport[],
+  config: CommentIntelligenceConfig,
+  viewerSafetyStates: Map<string, ViewerSafetyState>
+): void {
+  if (config.viewerSafety?.enabled === false) {
+    return;
+  }
+
+  const commentsById = new Map(
+    input.comments.map((comment) => [comment.id, comment])
+  );
+  const violationThreshold = config.viewerSafety?.violationThreshold ?? 1;
+  const shouldBlockOnHighRisk = config.viewerSafety?.blockOnHighRisk !== false;
+  const blockDurationMs =
+    config.viewerSafety?.blockDurationMs ?? 10 * 60 * 1000;
+
+  for (const report of safetyReports) {
+    if (report.riskLevel !== 'high' || !report.shouldIgnore) {
+      continue;
+    }
+
+    const comment = commentsById.get(report.commentId);
+    if (!comment) {
+      continue;
+    }
+
+    const existing = viewerSafetyStates.get(comment.author.id);
+    const violationCount = (existing?.violationCount ?? 0) + 1;
+    const shouldBlock =
+      shouldBlockOnHighRisk || violationCount >= violationThreshold;
+
+    viewerSafetyStates.set(comment.author.id, {
+      viewerId: comment.author.id,
+      violationCount,
+      lastViolationAt: Date.now(),
+      blockedUntil: shouldBlock ? Date.now() + blockDurationMs : undefined,
+      categories: [
+        ...new Set([...(existing?.categories ?? []), ...report.categories]),
+      ],
+    });
+  }
+}
+
+function addViewerBlockedReports(
+  input: AnalyzeCommentsInput,
+  safetyReports: SafetyReport[],
+  config: CommentIntelligenceConfig,
+  viewerSafetyStates: Map<string, ViewerSafetyState>
+): SafetyReport[] {
+  if (config.viewerSafety?.enabled === false) {
+    return safetyReports;
+  }
+
+  const byCommentId = new Map(
+    safetyReports.map((report) => [report.commentId, report])
+  );
+
+  for (const comment of input.comments) {
+    const viewerState = viewerSafetyStates.get(comment.author.id);
+    if (!isViewerBlocked(viewerState)) {
+      continue;
+    }
+
+    const existing = byCommentId.get(comment.id);
+    if (existing?.shouldIgnore) {
+      continue;
+    }
+
+    byCommentId.set(comment.id, {
+      commentId: comment.id,
+      riskLevel: 'high',
+      categories: ['viewer_blocked'],
+      shouldIgnore: true,
+      reason: 'viewer is blocked due to previous unsafe comments',
+    });
+  }
+
+  return [...byCommentId.values()];
+}
+
+function pruneExpiredViewerBlocks(
+  viewerSafetyStates: Map<string, ViewerSafetyState>
+): void {
+  for (const [viewerId, state] of viewerSafetyStates.entries()) {
+    if (state.blockedUntil !== undefined && state.blockedUntil <= Date.now()) {
+      viewerSafetyStates.delete(viewerId);
+    }
+  }
+}
+
+function pruneExpiredAnsweredStates(
+  answeredStates: Map<string, AnsweredState>,
+  config?: NonNullable<CommentIntelligenceConfig['ranking']>['answeredMemory']
+): void {
+  if (config?.enabled === false) {
+    return;
+  }
+
+  const ttlMs = config?.ttlMs ?? 10 * 60 * 1000;
+  if (ttlMs <= 0) {
+    answeredStates.clear();
+    return;
+  }
+
+  const now = Date.now();
+  for (const [commentId, state] of answeredStates.entries()) {
+    if (state.answeredAt + ttlMs <= now) {
+      answeredStates.delete(commentId);
+    }
+  }
+}
+
+function getBlockedViewerIds(
+  viewerSafetyStates: Map<string, ViewerSafetyState>
+): string[] {
+  return [...viewerSafetyStates.values()]
+    .filter((state) => isViewerBlocked(state))
+    .map((state) => state.viewerId);
+}
+
+function isViewerBlocked(state?: ViewerSafetyState): boolean {
+  return Boolean(
+    state &&
+      (state.blockedUntil === undefined || state.blockedUntil > Date.now())
+  );
+}
+
+function buildDefaultInstruction(
+  result: CommentIntelligenceResult,
+  language?: 'ja' | 'en' | 'auto'
+): string {
+  const selected = result.selectedComments[0];
+  if (!selected) {
+    return buildInstruction(result, language);
+  }
+
+  const resolvedLanguage = language === 'en' ? 'en' : 'ja';
+  const hasFirstTimeViewer = result.ignoredSummary.clusters.some(
+    (cluster) => cluster.label === 'first_time_viewer'
+  );
+  if (hasFirstTimeViewer) {
+    return resolvedLanguage === 'ja'
+      ? '初見の視聴者にも分かるように、歓迎しつつ今日の配信内容を短く説明してください。'
+      : "Welcome first-time viewers and briefly explain today's stream so they can follow along.";
+  }
+
+  return resolvedLanguage === 'ja'
+    ? '選ばれたコメントに短く自然に返答し、配信のテンポを保ってください。'
+    : 'Reply briefly and naturally to the selected comment, and keep the stream moving.';
+}
+
+async function withOptionalTimeout<T>(
+  promise: Promise<T>,
+  timeoutMs?: number
+): Promise<T> {
+  if (!timeoutMs || timeoutMs <= 0) {
+    return promise;
+  }
+
+  return Promise.race([
+    promise,
+    new Promise<T>((_, reject) => {
+      setTimeout(
+        () => reject(new Error('Comment analysis timed out')),
+        timeoutMs
+      );
+    }),
+  ]);
+}

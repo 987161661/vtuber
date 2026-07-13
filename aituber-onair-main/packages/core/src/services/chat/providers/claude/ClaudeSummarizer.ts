@@ -1,0 +1,89 @@
+import { Message } from '@aituber-onair/chat';
+import { Summarizer } from '../../../../core/MemoryManager';
+import {
+  ENDPOINT_CLAUDE_API,
+  MODEL_CLAUDE_4_5_HAIKU,
+  DEFAULT_SUMMARY_PROMPT_TEMPLATE,
+} from '@aituber-onair/chat';
+import {
+  createSummaryContext,
+  summarizeWithFallback,
+} from '../summarizerUtils';
+
+/**
+ * Implementation of summarization functionality using Claude
+ */
+export class ClaudeSummarizer implements Summarizer {
+  private apiKey: string;
+  private model: string;
+  private defaultPromptTemplate: string;
+
+  /**
+   * Constructor
+   * @param apiKey Anthropic API key
+   * @param model Name of the model to use
+   * @param defaultPromptTemplate Default prompt template for summarization
+   */
+  constructor(
+    apiKey: string,
+    model: string = MODEL_CLAUDE_4_5_HAIKU,
+    defaultPromptTemplate: string = DEFAULT_SUMMARY_PROMPT_TEMPLATE,
+  ) {
+    this.apiKey = apiKey;
+    this.model = model;
+    this.defaultPromptTemplate = defaultPromptTemplate;
+  }
+
+  /**
+   * Summarize chat messages
+   * @param messages Array of messages to summarize
+   * @param maxLength Maximum number of characters (default 256)
+   * @param customPrompt Custom prompt template for summarization (optional)
+   * @returns Summarized text
+   */
+  async summarize(
+    messages: Message[],
+    maxLength: number = 256,
+    customPrompt?: string,
+  ): Promise<string> {
+    const { systemPrompt, conversationText } = createSummaryContext(
+      messages,
+      maxLength,
+      this.defaultPromptTemplate,
+      customPrompt,
+    );
+
+    return summarizeWithFallback(messages, async () => {
+      // API request
+      const response = await fetch(ENDPOINT_CLAUDE_API, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-api-key': this.apiKey,
+          'anthropic-version': '2023-06-01',
+          'anthropic-dangerous-direct-browser-access': 'true',
+        },
+        body: JSON.stringify({
+          model: this.model,
+          messages: [
+            {
+              role: 'user',
+              content: `${systemPrompt}\n\n${conversationText}`,
+            },
+          ],
+          max_tokens: maxLength,
+        }),
+      });
+
+      if (!response.ok) {
+        const errorData = await response.json();
+        throw new Error(
+          `Claude API error: ${errorData.error?.message || response.statusText}`,
+        );
+      }
+
+      const data = await response.json();
+      return data.content?.[0]?.text || '';
+    });
+  }
+}

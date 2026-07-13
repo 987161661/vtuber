@@ -1,0 +1,25 @@
+import type { LiveComment } from './comment.js';
+import type { RecentAiMessage, StreamState } from './context.js';
+
+export type LLMCommentAnalysisResult = {
+  selectedCommentIds?: string[];
+  topicRelatedCommentIds?: string[];
+  ignoredSummary?: string;
+  audienceMood?: 'calm' | 'excited' | 'confused' | 'negative';
+  safetyFlags?: Array<{
+    commentId: string;
+    category: string;
+    reason: string;
+  }>;
+  instructionForLLM?: string;
+  contextForLLM?: string[];
+};
+
+export type CommentAnalysisLLMProvider = {
+  analyze(input: {
+    comments: LiveComment[];
+    streamState?: StreamState;
+    recentMessages?: RecentAiMessage[];
+    recentAiMessages?: RecentAiMessage[];
+  }): Promise<LLMCommentAnalysisResult>;
+};

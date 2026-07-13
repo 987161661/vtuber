@@ -1,0 +1,17 @@
+export type VoiceEngineType =
+  | 'voicevox'
+  | 'voicepeak'
+  | 'openai'
+  | 'xai'
+  | 'unrealSpeech'
+  | 'elevenLabs'
+  | 'inworld'
+  | 'gradium'
+  | 'geminiTts'
+  | 'openaiCompatible'
+  | 'aivisSpeech'
+  | 'aivisCloud'
+  | 'minimax'
+  | 'piperPlus'
+  | 'webSpeech'
+  | 'none';

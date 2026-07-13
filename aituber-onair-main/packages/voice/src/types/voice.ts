@@ -1,0 +1,78 @@
+/**
+ * Voice related type definitions
+ */
+
+export const talkStyles = [
+  'talk',
+  'neutral',
+  'happy',
+  'sad',
+  'angry',
+  'surprised',
+] as const;
+
+/**
+ * TalkStyle - Style of speech for voice synthesis
+ */
+export type TalkStyle = (typeof talkStyles)[number];
+
+/**
+ * Talk - Set of message and talk style
+ */
+export type Talk = {
+  style: TalkStyle;
+  message: string;
+  delivery?: string;
+  emotionIntensity?: number;
+};
+
+/**
+ * Types of emotional expressions
+ */
+export const emotions = [
+  'neutral',
+  'happy',
+  'angry',
+  'sad',
+  'surprised',
+  'relaxed',
+] as const;
+export type EmotionType = (typeof emotions)[number];
+
+/**
+ * Emotion types for VoicePeak
+ */
+export type EmotionTypeForVoicepeak =
+  | 'happy'
+  | 'fun'
+  | 'angry'
+  | 'sad'
+  | 'neutral'
+  | 'surprised';
+
+/**
+ * Weighted VoicePeak emotion overrides.
+ * Each key accepts an integer from 0 to 100.
+ */
+export type VoicepeakEmotionWeights = Partial<
+  Record<EmotionTypeForVoicepeak, number>
+>;
+
+/**
+ * VoicePeak emotion override input.
+ * Accepts either a single legacy tag or weighted emotion overrides.
+ */
+export type VoicepeakEmotionInput =
+  | EmotionTypeForVoicepeak
+  | VoicepeakEmotionWeights;
+
+/**
+ * Screenplay - Text with emotion expression
+ * This has a different structure from the Screenplay type in chat.ts.
+ * Be careful of name conflicts when importing both types.
+ * Example: import { Screenplay as VoiceScreenplay } from '../types/voice';
+ */
+export type Screenplay = {
+  expression: EmotionType;
+  talk: Talk;
+};

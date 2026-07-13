@@ -1,0 +1,69 @@
+{
+  "name": "@aituber-onair/chat",
+  "version": "0.45.0",
+  "description": "Chat and LLM API integration library for AITuber OnAir",
+  "main": "dist/cjs/index.js",
+  "module": "dist/esm/index.js",
+  "types": "dist/cjs/index.d.ts",
+  "files": ["dist"],
+  "exports": {
+    ".": {
+      "types": "./dist/cjs/index.d.ts",
+      "import": "./dist/esm/index.js",
+      "require": "./dist/cjs/index.js"
+    },
+    "./agent": {
+      "types": "./dist/cjs/agent.d.ts",
+      "import": "./dist/esm/agent.js",
+      "require": "./dist/cjs/agent.js"
+    },
+    "./dist/cjs/*": "./dist/cjs/*",
+    "./dist/esm/*": "./dist/esm/*",
+    "./umd": "./dist/umd/aituber-onair-chat.js"
+  },
+  "scripts": {
+    "build": "npm run clean && npm run build:cjs && npm run build:esm && npm run build:umd",
+    "build:cjs": "tsc --project tsconfig.cjs.json",
+    "build:esm": "tsc --project tsconfig.esm.json",
+    "build:umd": "npx tsup src/index.ts --format iife --global-name AITuberOnAirChat --out-dir dist/umd && mv dist/umd/index.global.js dist/umd/aituber-onair-chat.js && npx tsup src/index.ts --format iife --global-name AITuberOnAirChat --minify --out-dir dist/umd && mv dist/umd/index.global.js dist/umd/aituber-onair-chat.min.js",
+    "clean": "rm -rf dist",
+    "typecheck": "tsc --noEmit",
+    "test": "npm run typecheck && vitest run",
+    "test:watch": "vitest",
+    "test:coverage": "vitest run --coverage",
+    "test:example:character-agent": "vitest run examples/character-agent/tests",
+    "example:character-agent": "npm --prefix examples/character-agent run build && npm --prefix examples/character-agent run start",
+    "openai-compatible:probe": "node examples/compat-probe/index.js",
+    "openai-compatible:mock-server": "node examples/mock-openai-server/server.js",
+    "fmt": "biome format . --write",
+    "fmt:check": "biome format .",
+    "lint": "biome lint .",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": [
+    "aituber",
+    "vtuber",
+    "ai",
+    "chat",
+    "llm",
+    "openai",
+    "claude",
+    "gemini"
+  ],
+  "author": "shinshin86 (https://github.com/shinshin86)",
+  "license": "MIT",
+  "devDependencies": {
+    "@biomejs/biome": "1.9.4",
+    "@types/node": "^18.15.0",
+    "@vitest/coverage-v8": "^1.3.1",
+    "tsup": "^8.0.1",
+    "typescript": "^5.0.0",
+    "vitest": "^1.3.1"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "unpkg": "dist/umd/aituber-onair-chat.min.js",
+  "jsdelivr": "dist/umd/aituber-onair-chat.min.js",
+  "sideEffects": false
+}

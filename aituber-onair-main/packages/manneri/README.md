@@ -1,0 +1,730 @@
+# @aituber-onair/manneri
+
+![AITuber OnAir Manneri - logo](./images/aituber-onair-manneri.png)
+
+**Manneri** is a simple JavaScript library designed to detect repetitive conversation patterns in AI chatbots and provide topic diversification prompts for more engaging conversations.
+
+[日本語版README](README.ja.md) | [English README](README.md)
+
+## Features
+
+- 🔍 **Conversation Similarity Analysis**: Calculate text similarity to detect repetitive patterns
+- 📊 **Pattern Detection**: Identify structural patterns in conversations
+- 🎯 **Keyword Analysis**: Detect overused vocabulary and topic bias
+- 💡 **Automatic Prompt Generation**: Generate appropriate prompts for topic diversification
+- 🌐 **Frontend-Only**: Lightweight operation optimized for browser environments
+- 🌍 **Multi-Language Support**: Built-in support for Japanese and English, with easy extension to any language via custom prompts
+- 🎨 **Customizable Prompts**: Configure intervention messages and recommendations for any language
+- 🇯🇵 **Japanese Language Support**: Proper handling of Japanese text (Hiragana, Katakana, Kanji)
+- 💾 **Flexible Persistence**: Configurable data persistence with support for multiple storage backends
+- 📝 **Draft Review for Agents**: Check a drafted assistant reply before sending and rewrite only when it repeats recent conversation patterns
+
+## Installation
+
+```bash
+npm install @aituber-onair/manneri
+```
+
+## Basic Usage
+
+```typescript
+import { ManneriDetector, LocalStoragePersistenceProvider } from '@aituber-onair/manneri';
+
+// Create ManneriDetector with default settings
+const detector = new ManneriDetector();
+
+// Define message array
+const messages = [
+  { role: 'user', content: 'Hello' },
+  { role: 'assistant', content: 'Hello! How can I help you today?' },
+  { role: 'user', content: 'Hello' },
+  { role: 'assistant', content: 'Hello! What can I assist you with?' }
+];
+
+// Detect repetitive patterns
+if (detector.detectManneri(messages)) {
+  console.log('Repetitive conversation detected');
+}
+
+// Check if intervention is needed (considering cooldown)
+if (detector.shouldIntervene(messages)) {
+  // Generate topic diversification prompt
+  const prompt = detector.generateDiversificationPrompt(messages);
+  console.log('Suggested prompt:', prompt.content);
+}
+```
+
+## Configuration Options
+
+```typescript
+const detector = new ManneriDetector({
+  similarityThreshold: 0.75,     // Similarity threshold (0-1)
+  repetitionLimit: 3,            // (deprecated) Exposed for compatibility only
+  lookbackWindow: 10,            // Number of messages to analyze
+  interventionCooldown: 300000,  // Intervention interval (milliseconds)
+  minMessageLength: 10,          // Ignore shorter messages during analysis
+  excludeKeywords: ['yes', 'no'], // Ignore exact keyword-only messages
+  enableTopicTracking: true,     // Enable topic tracking
+  enableKeywordAnalysis: true,   // Enable keyword analysis
+  debugMode: false,              // Debug mode
+  language: 'en',                // Language for prompts ('ja' | 'en' | custom)
+  customPrompts: {               // Custom intervention prompts (optional)
+    en: {
+      intervention: [
+        'Please change the topic and talk about something new.',
+        'Let\'s explore a different subject.',
+        'How about discussing something else?'
+      ]
+    }
+  }
+}, {
+  // Optional: Configure persistence provider
+  persistenceProvider: new LocalStoragePersistenceProvider({
+    storageKey: 'my_manneri_data',
+    version: '1.0.0'
+  })
+});
+```
+
+`minMessageLength` and `excludeKeywords` are applied before similarity, pattern,
+and topic analysis. `excludeKeywords` matches exact message text after trimming,
+case normalization, whitespace normalization, and basic punctuation removal.
+`repetitionLimit` is deprecated and is not used by the detection logic.
+
+## Detection Behavior
+
+Manneri triggers an intervention when at least one actionable signal crosses its
+threshold:
+
+- the latest message is too similar to recent messages
+- a content-based conversation pattern repeats enough times
+- topic analysis finds a high-confidence topic bias
+
+Repeated message detection groups similar messages from the same role into one
+content-based pattern. Leading bracket metadata such as `[happy]` is ignored for
+this comparison, so emotion tags do not mask repeated wording.
+
+For Japanese text, similarity also uses character n-grams to catch short phrase
+overlap such as `次へ進もう` and `うん、次へ進もう`. Short Japanese
+messages use a lower repeated-message threshold than longer or non-Japanese
+messages so brief stream comments can still be detected without relying on
+role-only alternation.
+
+Role-only alternation patterns such as `user-assistant-user-assistant` are kept
+in analysis results for observability, but they do not trigger interventions by
+themselves. This reduces false positives in normal back-and-forth conversations.
+
+When you call `generateDiversificationPrompt()` after an analysis, the prompt
+metadata reflects the primary signal:
+
+- similarity and repeated content patterns use `pattern_break` with high priority
+- topic bias uses `keyword_shift` with medium priority
+- calls without a prior actionable analysis fall back to `topic_change`
+
+## Draft Review Before Sending
+
+Use `reviewDraft()` when your AI agent or chat workflow already has a candidate
+reply and needs to decide whether to send it as-is. Manneri analyzes the draft as
+the next assistant message, then returns `shouldRewrite` and an optional
+`suggestion` only when the draft appears repetitive.
+
+> **How to think about it:** Manneri only detects and returns a result. It never
+> sends, stops, or rewrites for you. Both when to run the check and what to do
+> with the result (send as-is, rewrite, or skip) are decided by your agent or
+> app. Unlike `generateDiversificationPrompt()`, which steers the next
+> generation from the conversation so far, `reviewDraft()` evaluates one
+> specific candidate reply right before sending. It is also exposed as the
+> `review_draft_repetition` agent tool so an agent can call the check itself.
+> Detection is deterministic: text similarity and repetition patterns controlled
+> by `similarityThreshold`. It does not call an LLM.
+
+This is useful for:
+
+- live-stream AI characters that should avoid repeating the same reaction,
+  greeting, or closing phrase
+- chatbots that want a lightweight self-review step before a response reaches
+  the user
+- agent workflows that can regenerate a reply only when the review finds a real
+  repetition signal
+- dashboards or observability tools that need to show why a draft was accepted
+  or sent back for rewriting
+
+```typescript
+import { ManneriDetector, type Message } from '@aituber-onair/manneri';
+
+const detector = new ManneriDetector({
+  minMessageLength: 0,
+  similarityThreshold: 0.75
+});
+
+const messages: Message[] = [
+  { role: 'user', content: 'What should I cook?' },
+  { role: 'assistant', content: 'A quick pasta would be good.' },
+  { role: 'user', content: 'Any other dinner idea?' },
+  { role: 'assistant', content: 'A quick pasta would be good.' },
+  { role: 'user', content: 'One more suggestion?' }
+];
+
+const review = detector.reviewDraft(
+  messages,
+  'A quick pasta would be good.'
+);
+
+if (review.shouldRewrite) {
+  console.log('Rewrite instruction for the LLM:', review.suggestion?.content);
+} else {
+  console.log('Draft is safe to send.');
+}
+```
+
+The returned `analysis` is the same shape as `analyzeConversation()`, so you can
+inspect similarity, repeated patterns, topic bias, and the intervention reason.
+`suggestion` is a diversification instruction or prompt to feed to your LLM for
+a rewrite. It is not a finished rewritten reply. Your code or agent performs the
+actual rewrite. `suggestion` is omitted when `shouldRewrite` is `false`.
+
+See `examples/draft-review-basic` for a browser sample that shows the send vs.
+rewrite vs. skip decision, review reason, and rewrite instruction in one flow.
+
+### Agent Tool Definition
+
+`REVIEW_DRAFT_REPETITION_TOOL` is a provider-agnostic JSON Schema tool
+definition for `reviewDraft(messages, draft)`. It has no SDK dependency, so you
+can adapt it to OpenAI tools, MCP-style registries, or your own agent runtime.
+
+```typescript
+import {
+  MANNERI_AGENT_TOOLS,
+  REVIEW_DRAFT_REPETITION_TOOL
+} from '@aituber-onair/manneri';
+
+console.log(REVIEW_DRAFT_REPETITION_TOOL.name);
+// "review_draft_repetition"
+
+// Register all Manneri agent tools in your runtime.
+agent.registerTools(MANNERI_AGENT_TOOLS);
+```
+
+The tool is intended for drafts generated by your application. Treat the
+conversation history and draft text as normal user-visible content, and avoid
+including secrets or private system prompts in tool inputs.
+
+## Integration with AITuberOnAirCore
+
+```typescript
+import { ManneriDetector } from '@aituber-onair/manneri';
+
+const manneriDetector = new ManneriDetector({
+  similarityThreshold: 0.8,
+  repetitionLimit: 3,
+  interventionCooldown: 300000
+});
+
+// Integration via AITuberOnAirCore event listener
+core.on('beforeAIRequest', (requestData) => {
+  const chatHistory = core.getChatHistory();
+  
+  if (manneriDetector.shouldIntervene(chatHistory)) {
+    const diversificationPrompt = manneriDetector.generateDiversificationPrompt(chatHistory);
+    
+    // Add topic change instruction as system prompt
+    requestData.messages.unshift({
+      role: 'system',
+      content: diversificationPrompt.content
+    });
+    
+    console.log('Applied diversification prompt:', diversificationPrompt.type);
+  }
+});
+```
+
+## Event Handling
+
+```typescript
+// Similarity calculation event
+detector.on('similarity_calculated', (data) => {
+  console.log(`Similarity: ${data.score}, Threshold: ${data.threshold}`);
+});
+
+// Pattern detection event
+detector.on('pattern_detected', (result) => {
+  console.log('Detected patterns:', result.patterns);
+});
+
+// Intervention triggered event
+detector.on('intervention_triggered', (prompt) => {
+  console.log('Intervention executed:', prompt.content);
+});
+
+// Configuration update event
+detector.on('config_updated', (newConfig) => {
+  console.log('Configuration updated:', newConfig);
+});
+```
+
+## Detailed Analysis
+
+```typescript
+// Perform detailed conversation analysis
+const analysis = detector.analyzeConversation(messages);
+
+console.log('Analysis result:', {
+  similarity: analysis.similarity,
+  topics: analysis.topics,
+  patterns: analysis.patterns,
+  shouldIntervene: analysis.shouldIntervene,
+  reason: analysis.interventionReason
+});
+
+// Get statistics
+const stats = detector.getStatistics();
+console.log('Statistics:', {
+  totalInterventions: stats.totalInterventions,
+  averageInterval: stats.averageInterventionInterval,
+  thresholds: stats.configuredThresholds,
+  analysis: stats.analysisStats
+});
+```
+
+`analysisStats` includes `totalAnalyses`, `averageAnalysisTime`,
+`cacheHitRate`, and `memoryUsage`. `clearHistory()` resets intervention history
+and analyzer caches. Calling `clearCache()` on `ConversationAnalyzer` clears
+caches while keeping analysis counters intact.
+
+## Multi-Language Support
+
+### Language Configuration
+
+```typescript
+// Use English prompts
+const detectorEn = new ManneriDetector({
+  language: 'en'
+});
+
+// Use Japanese prompts (default)
+const detectorJa = new ManneriDetector({
+  language: 'ja'
+});
+
+// Custom prompts for Spanish
+const detectorSpanish = new ManneriDetector({
+  language: 'es',
+  customPrompts: {
+    es: {
+      intervention: [
+        'Cambiemos de tema y hablemos de algo nuevo.',
+        'Exploremos un tema diferente.',
+        '¿Qué tal si discutimos otra cosa?'
+      ]
+    }
+  }
+});
+
+// Chinese support
+const detectorChinese = new ManneriDetector({
+  language: 'zh',
+  customPrompts: {
+    zh: {
+      intervention: [
+        '让我们换个话题，聊些新的内容。',
+        '我们来探讨一个不同的主题。',
+        '要不要讨论别的事情？'
+      ]
+    }
+  }
+});
+```
+
+### Built-in Language Support
+
+Manneri comes with built-in prompts for:
+- **Japanese** (`'ja'`) - Default language
+- **English** (`'en'`) - Full prompt coverage
+
+```typescript
+import { DEFAULT_PROMPTS } from '@aituber-onair/manneri';
+
+// View available built-in languages
+console.log(Object.keys(DEFAULT_PROMPTS)); // ['ja', 'en']
+
+// Access specific language prompts
+const englishPrompts = DEFAULT_PROMPTS.en;
+console.log(englishPrompts.intervention);
+```
+
+### Adding Any Language
+
+**Any language can be supported** by providing custom prompts. The library accepts any language code and uses your custom prompts:
+
+```typescript
+// Add support for any language (French example)
+const detectorFrench = new ManneriDetector({
+  language: 'fr',
+  customPrompts: {
+    fr: {
+      intervention: [
+        'Changeons de sujet et parlons de quelque chose de nouveau.',
+        'Explorons un sujet différent.',
+        'Que diriez-vous de discuter d\'autre chose?'
+      ]
+    }
+  }
+});
+
+// Or extend existing languages
+import { overridePrompts, DEFAULT_PROMPTS } from '@aituber-onair/manneri';
+
+const multilingualPrompts = overridePrompts(DEFAULT_PROMPTS, {
+  zh: {
+    intervention: ['让我们换个话题，聊些新的内容。']
+  },
+  ko: {
+    intervention: ['새로운 주제로 변경해 주세요.']
+  },
+  fr: {
+    intervention: ['Changeons de sujet.']
+  }
+});
+```
+
+### Language-Agnostic Design
+
+The library is designed to work with **any language** without code changes:
+
+```typescript
+// Easy language switching
+const createDetectorForLanguage = (lang: string, prompts: any) => {
+  return new ManneriDetector({
+    language: lang,
+    customPrompts: { [lang]: prompts }
+  });
+};
+
+// Support multiple languages in the same application
+const detectors = {
+  english: createDetectorForLanguage('en', englishPrompts),
+  chinese: createDetectorForLanguage('zh', chinesePrompts),
+  korean: createDetectorForLanguage('ko', koreanPrompts),
+  arabic: createDetectorForLanguage('ar', arabicPrompts),
+  // Add any language
+};
+
+// Dynamic language detection
+const getUserLanguage = () => navigator.language.split('-')[0];
+const userDetector = detectors[getUserLanguage()] || detectors.english;
+```
+
+### Prompt Utilities
+
+```typescript
+import { getPromptTemplate, overridePrompts } from '@aituber-onair/manneri';
+
+// Get intervention prompt for any language
+const interventionPrompt = getPromptTemplate(
+  myCustomPrompts, 
+  'zh'
+);
+
+// Override default prompts with custom ones
+const globalPrompts = overridePrompts(DEFAULT_PROMPTS, {
+  zh: { intervention: ['换个话题吧'] },
+  ko: { intervention: ['주제를 바꿔주세요'] },
+  es: { intervention: ['Cambiemos de tema'] }
+});
+```
+
+## Individual Feature Usage
+
+### Similarity Analysis
+
+```typescript
+import { SimilarityAnalyzer } from '@aituber-onair/manneri';
+
+const analyzer = new SimilarityAnalyzer();
+const similarity = analyzer.calculateSimilarity('Hello', 'Hello, how are you?');
+console.log('Similarity:', similarity); // 0.0 - 1.0
+```
+
+### Keyword Extraction
+
+```typescript
+import { KeywordExtractor } from '@aituber-onair/manneri';
+
+const extractor = new KeywordExtractor();
+const keywords = extractor.extractKeywordsFromMessages(messages);
+console.log('Keywords:', keywords);
+```
+
+### Pattern Detection
+
+```typescript
+import { PatternDetector } from '@aituber-onair/manneri';
+
+const detector = new PatternDetector();
+const result = detector.detectPatterns(messages);
+console.log('Patterns:', result.patterns);
+console.log('Severity:', result.severity);
+console.log('Confidence:', result.confidence);
+```
+
+## Data Persistence
+
+Manneri provides flexible persistence through configurable providers. You have full control over when and how data is saved.
+
+### Browser Environment (LocalStorage)
+
+```typescript
+import { ManneriDetector, LocalStoragePersistenceProvider } from '@aituber-onair/manneri';
+
+// Configure with LocalStorage persistence
+const detector = new ManneriDetector({
+  // ... configuration options
+}, {
+  persistenceProvider: new LocalStoragePersistenceProvider({
+    storageKey: 'manneri_data',  // Custom storage key
+    version: '1.0.0'             // Data version
+  })
+});
+
+// Manual persistence control
+await detector.save();    // Save current state
+await detector.load();    // Load saved state
+await detector.cleanup(); // Clean up old data
+
+// Check if persistence is available
+if (detector.hasPersistenceProvider()) {
+  console.log('Persistence is configured');
+  
+  // Get storage info
+  const info = detector.getPersistenceInfo();
+  console.log('Storage info:', info);
+}
+
+// Event handling for persistence operations
+detector.on('save_success', ({ timestamp }) => {
+  console.log('Data saved successfully at', new Date(timestamp));
+});
+
+detector.on('save_error', ({ error }) => {
+  console.error('Failed to save data:', error);
+});
+
+detector.on('load_success', ({ data, timestamp }) => {
+  console.log('Data loaded successfully:', data);
+});
+
+detector.on('cleanup_completed', ({ removedItems, timestamp }) => {
+  console.log(`Cleaned up ${removedItems} old items`);
+});
+```
+
+### Custom Persistence Provider
+
+For Node.js, Deno, or custom storage solutions, implement the `PersistenceProvider` interface:
+
+```typescript
+import type { PersistenceProvider, StorageData } from '@aituber-onair/manneri';
+
+// Example: Database persistence provider
+class DatabasePersistenceProvider implements PersistenceProvider {
+  constructor(private dbConnection: any) {}
+
+  async save(data: StorageData): Promise<boolean> {
+    try {
+      await this.dbConnection.query(
+        'INSERT OR REPLACE INTO manneri_data (id, data) VALUES (?, ?)',
+        [1, JSON.stringify(data)]
+      );
+      return true;
+    } catch (error) {
+      console.error('Database save failed:', error);
+      return false;
+    }
+  }
+
+  async load(): Promise<StorageData | null> {
+    try {
+      const result = await this.dbConnection.query(
+        'SELECT data FROM manneri_data WHERE id = ?',
+        [1]
+      );
+      return result.length > 0 ? JSON.parse(result[0].data) : null;
+    } catch (error) {
+      console.error('Database load failed:', error);
+      return null;
+    }
+  }
+
+  async clear(): Promise<boolean> {
+    try {
+      await this.dbConnection.query('DELETE FROM manneri_data WHERE id = ?', [1]);
+      return true;
+    } catch (error) {
+      console.error('Database clear failed:', error);
+      return false;
+    }
+  }
+
+  async cleanup(maxAge: number): Promise<number> {
+    // Implement cleanup logic for your storage
+    // Return number of items removed
+    return 0;
+  }
+}
+
+// Use custom persistence provider
+const detector = new ManneriDetector({
+  // ... configuration
+}, {
+  persistenceProvider: new DatabasePersistenceProvider(dbConnection)
+});
+```
+
+### Manual Data Management (No Persistence)
+
+```typescript
+// Use without persistence provider
+const detector = new ManneriDetector();
+
+// Manual export/import for custom storage
+const data = detector.exportData();
+// Store data however you want (file, database, etc.)
+await myCustomStorage.save(data);
+
+// Restore data
+const restoredData = await myCustomStorage.load();
+detector.importData(restoredData);
+
+// Clear history
+detector.clearHistory();
+```
+
+### Environment-Specific Examples
+
+```typescript
+// Browser-only with LocalStorage
+const browserDetector = new ManneriDetector({}, {
+  persistenceProvider: new LocalStoragePersistenceProvider()
+});
+
+// Node.js with file storage
+class FilePersistenceProvider implements PersistenceProvider {
+  constructor(private filePath: string) {}
+  
+  save(data: StorageData): boolean {
+    try {
+      fs.writeFileSync(this.filePath, JSON.stringify(data));
+      return true;
+    } catch {
+      return false;
+    }
+  }
+  
+  load(): StorageData | null {
+    try {
+      const data = fs.readFileSync(this.filePath, 'utf8');
+      return JSON.parse(data);
+    } catch {
+      return null;
+    }
+  }
+  
+  clear(): boolean {
+    try {
+      fs.unlinkSync(this.filePath);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+}
+
+const nodeDetector = new ManneriDetector({}, {
+  persistenceProvider: new FilePersistenceProvider('./manneri-data.json')
+});
+
+// Deno with Deno.KV
+class DenoKvPersistenceProvider implements PersistenceProvider {
+  constructor(private kv: Deno.Kv) {}
+  
+  async save(data: StorageData): Promise<boolean> {
+    try {
+      await this.kv.set(['manneri', 'data'], data);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+  
+  async load(): Promise<StorageData | null> {
+    try {
+      const result = await this.kv.get(['manneri', 'data']);
+      return result.value as StorageData | null;
+    } catch {
+      return null;
+    }
+  }
+  
+  async clear(): Promise<boolean> {
+    try {
+      await this.kv.delete(['manneri', 'data']);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+}
+
+const kv = await Deno.openKv();
+const denoDetector = new ManneriDetector({}, {
+  persistenceProvider: new DenoKvPersistenceProvider(kv)
+});
+```
+
+## TypeScript Type Definitions
+
+```typescript
+import type { 
+  Message,
+  ManneriConfig,
+  AnalysisResult,
+  DiversificationPrompt,
+  LocalizedPrompts,
+  PromptTemplates,
+  SupportedLanguage,
+  PersistenceProvider,
+  PersistenceConfig,
+  StorageData
+} from '@aituber-onair/manneri';
+```
+
+## Browser Support
+
+- Chrome 90+
+- Firefox 88+
+- Safari 14+
+- Edge 90+
+
+## Performance
+
+- Lightweight: < 50KB gzipped
+- Fast: Real-time analysis < 100ms
+- Memory efficient: Automatic cache cleanup
+
+## License
+
+MIT License
+
+## Contributing
+
+Pull requests and issues are welcome. Please see [CONTRIBUTING.md](CONTRIBUTING.md) for details.
+
+## Support
+
+- GitHub Issues: https://github.com/shinshin86/aituber-onair/issues
+- Documentation: https://github.com/shinshin86/aituber-onair/tree/main/packages/manneri
+
+## Related Projects
+
+- [AITuber OnAir](https://github.com/shinshin86/aituber-onair) - Main project
+- [@aituber-onair/core](https://github.com/shinshin86/aituber-onair/tree/main/packages/core) - Core library

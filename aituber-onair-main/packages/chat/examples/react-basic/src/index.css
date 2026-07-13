@@ -1,0 +1,69 @@
+@import url("https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap");
+
+:root {
+  font-family: "Space Grotesk", "Hiragino Kaku Gothic ProN", "Noto Sans JP",
+    sans-serif;
+  line-height: 1.5;
+  font-weight: 400;
+  color: #0f0f0f;
+  background-color: #f7f7f7;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+
+  --bg: #f7f7f7;
+  --panel: #ffffff;
+  --text: #0f0f0f;
+  --muted: #6f6f6f;
+  --border: #e3e3e3;
+  --shadow: 0 20px 60px rgba(15, 15, 15, 0.06);
+  --input-bg: #fafafa;
+  --input-border: #d7d7d7;
+  --input-focus: #0f0f0f;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-width: 320px;
+  min-height: 100vh;
+  background: var(--bg);
+  background-image: radial-gradient(
+      circle at 20% 20%,
+      rgba(15, 15, 15, 0.04),
+      transparent 55%
+    ),
+    radial-gradient(circle at 80% 10%, rgba(15, 15, 15, 0.03), transparent 45%);
+  color: var(--text);
+}
+
+button,
+input,
+select,
+textarea {
+  font-family: inherit;
+}
+
+button {
+  border-radius: 999px;
+  border: 1px solid transparent;
+  padding: 0.6em 1.1em;
+  font-size: 0.95rem;
+  font-weight: 500;
+  background-color: transparent;
+  cursor: pointer;
+  transition: border-color 0.2s ease, background-color 0.2s ease, color 0.2s
+    ease, transform 0.2s ease;
+}
+
+button:focus-visible,
+input:focus-visible,
+select:focus-visible,
+textarea:focus-visible {
+  outline: 2px solid #0f0f0f;
+  outline-offset: 2px;
+}

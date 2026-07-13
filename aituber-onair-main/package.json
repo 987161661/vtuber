@@ -1,0 +1,28 @@
+{
+    "name": "aituber-onair",
+    "version": "0.14.0",
+    "private": true,
+    "workspaces": [
+        "packages/*"
+    ],
+    "scripts": {
+        "build": "npm run build --workspaces",
+        "test": "npm run test --workspaces",
+        "fmt": "npm run fmt --workspaces",
+        "fmt:check": "npm run fmt:check --workspaces",
+        "check:biome-config": "node scripts/check-biome-config.mjs",
+        "lint": "npm run lint --workspaces",
+        "changeset": "changeset",
+        "changeset:version": "changeset version",
+        "changeset:publish": "changeset publish",
+        "release": "npm run build && npm run test && changeset publish"
+    },
+    "devDependencies": {
+        "@changesets/changelog-github": "^0.5.1",
+        "@changesets/cli": "^2.29.5",
+        "react": "^19.0.0",
+        "react-dom": "^19.0.0",
+        "typescript": "^5.8.3",
+        "typescript-language-server": "^4.3.4"
+    }
+}

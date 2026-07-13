@@ -1,0 +1,254 @@
+#root {
+  width: 100%;
+  margin: 0 auto;
+}
+
+.app {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  min-height: 100vh;
+  width: 100%;
+  background: var(--bg);
+}
+
+.app-header {
+  padding: 2rem 2.5rem 1rem;
+}
+
+.brand {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+}
+
+.brand-title {
+  font-size: 1.6rem;
+  font-weight: 600;
+  letter-spacing: -0.02em;
+  color: var(--text);
+}
+
+.brand-subtitle {
+  font-size: 0.95rem;
+  color: var(--muted);
+}
+
+.app-main {
+  flex: 1;
+  display: flex;
+  align-items: stretch;
+  gap: 1.5rem;
+  padding: 1.5rem 2.5rem 2.5rem;
+  min-height: 0;
+}
+
+.config-section {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 18px;
+  padding: 1.5rem;
+  box-shadow: var(--shadow);
+  min-width: 0;
+  min-height: 0;
+  overflow: auto;
+  flex: 0 0 340px;
+  height: 100%;
+}
+
+.chat-section {
+  display: flex;
+  flex-direction: column;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 18px;
+  overflow: hidden;
+  min-height: 0;
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.error-message {
+  background: #fff1f1;
+  color: #8d1c1c;
+  padding: 0.75rem 1rem;
+  margin: 0 1.25rem 1rem;
+  border-radius: 12px;
+  text-align: left;
+  font-size: 0.9rem;
+  border: 1px solid #f1c4c4;
+}
+
+.app-footer {
+  padding: 0 2.5rem 2rem;
+  font-size: 0.85rem;
+  color: var(--muted);
+}
+
+.app-footer a {
+  color: var(--text);
+  text-decoration: none;
+  margin-left: 0.5rem;
+}
+
+.app-footer a:hover {
+  text-decoration: underline;
+}
+
+/* Responsive */
+@media (max-width: 980px) {
+  .app-header {
+    padding: 1.5rem 1.5rem 0.75rem;
+  }
+
+  .app-main {
+    flex-direction: column;
+    padding: 1rem 1.5rem 2rem;
+  }
+
+  .config-section {
+    flex: 0 0 auto;
+    height: auto;
+  }
+}
+
+/* Gemini Nano setup guide */
+.gemini-nano-setup {
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  overflow: hidden;
+}
+
+.gemini-nano-setup[open] {
+  border-color: #fde68a;
+  background: #fefce8;
+}
+
+.gemini-nano-setup__summary {
+  padding: 0.7rem 1rem;
+  font-size: 0.9rem;
+  font-weight: 500;
+  cursor: pointer;
+  color: var(--text);
+  list-style: none;
+}
+
+.gemini-nano-setup__summary::-webkit-details-marker {
+  display: none;
+}
+
+.gemini-nano-setup__summary::before {
+  content: "\25B6";
+  display: inline-block;
+  margin-right: 0.5rem;
+  font-size: 0.7em;
+  transition: transform 0.15s ease;
+}
+
+.gemini-nano-setup[open] > .gemini-nano-setup__summary::before {
+  transform: rotate(90deg);
+}
+
+.gemini-nano-setup__body {
+  padding: 0 1rem 0.95rem;
+  color: #854d0e;
+}
+
+.gemini-nano-setup__body p {
+  margin: 0 0 0.5rem;
+  font-size: 0.9rem;
+  line-height: 1.55;
+}
+
+.gemini-nano-steps {
+  margin: 0.5rem 0 0.75rem;
+  padding-left: 1.4rem;
+  font-size: 0.88rem;
+  line-height: 1.65;
+}
+
+.gemini-nano-steps li {
+  margin-bottom: 0.25rem;
+}
+
+.gemini-nano-steps code {
+  background: rgba(0, 0, 0, 0.06);
+  padding: 0.1em 0.35em;
+  border-radius: 4px;
+  font-size: 0.88em;
+  font-family: "JetBrains Mono", monospace;
+}
+
+.gemini-nano-note {
+  font-size: 0.85rem;
+  color: #92400e;
+  margin-bottom: 0 !important;
+}
+
+/* Gemini Nano status & prepare */
+.gemini-nano-status {
+  text-align: left;
+}
+
+.gemini-nano-status__text {
+  font-size: 0.9rem;
+  color: var(--muted);
+}
+
+.gemini-nano-status__text--ready {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  color: #16a34a;
+  font-weight: 500;
+}
+
+.gemini-nano-status__text--error {
+  color: #dc2626;
+}
+
+.gemini-nano-ready-indicator {
+  width: 0.6rem;
+  height: 0.6rem;
+  border-radius: 999px;
+  background: #16a34a;
+  flex-shrink: 0;
+}
+
+.gemini-nano-prepare {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.gemini-nano-prepare__button {
+  align-self: flex-start;
+  padding: 0.5em 1.2em;
+  font-size: 0.88rem;
+  font-weight: 500;
+  background: var(--text);
+  color: var(--panel);
+  border: none;
+  border-radius: 8px;
+  cursor: pointer;
+  transition: opacity 0.15s ease;
+}
+
+.gemini-nano-prepare__button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.gemini-nano-progress {
+  height: 6px;
+  background: var(--border);
+  border-radius: 3px;
+  overflow: hidden;
+}
+
+.gemini-nano-progress__bar {
+  height: 100%;
+  background: var(--text);
+  border-radius: 3px;
+  transition: width 0.3s ease;
+}
