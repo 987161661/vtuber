@@ -1,4 +1,5 @@
 import type { EmptyRoomAwarenessSettings } from '../types/settings';
+import type { LiveRoomEventType } from '../services/live-platform/types';
 
 export type EmptyRoomAwarenessSource =
   | 'interface'
@@ -27,6 +28,11 @@ export interface EmptyRoomAwarenessPrompt {
   source: EmptyRoomAwarenessSource;
   scheduledNextAt: number;
   cueId?: string;
+}
+
+/** Presence alone is not a conversation and must not postpone quiet-room talk. */
+export function isQuietRoomInteraction(type: LiveRoomEventType): boolean {
+  return type !== 'entry';
 }
 
 const INSPIRATION_SEEDS = [

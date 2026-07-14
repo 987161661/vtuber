@@ -52,6 +52,24 @@ export type OperatorQueueItem = {
   assignedOwnerId?: string;
 };
 
+export const MAX_READY_REPLY_AGE_MS = 45_000;
+
+/**
+ * A generated reply becomes misleading once the live room has already moved
+ * on. Operator-authored speech is exempt because it is an explicit command.
+ */
+export function isStaleReadyReply(
+  item: OperatorQueueItem,
+  now = Date.now(),
+  maxAgeMs = MAX_READY_REPLY_AGE_MS,
+): boolean {
+  return (
+    item.status === 'ready' &&
+    item.source !== 'operator-manual' &&
+    now - item.createdAt > maxAgeMs
+  );
+}
+
 export async function updateOperatorQueue(
   eventId: string,
   action: string,

@@ -7,7 +7,7 @@ export type StreamState = {
   title?: string;
   elapsedMs?: number;
   viewerCount?: number;
-  language?: 'ja' | 'en' | 'auto';
+  language?: 'zh-CN' | 'ja' | 'en' | 'auto';
 };
 
 export type RecentAiMessage = {

@@ -9,13 +9,14 @@ import {
 } from './config/characterProfile';
 import { useAituberCore } from './hooks/useAituberCore';
 import { useAudioLipsync } from './hooks/useAudioLipsync';
-import { useBilibiliComments } from './hooks/useBilibiliComments';
 import { useHostExtensions } from './hooks/useHostExtensions';
 import { useInteractionFeed } from './hooks/useInteractionFeed';
 import { useInterval } from './hooks/useInterval';
 import { useLiveCommentIntelligence } from './hooks/useLiveCommentIntelligence';
 import { useLiveDirector } from './hooks/useLiveDirector';
+import { useLiveHostCoordinator } from './hooks/useLiveHostCoordinator';
 import { useLivePlatformEvents } from './hooks/useLivePlatformEvents';
+import { useRuntimeOwnerLease } from './hooks/useRuntimeOwnerLease';
 import { useScreenVisionController } from './hooks/useScreenVisionController';
 import { useSettings } from './hooks/useSettings';
 import { useSocialStreamBus } from './hooks/useSocialStreamBus';
@@ -23,8 +24,12 @@ import { useStreamerMemory } from './hooks/useStreamerMemory';
 import { useTwitchComments } from './hooks/useTwitchComments';
 import { useYoutubeComments } from './hooks/useYoutubeComments';
 import { digitalHumanAvatarStore } from './lib/digitalHumanAvatarStore';
-import { EmptyRoomAwarenessPlanner } from './lib/emptyRoomAwareness';
+import {
+  EmptyRoomAwarenessPlanner,
+  isQuietRoomInteraction,
+} from './lib/emptyRoomAwareness';
 import { parseFlashHeadBundle } from './lib/flashheadBundle';
+import { routeTyphoonSkillWithAgent } from './lib/skillRoutingAgent';
 import { previewMinimaxVoice } from './lib/minimaxVoicePreview';
 import type { PuruPuruAvatarPackage } from './lib/purupuruPackage';
 import { loadPuruPuruPackage } from './lib/purupuruPackage';
@@ -42,8 +47,17 @@ import {
   hostBridgeType,
   isLegacyHostBridgeMessage,
 } from './services/host-bridge/protocol';
-import { bilibiliReplyAdapter } from './services/live-platform/bilibili';
+import {
+  createOrdinaryRoadEventAdapter,
+  fetchOrdinaryRoadStatus,
+  sendOrdinaryRoadReply,
+} from './services/live-platform/ordinaryRoad';
 import { createCustomSseEventAdapter } from './services/live-platform/customSse';
+import {
+  platformOwner,
+  resolveSpeechDeliveryTargets,
+  type SpeechDeliveryKind,
+} from './services/live-platform/connectors';
 import type {
   LiveRoomEvent,
   LiveRoomStatus,
@@ -61,10 +75,16 @@ import {
 } from './lib/liveConversationContext';
 import type { LiveLifecycleTransition } from './lib/liveResponseScheduler';
 import {
+  isStaleReadyReply,
   type OperatorQueueItem,
   updateOperatorQueue,
 } from './lib/operatorQueue';
 import { STRESS_TEST_PLAN } from './lib/stressTestPlan';
+import {
+  AvatarBehaviorBus,
+  createAvatarBehaviorEvent,
+  type AvatarAction,
+} from '@aituber-onair/live-companion';
 
 type AvatarPackageSource = 'default' | 'user';
 const EMPTY_STRESS_RUN: StressRunState = {
@@ -76,6 +96,14 @@ const EMPTY_STRESS_RUN: StressRunState = {
   failures: [],
 };
 type StressApiRecord = Record<string, unknown>;
+
+function scopedViewerId(
+  viewerId?: string,
+  platform?: string,
+): string | undefined {
+  if (!viewerId) return undefined;
+  return `${platform?.trim() || 'unknown'}:${viewerId}`;
+}
 
 function parseStressDiagnostics(value: unknown): StressRunState['diagnostics'] {
   if (!value || typeof value !== 'object') return undefined;
@@ -122,7 +150,7 @@ type ConversationOrigin = {
 type ActiveLifecycle = ConversationOrigin & {
   eventId: string;
   replyText?: string;
-  bilibiliMirrorStarted?: boolean;
+  deliveredConnectorTargets?: Set<string>;
   ttsStartAt?: number;
   testRunId?: string;
   stepId?: string;
@@ -205,13 +233,18 @@ function toInteractionTransition(
     viewerId: typeof event.viewerId === 'string' ? event.viewerId : undefined,
     viewerName:
       typeof event.viewerName === 'string' ? event.viewerName : undefined,
-    sourcesSeen: Array.isArray(event.sourcesSeen)
-      ? event.sourcesSeen.filter(
-          (source): source is string => typeof source === 'string',
-        )
-      : typeof event.sourceLabel === 'string'
-        ? [event.sourceLabel]
-        : [],
+    sourcesSeen: (() => {
+      const sources = Array.isArray(event.sourcesSeen)
+        ? event.sourcesSeen.filter(
+            (source): source is string => typeof source === 'string',
+          )
+        : [];
+      if (sources.length) return sources;
+      if (typeof event.source === 'string' && event.source.trim()) {
+        return [event.source];
+      }
+      return typeof event.sourceLabel === 'string' ? [event.sourceLabel] : [];
+    })(),
     queueDepth: typeof event.queueDepth === 'number' ? event.queueDepth : 0,
     oldestQueueAgeMs:
       typeof event.oldestQueueAgeMs === 'number' ? event.oldestQueueAgeMs : 0,
@@ -226,10 +259,10 @@ const FLASHHEAD_START_BUFFER_SECONDS = 2.5;
 // silent. This is a latency cap, not the normal buffering target.
 const FLASHHEAD_MAX_START_WAIT_MS = 1_600;
 
-// Rendering a FlashHead audio slice usually takes about two seconds on this
-// machine. Leave room for an occasional cold or busy GPU instead of silently
-// falling back to the idle avatar mid-sentence.
-const SPEAKING_RENDER_TIMEOUT_MS = 10_000;
+// Speech always outranks an optional avatar render. If the local renderer is
+// offline or cold, fall back to the idle avatar quickly and play the verified
+// TTS audio instead of turning a short render delay into a silent reply.
+const SPEAKING_RENDER_TIMEOUT_MS = 1_600;
 // This is a *no-progress* watchdog, not a whole-reply deadline.  A real
 // MiniMax reply may contain several separately synthesized sentences, so a
 // fixed timer armed only at screenplay start used to kill valid playback after
@@ -237,6 +270,7 @@ const SPEAKING_RENDER_TIMEOUT_MS = 10_000;
 // A fact-complete Chinese weather answer can exceed 120 seconds of natural
 // playback.  This is a no-progress watchdog, not a response-length limit.
 const OPERATOR_SPEECH_WATCHDOG_MS = 240_000;
+const OPERATOR_TTS_START_TIMEOUT_MS = 30_000;
 const OPERATOR_GENERATION_RECOVERY_MS = 35_000;
 const NO_REPLY_TOKEN = '[[NO_REPLY]]';
 async function getAudioPlaybackTimeoutMs(arrayBuffer: ArrayBuffer) {
@@ -265,10 +299,18 @@ async function getAudioPlaybackTimeoutMs(arrayBuffer: ArrayBuffer) {
 
 export default function App() {
   const query = new URLSearchParams(window.location.search);
+  const hostCoordinatorV2Enabled = query.get('hostCoordinatorV2') !== '0';
+  const speechPlanV2Enabled = query.get('speechPlanV2') !== '0';
+  // Affine reactions are useful for renderer diagnostics, but they are not a
+  // production motion system. Production only exposes renderer-backed output.
+  const debugAffineAvatarMotion = query.get('debugAffineAvatarMotion') === '1';
+  const { dispatch: dispatchLiveHostEvent, snapshot: liveHostSnapshot } =
+    useLiveHostCoordinator(hostCoordinatorV2Enabled);
   const isObsOverlay = query.get('overlay') === '1';
   const [isTemporaryStressOwner, setIsTemporaryStressOwner] = useState(false);
-  const isLiveRuntimeOwner =
+  const isLiveRuntimeCandidate =
     isObsOverlay || query.get('listener') === '1' || isTemporaryStressOwner;
+  const isLiveRuntimeOwner = useRuntimeOwnerLease(isLiveRuntimeCandidate);
   // FlashHead is the production audio-driven avatar renderer. Set
   // ?avatar=purupuru to disable rendered speaking video for troubleshooting.
   const useSpeakingAvatar = query.get('avatar') !== 'purupuru';
@@ -387,6 +429,24 @@ export default function App() {
   );
   const [autoBroadcastEnabled, setAutoBroadcastEnabled] = useState(true);
   const [streamErrorMessage, setStreamErrorMessage] = useState('');
+  const [ordinaryRoadStatus, setOrdinaryRoadStatus] = useState<LiveRoomStatus>({
+    state: 'disabled',
+  });
+  const socialStreamSendRef = useRef<
+    (
+      platformId: string,
+      reply: { message: string; idempotencyKey: string },
+    ) => Promise<unknown>
+  >(async () => {
+    throw new Error('social_stream_control_not_connected');
+  });
+  const ordinaryRoadEventAdapter = useMemo(
+    () =>
+      createOrdinaryRoadEventAdapter(
+        settingsHook.settings.liveConnectors.ordinaryRoad.gatewayUrl,
+      ),
+    [settingsHook.settings.liveConnectors.ordinaryRoad.gatewayUrl],
+  );
   const [backgroundImageUrl, setBackgroundImageUrl] = useState<string | null>(
     null,
   );
@@ -402,9 +462,26 @@ export default function App() {
   const avatarPackageRef = useRef<PuruPuruAvatarPackage | null>(null);
   const avatarLoadRequestRef = useRef(0);
   const avatarReactionIdRef = useRef(0);
+  const unsupportedAvatarActionCountRef = useRef(0);
+  const [unsupportedAvatarActionCount, setUnsupportedAvatarActionCount] =
+    useState(0);
+  const avatarBehaviorBusRef = useRef<AvatarBehaviorBus | null>(null);
+  const lastAvatarBehaviorBeatRef = useRef('');
+  if (!avatarBehaviorBusRef.current) {
+    const bus = new AvatarBehaviorBus();
+    bus.register({
+      id: 'flashhead-personalive-production',
+      // Lip-sync and real layer switching are driven by their existing audio
+      // adapters. There is no renderer-backed motion/gesture capability yet.
+      capabilities: { actionKinds: [], emotionNames: '*' },
+      async dispatch() {},
+    });
+    avatarBehaviorBusRef.current = bus;
+  }
   const handledExternalRequestIdsRef = useRef<Set<string>>(new Set());
   const speechReactionRef = useRef<PuruPuruReactionDraft | null>(null);
   const proactiveSpeechRef = useRef(false);
+  const proactiveEventIdRef = useRef<string | null>(null);
   const emptyRoomAwarenessPlannerRef = useRef<EmptyRoomAwarenessPlanner | null>(
     null,
   );
@@ -605,12 +682,18 @@ export default function App() {
           `${speakingAvatarEngine} unavailable; using the idle avatar.`,
           error,
         );
+        emitRuntimeEvent({
+          eventId: activeLifecycleRef.current?.eventId,
+          stage: `${speakingAvatarEngine}_render_failed`,
+          at: Date.now(),
+          reason: error instanceof Error ? error.message : String(error),
+        });
         return null;
       } finally {
         window.clearTimeout(timeout);
       }
     },
-    [speakingAvatarEngine, useSpeakingAvatar],
+    [emitRuntimeEvent, speakingAvatarEngine, useSpeakingAvatar],
   );
 
   const playAudioChunk = useCallback(
@@ -830,7 +913,7 @@ export default function App() {
   );
 
   const armOperatorSpeechWatchdog = useCallback(
-    (eventId: string) => {
+    (eventId: string, timeoutMs = OPERATOR_SPEECH_WATCHDOG_MS) => {
       if (speakingOperatorTaskRef.current !== eventId) return;
       if (operatorSpeechWatchdogRef.current !== null) {
         window.clearTimeout(operatorSpeechWatchdogRef.current);
@@ -860,9 +943,76 @@ export default function App() {
         void updateOperatorQueue(eventId, 'retry', {
           reason: 'tts_progress_timeout',
         }).catch(() => undefined);
-      }, OPERATOR_SPEECH_WATCHDOG_MS);
+      }, timeoutMs);
     },
     [emitRuntimeEvent, stop],
+  );
+
+  const dispatchAvatarBehavior = useCallback(
+    (screenplay: ScreenplayLike) => {
+      const active = activeLifecycleRef.current;
+      const actions: AvatarAction[] = [];
+      if (screenplay.motion && screenplay.motion !== 'none') {
+        actions.push({ kind: 'motion', name: screenplay.motion });
+      }
+      if (screenplay.gaze && screenplay.gaze !== 'none') {
+        actions.push({ kind: 'pose', name: `gaze:${screenplay.gaze}` });
+      }
+      if (screenplay.gesture && screenplay.gesture !== 'none') {
+        actions.push({ kind: 'gesture', name: screenplay.gesture });
+      }
+      const behaviorEvent = createAvatarBehaviorEvent(
+        {
+          name: screenplay.emotion || 'neutral',
+          intensity: Math.max(
+            0,
+            Math.min(1, screenplay.emotionIntensity ?? 0.5),
+          ),
+        },
+        {
+          streamId: 'linglan-live',
+          source: active?.channel.includes('quiet-room')
+            ? 'proactive-talk'
+            : 'assistant',
+          speechText: screenplay.text,
+          targetViewerId: active?.viewerId,
+          correlationId: active?.eventId,
+        },
+        actions,
+      );
+      void avatarBehaviorBusRef.current
+        ?.dispatch(behaviorEvent)
+        .then((receipts) => {
+          const skipped = receipts.some(
+            (receipt) => receipt.status === 'skipped',
+          )
+            ? actions.length
+            : 0;
+          unsupportedAvatarActionCountRef.current += skipped;
+          setUnsupportedAvatarActionCount(
+            unsupportedAvatarActionCountRef.current,
+          );
+          emitRuntimeEvent({
+            eventId: active?.eventId,
+            stage:
+              skipped > 0
+                ? 'avatar_action_skipped'
+                : 'avatar_behavior_dispatched',
+            at: Date.now(),
+            reason:
+              skipped > 0
+                ? 'renderer_capability_not_supported'
+                : 'renderer_capability_delivered',
+            intents: actions.map((action) => `${action.kind}:${action.name}`),
+            skippedCount: skipped,
+            receipts: receipts.map(({ adapterId, status }) => ({
+              adapterId,
+              status,
+            })),
+          });
+        });
+    },
+    [emitRuntimeEvent],
   );
 
   const handleSpeechStart = useCallback(
@@ -878,9 +1028,16 @@ export default function App() {
       };
       const active = activeLifecycleRef.current;
       if (active?.eventId) {
+        dispatchLiveHostEvent({
+          type: 'speech',
+          at: Date.now(),
+          eventId: active.eventId,
+          stage: 'started',
+          beatIndex: 0,
+          interruptibleAfter: false,
+        });
         if (speakingOperatorTaskRef.current === active.eventId) {
           operatorPlaybackObservedRef.current = false;
-          armOperatorSpeechWatchdog(active.eventId);
         }
         active.ttsStartAt = Date.now();
         emitRuntimeEvent({
@@ -893,34 +1050,99 @@ export default function App() {
           viewerName: active.viewerName,
           sourcesSeen: active.sourcesSeen,
         });
-        if (
-          settingsHook.settings.stream.bilibiliReplyEnabled &&
-          !active.testRunId &&
-          !active.bilibiliMirrorStarted
-        ) {
+        if (!active.testRunId) {
           const message = (active.replyText || text).trim();
-          if (message) {
-            // Mirror exactly once when TTS really starts. This covers replies,
-            // proactive speech and operator-authored broadcasts through the
-            // same playback lifecycle.
-            active.bilibiliMirrorStarted = true;
-            void bilibiliReplyAdapter
-              .send({
-                message,
-                idempotencyKey: `speech:${active.eventId}`,
+          const kind: SpeechDeliveryKind = active.channel.includes(
+            'operator-manual',
+          )
+            ? 'operator-broadcast'
+            : active.channel.includes('quiet-room') ||
+                active.channel.includes('proactive')
+              ? 'proactive-speech'
+              : 'viewer-reply';
+          const sourcePlatformId = active.sourcesSeen?.find(Boolean);
+          const sourceConnectorId = sourcePlatformId
+            ? platformOwner(
+                settingsHook.settings.liveConnectors,
+                sourcePlatformId,
+              )
+            : undefined;
+          const targets = resolveSpeechDeliveryTargets(
+            settingsHook.settings.liveConnectors,
+            {
+              eventId: active.eventId,
+              kind,
+              sourceConnectorId,
+              sourcePlatformId,
+            },
+          );
+          active.deliveredConnectorTargets ??= new Set<string>();
+          for (const target of targets) {
+            const targetKey = `${target.connectorId}:${target.platformId}`;
+            if (!message || active.deliveredConnectorTargets.has(targetKey))
+              continue;
+            active.deliveredConnectorTargets.add(targetKey);
+            const idempotencyKey = `speech:${active.eventId}:${targetKey}`;
+            emitRuntimeEvent({
+              eventId: active.eventId,
+              stage: 'live_platform_delivery_requested',
+              actor: {
+                type: 'system',
+                id: `${target.connectorId}-reply-adapter`,
+              },
+              at: Date.now(),
+              source: active.channel,
+              connectorId: target.connectorId,
+              platformId: target.platformId,
+              message,
+              idempotencyKey,
+            });
+            const delivery =
+              target.connectorId === 'ordinaryroad'
+                ? sendOrdinaryRoadReply(
+                    settingsHook.settings.liveConnectors.ordinaryRoad
+                      .gatewayUrl,
+                    target.platformId,
+                    { message, idempotencyKey },
+                  )
+                : socialStreamSendRef.current(target.platformId, {
+                    message,
+                    idempotencyKey,
+                  });
+            void delivery
+              .then((result) => {
+                setStreamErrorMessage('');
+                emitRuntimeEvent({
+                  eventId: active.eventId,
+                  stage: 'live_platform_delivery_succeeded',
+                  at: Date.now(),
+                  connectorId: target.connectorId,
+                  platformId: target.platformId,
+                  result,
+                });
               })
-              .then(() => setStreamErrorMessage(''))
               .catch((error) => {
                 const reason =
                   error instanceof Error ? error.message : String(error);
-                setStreamErrorMessage(`B 站同步主播台词失败：${reason}`);
-                console.warn('Bilibili speech mirror failed.', error);
+                setStreamErrorMessage(
+                  `${target.platformId} 文字回写失败：${reason}`,
+                );
+                emitRuntimeEvent({
+                  eventId: active.eventId,
+                  stage: 'live_platform_delivery_failed',
+                  at: Date.now(),
+                  connectorId: target.connectorId,
+                  platformId: target.platformId,
+                  error: reason,
+                });
               });
           }
         }
       }
-      speechReactionRef.current =
-        createPuruPuruReactionFromScreenplay(screenplay);
+      speechReactionRef.current = debugAffineAvatarMotion
+        ? createPuruPuruReactionFromScreenplay(screenplay)
+        : null;
+      lastAvatarBehaviorBeatRef.current = '';
       setAvatarMotion(
         useSpeakingAvatar
           ? 'idle_cold'
@@ -928,9 +1150,10 @@ export default function App() {
       );
     },
     [
-      armOperatorSpeechWatchdog,
+      dispatchLiveHostEvent,
+      debugAffineAvatarMotion,
       emitRuntimeEvent,
-      settingsHook.settings.stream.bilibiliReplyEnabled,
+      settingsHook.settings.liveConnectors,
       useSpeakingAvatar,
     ],
   );
@@ -953,6 +1176,12 @@ export default function App() {
     if (isOperatorPlayback && !hasCompleteOperatorAudio) return;
     if (active?.eventId) {
       const ttsEndAt = Date.now();
+      dispatchLiveHostEvent({
+        type: 'speech',
+        at: ttsEndAt,
+        eventId: active.eventId,
+        stage: 'completed',
+      });
       void fetch('/api/conversation-history', {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
@@ -1001,9 +1230,46 @@ export default function App() {
     activeLifecycleRef.current = null;
     speechRenderTraceRef.current = null;
     proactiveSpeechRef.current = false;
+    proactiveEventIdRef.current = null;
     resetAvatarReaction();
     setAvatarMotion('idle_cold');
-  }, [emitRuntimeEvent, resetAvatarReaction]);
+  }, [dispatchLiveHostEvent, emitRuntimeEvent, resetAvatarReaction]);
+
+  const handleSpeechInterrupted = useCallback(() => {
+    const active = activeLifecycleRef.current;
+    if (active?.eventId) {
+      dispatchLiveHostEvent({
+        type: 'speech',
+        at: Date.now(),
+        eventId: active.eventId,
+        stage: 'interrupted',
+      });
+      emitRuntimeEvent({
+        eventId: active.eventId,
+        stage: 'dropped',
+        at: Date.now(),
+        source: active.channel,
+        sourceLabel: active.label,
+        viewerId: active.viewerId,
+        viewerName: active.viewerName,
+        reason: 'interrupted_at_beat_boundary',
+      });
+      void updateOperatorQueue(active.eventId, 'skip', {
+        reason: 'interrupted_at_beat_boundary',
+      }).catch(() => undefined);
+    }
+    speakingOperatorTaskRef.current = null;
+    operatorPlaybackObservedRef.current = false;
+    activeLifecycleRef.current = null;
+    proactiveSpeechRef.current = false;
+    proactiveEventIdRef.current = null;
+    if (operatorSpeechWatchdogRef.current !== null) {
+      window.clearTimeout(operatorSpeechWatchdogRef.current);
+      operatorSpeechWatchdogRef.current = null;
+    }
+    resetAvatarReaction();
+    setAvatarMotion('idle_cold');
+  }, [dispatchLiveHostEvent, emitRuntimeEvent, resetAvatarReaction]);
 
   const {
     messages,
@@ -1014,16 +1280,29 @@ export default function App() {
     speakPrepared,
     isCoreReady,
     recoverChatRuntime,
+    interruptSpeech,
   } = useAituberCore({
     onAudioPlay: handleAudioPlay,
     onAudioStream:
       useSpeakingAvatar && useStreamingLipSync ? handleAudioStream : undefined,
     onSpeechStart: handleSpeechStart,
     onSpeechEnd: handleSpeechEnd,
+    onSpeechInterrupted: handleSpeechInterrupted,
     onSpeechChunk: (stage, data) => {
       const active = activeLifecycleRef.current;
       const bridgePlayback = data.bridge === 'minimax-audio';
       if (stage === 'start') {
+        const beatIndex = Number(data.beatIndex ?? data.index ?? 0);
+        const avatarBeatKey = `${active?.eventId || 'direct'}:${beatIndex}`;
+        if (
+          !debugAffineAvatarMotion &&
+          data.screenplay &&
+          typeof data.screenplay === 'object' &&
+          lastAvatarBehaviorBeatRef.current !== avatarBeatKey
+        ) {
+          lastAvatarBehaviorBeatRef.current = avatarBeatKey;
+          dispatchAvatarBehavior(data.screenplay as ScreenplayLike);
+        }
         speechBeatBytesRef.current = 0;
         operatorBeatCountRef.current = bridgePlayback
           ? Number(data.count || 1)
@@ -1036,7 +1315,10 @@ export default function App() {
           }).catch(() => undefined);
         }
       }
-      if (active?.eventId && (stage === 'start' || stage === 'end')) {
+      if (
+        active?.eventId &&
+        (stage === 'end' || stage === 'start')
+      ) {
         armOperatorSpeechWatchdog(active.eventId);
       }
       emitRuntimeEvent({
@@ -1050,6 +1332,14 @@ export default function App() {
         byteLength: stage === 'start' ? 0 : speechBeatBytesRef.current,
       });
       if (active?.eventId && stage === 'end') {
+        dispatchLiveHostEvent({
+          type: 'speech',
+          at: Date.now(),
+          eventId: active.eventId,
+          stage: 'beat-completed',
+          beatIndex: Number(data.beatIndex ?? data.index ?? 0),
+          interruptibleAfter: data.interruptibleAfter === true,
+        });
         operatorCompletedBeatCountRef.current = Math.max(
           operatorCompletedBeatCountRef.current,
           Number(data.index || 0) + 1,
@@ -1062,9 +1352,18 @@ export default function App() {
           replaceBeatPlan: bridgePlayback,
         }).catch(() => undefined);
       }
+      if (active?.eventId && stage === 'error') {
+        dispatchLiveHostEvent({
+          type: 'runtime-fault',
+          at: Date.now(),
+          eventId: active.eventId,
+          reasonCode: 'tts_beat_failed',
+        });
+      }
     },
     settings: settingsHook.settings,
     profile: runtimeProfile,
+    speechPlanV2Enabled,
     getApiKeyForProvider: settingsHook.getApiKeyForProvider,
     onAssistantResponse: (input, reply, metadata) => {
       // Update synchronously, before the disk write finishes, so an immediate
@@ -1077,7 +1376,10 @@ export default function App() {
             at: Date.now(),
             input,
             reply,
+            viewerId: metadata?.viewerId,
             viewerName: metadata?.viewerName,
+            sourceLabel: metadata?.sourceLabel,
+            sourcesSeen: metadata?.sourcesSeen,
           },
         ],
       );
@@ -1106,8 +1408,10 @@ export default function App() {
         body: JSON.stringify({
           input,
           reply,
+          viewerId: metadata?.viewerId,
           viewerName: metadata?.viewerName,
           source: metadata?.source,
+          sourceLabel: metadata?.sourceLabel,
           eventId: metadata?.eventId,
           commentAt: metadata?.commentAt,
           receivedAt: metadata?.receivedAt,
@@ -1136,7 +1440,10 @@ export default function App() {
         input,
         reply,
         {
-          id: metadata?.viewerId,
+          id: scopedViewerId(
+            metadata?.viewerId,
+            metadata?.sourcesSeen?.[0] ?? metadata?.source,
+          ),
           name: metadata?.viewerName,
         },
         metadata?.source,
@@ -1155,9 +1462,26 @@ export default function App() {
         ? 'generation_truncated'
         : 'generation_failed';
       if (eventId) {
-        void updateOperatorQueue(eventId, 'retry', { reason }).catch(
-          () => undefined,
-        );
+        void updateOperatorQueue(
+          eventId,
+          reason === 'generation_truncated' ? 'fail' : 'retry',
+          { reason },
+        ).catch(() => undefined);
+        dispatchLiveHostEvent({
+          type: 'generation',
+          at: Date.now(),
+          eventId,
+          stage: 'failed',
+          turn: {
+            eventId,
+            kind: active?.channel.includes('quiet-room')
+              ? 'proactive'
+              : 'viewer',
+            priority: active?.channel.includes('quiet-room') ? 'low' : 'normal',
+            createdAt: Date.now(),
+            targetViewerId: active?.viewerId,
+          },
+        });
       }
       if (!active?.eventId || active.eventId !== eventId) return;
       emitRuntimeEvent({
@@ -1193,8 +1517,16 @@ export default function App() {
         ttsConfigured:
           settingsHook.settings.tts.engine !== 'minimax' ||
           Boolean(settingsHook.settings.tts.minimaxApiKey?.trim()),
-        nextProactiveAt:
-          emptyRoomAwarenessPlannerRef.current?.getNextAt() || null,
+        nextProactiveAt: liveHostSnapshot.nextProactiveAt || null,
+        hostPhase: liveHostSnapshot.phase,
+        activeTurnId: liveHostSnapshot.activeTurn?.eventId,
+        targetViewerId: liveHostSnapshot.activeTurn?.targetViewerId,
+        lastDecisionReason: liveHostSnapshot.lastDecisionReason,
+        proactiveRemaining: liveHostSnapshot.proactiveRemaining,
+        currentBeatIndex: liveHostSnapshot.currentBeatIndex,
+        currentBeatInterruptible: liveHostSnapshot.currentBeatInterruptible,
+        recoveryCount: liveHostSnapshot.recoveryCount,
+        unsupportedAvatarActionCount: unsupportedAvatarActionCountRef.current,
         at: Date.now(),
       });
     heartbeat();
@@ -1205,6 +1537,7 @@ export default function App() {
     isLiveRuntimeOwner,
     isProcessing,
     isSpeaking,
+    liveHostSnapshot,
     settingsHook.settings.tts.engine,
     settingsHook.settings.tts.minimaxApiKey,
   ]);
@@ -1332,6 +1665,21 @@ export default function App() {
                     typeof value.viewerName === 'string'
                       ? value.viewerName
                       : undefined,
+                  viewerId:
+                    typeof value.viewerId === 'string'
+                      ? value.viewerId
+                      : undefined,
+                  sourceLabel:
+                    typeof value.sourceLabel === 'string'
+                      ? value.sourceLabel
+                      : typeof value.source === 'string'
+                        ? value.source
+                        : undefined,
+                  sourcesSeen: Array.isArray(value.sourcesSeen)
+                    ? value.sourcesSeen.filter(
+                        (source): source is string => typeof source === 'string',
+                      )
+                    : undefined,
                   skills: Array.isArray(value.skills)
                     ? value.skills.filter(
                         (skill): skill is string => typeof skill === 'string',
@@ -1362,7 +1710,16 @@ export default function App() {
   // scheduler effect below mistakes every sync for a configuration edit and
   // postpones proactive speech forever.
   const emptyRoomAwarenessSettings = useMemo(
-    () => settingsHook.settings.emptyRoomAwareness,
+    () => ({
+      enabled: settingsHook.settings.emptyRoomAwareness.enabled,
+      minIntervalMs: settingsHook.settings.emptyRoomAwareness.minIntervalMs,
+      maxIntervalMs: settingsHook.settings.emptyRoomAwareness.maxIntervalMs,
+      interfaceWeight: settingsHook.settings.emptyRoomAwareness.interfaceWeight,
+      memoryWeight: settingsHook.settings.emptyRoomAwareness.memoryWeight,
+      inspirationWeight:
+        settingsHook.settings.emptyRoomAwareness.inspirationWeight,
+      audienceWeight: settingsHook.settings.emptyRoomAwareness.audienceWeight,
+    }),
     [
       settingsHook.settings.emptyRoomAwareness.enabled,
       settingsHook.settings.emptyRoomAwareness.minIntervalMs,
@@ -1373,12 +1730,21 @@ export default function App() {
       settingsHook.settings.emptyRoomAwareness.audienceWeight,
     ],
   );
-  const markLiveActivity = useCallback(() => {
-    liveDirector.markActivity();
-    emptyRoomAwarenessPlannerRef.current?.markActivity(
-      emptyRoomAwarenessSettings,
-    );
-  }, [emptyRoomAwarenessSettings, liveDirector]);
+  const markLiveActivity = useCallback(
+    (reason = 'viewer-interaction') => {
+      liveDirector.markActivity();
+      emptyRoomAwarenessPlannerRef.current?.markActivity(
+        emptyRoomAwarenessSettings,
+      );
+      emitRuntimeEvent({
+        stage: 'quiet-room-timer-reset',
+        at: Date.now(),
+        reason,
+        nextProactiveAt: emptyRoomAwarenessPlannerRef.current?.getNextAt() ?? 0,
+      });
+    },
+    [emitRuntimeEvent, emptyRoomAwarenessSettings, liveDirector],
+  );
   useEffect(() => {
     if (emptyRoomAwarenessSettings.enabled) {
       emptyRoomAwarenessPlannerRef.current?.markActivity(
@@ -1427,12 +1793,38 @@ export default function App() {
     ) => {
       const eventId = options?.eventId ?? crypto.randomUUID();
       const displayText = options?.displayText ?? text;
+      const isProactive =
+        options?.sourceLabel?.includes('quiet-room') === true ||
+        options?.sourcesSeen?.includes('quiet-room-awareness') === true;
+      const turn = {
+        eventId,
+        kind: isProactive ? ('proactive' as const) : ('viewer' as const),
+        priority: isProactive ? ('low' as const) : ('normal' as const),
+        createdAt: options?.createdAt ?? Date.now(),
+        targetViewerId: options?.viewerId,
+        proactiveSource: isProactive ? options?.sourceLabel : undefined,
+      };
+      dispatchLiveHostEvent({
+        type: 'generation',
+        at: Date.now(),
+        eventId,
+        stage: 'started',
+        turn,
+      });
       const shortTermLiveContext = await getShortTermLiveContext(
         options?.createdAt,
       );
+      const routing = await routeTyphoonSkillWithAgent({
+        text: displayText,
+        viewerId: options?.viewerId,
+        viewerName: options?.viewerName,
+        sourceLabel: options?.sourceLabel,
+        turns: recentLiveTurnsRef.current,
+      });
       const responseContract = buildLiveResponseContract(
         displayText,
         recentLiveTurnsRef.current,
+        routing,
       );
       // Live comments already receive this context through liveDirector.guide.
       // Queue and radar messages need the same relationship state without
@@ -1443,6 +1835,7 @@ export default function App() {
           : liveDirector.relationshipContext({
               id: options?.viewerId,
               name: options?.viewerName,
+              platform: options?.sourcesSeen?.[0],
             });
       emitRuntimeEvent({
         eventId,
@@ -1454,6 +1847,7 @@ export default function App() {
         viewerId: options?.viewerId,
         viewerName: options?.viewerName,
         sourcesSeen: options?.sourcesSeen,
+        createdAt: options?.commentAt,
       });
       const simulateSkillTimeout =
         Boolean(options?.testRunId) &&
@@ -1470,6 +1864,15 @@ export default function App() {
           ? ['typhoon-skill-timeout']
           : undefined,
       });
+      if (enrichment.forceFallback) {
+        emitRuntimeEvent({
+          eventId,
+          stage: 'skill_timeout_or_unavailable',
+          at: Date.now(),
+          reason: 'skill_result_unavailable_use_safe_fallback',
+          skills: enrichment.skills,
+        });
+      }
       const payload = enrichment.payload;
       // Operator-queue preparation must return a writable text draft. The
       // screenshot/vision route speaks directly and has no draft callback, so
@@ -1509,11 +1912,21 @@ export default function App() {
           forceFallback: enrichment.forceFallback,
         },
         silent: options?.silent,
-        onPrepared: (reply) => options?.onPrepared?.(reply, enrichment.skills),
+        onPrepared: (reply) => {
+          dispatchLiveHostEvent({
+            type: 'generation',
+            at: Date.now(),
+            eventId,
+            stage: 'completed',
+            turn,
+          });
+          options?.onPrepared?.(reply, enrichment.skills);
+        },
       });
     },
     [
       emitRuntimeEvent,
+      dispatchLiveHostEvent,
       getShortTermLiveContext,
       liveDirector,
       processChat,
@@ -1672,8 +2085,10 @@ export default function App() {
           'stress-viewer-b',
           'stress-viewer-c',
         ]) {
-          liveDirector.removeViewer(viewerId);
-          await streamerMemory.removeViewer(viewerId);
+          liveDirector.removeViewer(viewerId, 'stress-test');
+          await streamerMemory.removeViewer(
+            scopedViewerId(viewerId, 'stress-test') || viewerId,
+          );
         }
       }
       const response = await fetch('/api/stress-test', {
@@ -1774,12 +2189,17 @@ export default function App() {
       scenarioId?: string;
       faultKind?: OperatorQueueItem['faultKind'];
       engagementSignals?: OperatorQueueItem['engagementSignals'];
+      createdAt?: number;
     }) => {
       const now = Date.now();
+      const createdAt =
+        typeof input.createdAt === 'number' && Number.isFinite(input.createdAt)
+          ? input.createdAt
+          : now;
       await fetch('/api/operator-queue', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ action: 'ingest', ...input, createdAt: now }),
+        body: JSON.stringify({ action: 'ingest', ...input, createdAt }),
       });
       emitRuntimeEvent({ ...input, stage: 'received', at: now });
       emitRuntimeEvent({ ...input, stage: 'queued', at: now, queuedAt: now });
@@ -1788,12 +2208,179 @@ export default function App() {
     [emitRuntimeEvent, refreshOperatorQueue],
   );
 
+  const enqueueProactiveSpeech = useCallback(
+    (input: {
+      prompt: string;
+      awarenessSource: string;
+      audiencePresent: boolean;
+      scheduledNextAt?: number;
+      busy?: boolean;
+    }) => {
+      const eventId = `proactive:${crypto.randomUUID()}`;
+      const decisions = dispatchLiveHostEvent({
+        type: 'quiet-candidate',
+        at: Date.now(),
+        eventId,
+        source: input.awarenessSource,
+        prompt: input.prompt,
+        busy: input.busy === true,
+      });
+      const selected = decisions.some(
+        (decision) =>
+          decision.kind === 'prepare-reply' && decision.eventId === eventId,
+      );
+      if (hostCoordinatorV2Enabled && !selected) {
+        const dropped = decisions.find((decision) => decision.kind === 'drop');
+        emitRuntimeEvent({
+          eventId,
+          stage: 'dropped',
+          at: Date.now(),
+          source: 'quiet-room-awareness',
+          reason: dropped?.reasonCode ?? 'proactive_not_selected',
+        });
+        return;
+      }
+      emitRuntimeEvent({
+        eventId,
+        stage: 'proactive-selected',
+        at: Date.now(),
+        source: 'quiet-room-awareness',
+        awarenessSource: input.awarenessSource,
+        audiencePresent: input.audiencePresent,
+        scheduledNextAt: input.scheduledNextAt,
+      });
+      proactiveSpeechRef.current = true;
+      proactiveEventIdRef.current = eventId;
+      void enqueueOperatorMessage({
+        eventId,
+        text: input.prompt,
+        source: 'quiet-room-awareness',
+        sourceLabel: '安静直播间主动搭话',
+        sourcesSeen: ['quiet-room-awareness'],
+      }).catch((error) => {
+        proactiveSpeechRef.current = false;
+        proactiveEventIdRef.current = null;
+        emitRuntimeEvent({
+          eventId,
+          stage: 'failed',
+          at: Date.now(),
+          source: 'quiet-room-awareness',
+          reason: 'proactive_enqueue_failed',
+          error: error instanceof Error ? error.message : String(error),
+        });
+      });
+    },
+    [
+      dispatchLiveHostEvent,
+      emitRuntimeEvent,
+      enqueueOperatorMessage,
+      hostCoordinatorV2Enabled,
+    ],
+  );
+
+  const cancelQueuedProactiveSpeech = useCallback(
+    (reason: string) => {
+      const queued = operatorQueue.filter(
+        (item) =>
+          item.source === 'quiet-room-awareness' &&
+          ['pending', 'preparing', 'ready'].includes(item.status),
+      );
+      const eventIds = new Set(queued.map((item) => item.eventId));
+      if (proactiveEventIdRef.current && !isSpeaking) {
+        eventIds.add(proactiveEventIdRef.current);
+      }
+      if (!eventIds.size) return;
+      proactiveSpeechRef.current = false;
+      proactiveEventIdRef.current = null;
+      void Promise.all(
+        [...eventIds].map(async (eventId) => {
+          await updateOperatorQueue(eventId, 'skip', { reason });
+          emitRuntimeEvent({
+            eventId,
+            stage: 'dropped',
+            at: Date.now(),
+            source: 'quiet-room-awareness',
+            reason,
+          });
+        }),
+      )
+        .then(() => refreshOperatorQueue())
+        .catch(() => undefined);
+    },
+    [emitRuntimeEvent, isSpeaking, operatorQueue, refreshOperatorQueue],
+  );
+
+  const interruptProactiveSpeech = useCallback(
+    (eventId: string, viewerId?: string) => {
+      const decisions = dispatchLiveHostEvent({
+        type: 'audience-message',
+        at: Date.now(),
+        eventId,
+        viewerId,
+      });
+      if (proactiveSpeechRef.current && isSpeaking) {
+        const interrupt = decisions.find(
+          (decision) => decision.kind === 'interrupt',
+        );
+        if (hostCoordinatorV2Enabled && interrupt?.kind === 'interrupt') {
+          interruptSpeech(interrupt.mode);
+        } else if (!hostCoordinatorV2Enabled) {
+          stop();
+          proactiveSpeechRef.current = false;
+          resetAvatarReaction();
+        }
+      }
+      cancelQueuedProactiveSpeech('viewer_interaction');
+    },
+    [
+      cancelQueuedProactiveSpeech,
+      dispatchLiveHostEvent,
+      hostCoordinatorV2Enabled,
+      interruptSpeech,
+      isSpeaking,
+      resetAvatarReaction,
+      stop,
+    ],
+  );
+
+  const emergencyTakeover = useCallback(() => {
+    const startedAt = performance.now();
+    const activeEventId = activeLifecycleRef.current?.eventId;
+    dispatchLiveHostEvent({
+      type: 'operator-command',
+      at: Date.now(),
+      eventId: activeEventId,
+      command: 'takeover',
+    });
+    interruptSpeech('immediate');
+    stop();
+    setAutoBroadcastEnabled(false);
+    proactiveSpeechRef.current = false;
+    proactiveEventIdRef.current = null;
+    cancelQueuedProactiveSpeech('operator_takeover');
+    resetAvatarReaction();
+    emitRuntimeEvent({
+      eventId: activeEventId,
+      stage: 'operator_takeover',
+      at: Date.now(),
+      stopLatencyMs: Math.round(performance.now() - startedAt),
+      reason: 'operator_emergency_takeover',
+    });
+  }, [
+    cancelQueuedProactiveSpeech,
+    dispatchLiveHostEvent,
+    emitRuntimeEvent,
+    interruptSpeech,
+    resetAvatarReaction,
+    stop,
+  ]);
+
   const enqueueManualBroadcast = useCallback(
     async (text: string) => {
       const preparedReply = text.trim();
       if (!preparedReply) return;
       void unlock();
-      markLiveActivity();
+      markLiveActivity('operator-manual');
       const now = Date.now();
       await fetch('/api/operator-queue', {
         method: 'POST',
@@ -1808,6 +2395,7 @@ export default function App() {
           viewerName: '主播总控',
           sourcesSeen: ['operator-manual'],
           createdAt: now,
+          auditActor: 'control-room',
         }),
       });
       await refreshOperatorQueue();
@@ -1831,6 +2419,8 @@ export default function App() {
     if (
       !isLiveRuntimeOwner ||
       !isCoreReady ||
+      (hostCoordinatorV2Enabled &&
+        liveHostSnapshot.phase === 'operator_hold') ||
       isProcessing ||
       preparingOperatorTaskRef.current
     )
@@ -1876,21 +2466,25 @@ export default function App() {
         let chatAccepted = true;
         try {
           if (!next.interactionObservedAt && next.viewerId) {
+            const relationshipPlatform = next.sourcesSeen?.[0] || 'unknown';
+            const relationshipKey = `${relationshipPlatform}:${next.viewerId}`;
             const beforeRelationships = liveDirector.getRelationshipSnapshot();
             liveDirector.observeViewerInteraction({
               id: next.viewerId,
               name: next.viewerName,
+              platform: relationshipPlatform,
             });
             const afterRelationships = liveDirector.getRelationshipSnapshot();
             const beforeVisits =
-              beforeRelationships[next.viewerId]?.visits ?? 0;
-            const afterVisits = afterRelationships[next.viewerId]?.visits ?? 0;
+              beforeRelationships[relationshipKey]?.visits ?? 0;
+            const afterVisits =
+              afterRelationships[relationshipKey]?.visits ?? 0;
             const otherViewerRelationshipMutated = Object.keys({
               ...beforeRelationships,
               ...afterRelationships,
             }).some(
               (viewerId) =>
-                viewerId !== next.viewerId &&
+                viewerId !== relationshipKey &&
                 JSON.stringify(beforeRelationships[viewerId] ?? null) !==
                   JSON.stringify(afterRelationships[viewerId] ?? null),
             );
@@ -1906,7 +2500,11 @@ export default function App() {
           ) {
             for (const signal of next.engagementSignals) {
               liveDirector.recordRelationshipSignal(
-                { id: next.viewerId, name: next.viewerName },
+                {
+                  id: next.viewerId,
+                  name: next.viewerName,
+                  platform: next.sourcesSeen?.[0],
+                },
                 signal,
               );
             }
@@ -1947,7 +2545,7 @@ export default function App() {
               faultKind: next.faultKind,
               faultConsumed: next.faultConsumed,
               memoryContext: streamerMemory.contextFor(next.text, {
-                id: next.viewerId,
+                id: scopedViewerId(next.viewerId, next.sourcesSeen?.[0]),
                 name: next.viewerName,
               }),
               silent: true,
@@ -2050,6 +2648,8 @@ export default function App() {
     isCoreReady,
     isLiveRuntimeOwner,
     isProcessing,
+    hostCoordinatorV2Enabled,
+    liveHostSnapshot.phase,
     liveDirector,
     operatorQueue,
     processWithHostExtensions,
@@ -2061,11 +2661,36 @@ export default function App() {
   useEffect(() => {
     if (
       !isLiveRuntimeOwner ||
+      (hostCoordinatorV2Enabled &&
+        liveHostSnapshot.phase === 'operator_hold') ||
       isSpeaking ||
       isProcessing ||
       speakingOperatorTaskRef.current
     )
       return;
+    const stale = operatorQueue.find(
+      (item) =>
+        isStaleReadyReply(item) &&
+        (!item.assignedOwnerId ||
+          item.assignedOwnerId === runtimeOwnerIdRef.current),
+    );
+    if (stale) {
+      void updateOperatorQueue(stale.eventId, 'skip', {
+        reason: 'stale_before_speech',
+      })
+        .then(() => {
+          emitRuntimeEvent({
+            eventId: stale.eventId,
+            stage: 'dropped',
+            at: Date.now(),
+            source: stale.source,
+            reason: 'stale_before_speech',
+          });
+          return refreshOperatorQueue();
+        })
+        .catch(() => undefined);
+      return;
+    }
     const next = operatorQueue.find(
       (item) =>
         item.status === 'ready' &&
@@ -2122,6 +2747,10 @@ export default function App() {
           stepId: next.stepId,
           scenarioId: next.scenarioId,
         };
+        // A provider can hang before emitting its first TTS callback. Start a
+        // short watchdog now; once playback begins, speech-start resets it to
+        // the longer progress watchdog for multi-beat replies.
+        armOperatorSpeechWatchdog(next.eventId, OPERATOR_TTS_START_TIMEOUT_MS);
         await speakPrepared(preparedReply);
       } catch (error) {
         if (operatorSpeechWatchdogRef.current !== null) {
@@ -2150,11 +2779,13 @@ export default function App() {
         if (activeLifecycleRef.current?.eventId === next.eventId) {
           activeLifecycleRef.current = null;
         }
-        // A failed first beat can safely retry. If any audio beat completed,
-        // the queue's retry contract deliberately makes it terminal instead
-        // of replaying a partially heard response.
-        await updateOperatorQueue(next.eventId, 'retry', {
-          reason: 'tts_playback_failed',
+        // The core already retries the first beat exactly once. Never requeue
+        // a heard response, and do not add a second outer retry loop.
+        await updateOperatorQueue(next.eventId, 'fail', {
+          reason:
+            operatorCompletedBeatCountRef.current > 0
+              ? 'later_beat_failed_partial_playback_preserved'
+              : 'tts_first_beat_failed_after_retry',
         }).catch(() => undefined);
         speakingOperatorTaskRef.current = null;
       } finally {
@@ -2167,8 +2798,11 @@ export default function App() {
     isLiveRuntimeOwner,
     isProcessing,
     isSpeaking,
+    hostCoordinatorV2Enabled,
+    liveHostSnapshot.phase,
     operatorQueue,
     refreshOperatorQueue,
+    armOperatorSpeechWatchdog,
     speakPrepared,
   ]);
 
@@ -2258,6 +2892,8 @@ export default function App() {
           typeof data.viewerName === 'string' && data.viewerName.trim()
             ? data.viewerName.trim()
             : viewerId;
+        markLiveActivity('parent-message');
+        interruptProactiveSpeech(requestId, viewerId);
         void enqueueOperatorMessage({
           eventId: requestId,
           text,
@@ -2266,33 +2902,9 @@ export default function App() {
           // Give it a stable identity so memory, queue cards and prompts all
           // agree about who is speaking.
           sourceLabel: '台风雷达对话',
+          sourcesSeen: ['typhoon-radar'],
           viewerId,
           viewerName,
-        });
-        return;
-        void unlock();
-        markLiveActivity();
-        stop();
-        resetAvatarReaction();
-        const lifecycle = beginConversationLifecycle(
-          { channel: 'parent-message', label: '父页面对话' },
-          requestId,
-        );
-        replyLatencyRef.current = {
-          requestId: crypto.randomUUID(),
-          source: 'chat',
-          inputAt: now,
-          models: replyModelTrace,
-          input: text,
-          eventId: lifecycle.eventId,
-          origin: { channel: 'parent-message', requestId },
-        };
-        void processWithHostExtensions(text, {
-          displayText: text,
-          memoryContext: streamerMemory.contextFor(text),
-          source: 'chat',
-          eventId: lifecycle.eventId,
-          sourceLabel: lifecycle.label,
         });
         return;
       }
@@ -2310,18 +2922,10 @@ export default function App() {
     window.parent.postMessage({ type: hostBridgeType('ready', true) }, '*');
     return () => window.removeEventListener('message', handleNarrationRequest);
   }, [
-    isProcessing,
-    isSpeaking,
     liveDirector,
     markLiveActivity,
-    beginConversationLifecycle,
-    replyModelTrace,
-    processWithHostExtensions,
-    resetAvatarReaction,
-    stop,
-    streamerMemory,
-    unlock,
     enqueueOperatorMessage,
+    interruptProactiveSpeech,
   ]);
 
   useEffect(() => {
@@ -2340,8 +2944,13 @@ export default function App() {
         };
         const text = typeof data.text === 'string' ? data.text.trim() : '';
         if (!text || text.length > 500) return;
+        const eventId = String(data.requestId || crypto.randomUUID());
+        const viewerId =
+          typeof data.viewerId === 'string' ? data.viewerId : 'external-viewer';
+        markLiveActivity('external-chat-bridge');
+        interruptProactiveSpeech(eventId, viewerId);
         void enqueueOperatorMessage({
-          eventId: String(data.requestId || crypto.randomUUID()),
+          eventId,
           text,
           source: 'external-chat-bridge',
           sourceLabel: '外部聊天桥接',
@@ -2349,34 +2958,6 @@ export default function App() {
             typeof data.viewerId === 'string' ? data.viewerId : '001号人类',
           viewerName:
             typeof data.viewerName === 'string' ? data.viewerName : '001号人类',
-        });
-        return;
-        void unlock();
-        markLiveActivity();
-        stop();
-        resetAvatarReaction();
-        const lifecycle = beginConversationLifecycle({
-          channel: 'external-chat-bridge',
-          label: '外部聊天桥接',
-        });
-        replyLatencyRef.current = {
-          requestId: crypto.randomUUID(),
-          source: 'chat',
-          inputAt: Date.now(),
-          models: replyModelTrace,
-          input: text,
-          eventId: lifecycle.eventId,
-          origin: {
-            channel: 'external-chat-bridge',
-            requestId: String(data.requestId ?? ''),
-          },
-        };
-        void processWithHostExtensions(text, {
-          displayText: text,
-          memoryContext: streamerMemory.contextFor(text),
-          source: 'chat',
-          eventId: lifecycle.eventId,
-          sourceLabel: lifecycle.label,
         });
       } catch {
         // The local bridge is optional while the runtime is starting up.
@@ -2388,18 +2969,7 @@ export default function App() {
       cancelled = true;
       window.clearInterval(timer);
     };
-  }, [
-    liveDirector,
-    beginConversationLifecycle,
-    markLiveActivity,
-    processWithHostExtensions,
-    replyModelTrace,
-    resetAvatarReaction,
-    stop,
-    streamerMemory,
-    unlock,
-    enqueueOperatorMessage,
-  ]);
+  }, [enqueueOperatorMessage, interruptProactiveSpeech, markLiveActivity]);
 
   const handleSend = useCallback(
     (text: string) => {
@@ -2419,7 +2989,8 @@ export default function App() {
         eventId: lifecycle.eventId,
         origin: { channel: 'web-chat' },
       };
-      markLiveActivity();
+      markLiveActivity('web-chat');
+      interruptProactiveSpeech(lifecycle.eventId, 'operator');
       // Stop previous audio if speech is currently playing
       stop();
       resetAvatarReaction();
@@ -2438,6 +3009,7 @@ export default function App() {
       markLiveActivity,
       replyModelTrace,
       beginConversationLifecycle,
+      interruptProactiveSpeech,
     ],
   );
 
@@ -2472,63 +3044,8 @@ export default function App() {
         sourcesSeen: options?.sourcesSeen,
       });
       return Promise.resolve();
-      const liveSourceLabel = (options ?? { sourcesSeen: [] }).sourcesSeen
-        ?.length
-        ? // @ts-expect-error legacy direct dispatch below is intentionally unreachable
-          `直播弹幕（${options.sourcesSeen.join(' / ')}）`
-        : '直播弹幕';
-      markLiveActivity();
-      replyLatencyRef.current = {
-        requestId: crypto.randomUUID(),
-        source: 'live',
-        inputAt: options?.receivedAt ?? Date.now(),
-        models: replyModelTrace,
-        input: text,
-        eventId: options?.eventId,
-        origin: {
-          channel: 'live-comment',
-          viewerId: options?.viewerId,
-          viewerName: options?.viewerName,
-          commentAt: options?.commentAt,
-          receivedAt: options?.receivedAt,
-          sourcesSeen: options?.sourcesSeen,
-        },
-      };
-      const lifecycle = beginConversationLifecycle(
-        {
-          channel: options?.sourcesSeen?.join('+') || 'live-comment',
-          label: liveSourceLabel,
-          viewerId: options?.viewerId,
-          viewerName: options?.viewerName,
-          sourcesSeen: options?.sourcesSeen,
-        },
-        options?.eventId,
-      );
-      return processWithHostExtensions(text, {
-        ...options,
-        eventId: lifecycle.eventId,
-        sourceLabel: lifecycle.label,
-        source: 'live',
-        memoryContext:
-          streamerMemory.contextFor(displayText, {
-            id: options?.viewerId,
-            name: options?.viewerName,
-          }) +
-          liveDirector.guide(displayText, {
-            id: options?.viewerId,
-            name: options?.viewerName,
-          }),
-      }).then(() => undefined);
     },
-    [
-      processWithHostExtensions,
-      streamerMemory,
-      liveDirector,
-      markLiveActivity,
-      replyModelTrace,
-      beginConversationLifecycle,
-      enqueueOperatorMessage,
-    ],
+    [enqueueOperatorMessage],
   );
 
   const {
@@ -2566,33 +3083,26 @@ export default function App() {
   });
 
   const socialStreamBus = useSocialStreamBus(
-    settingsHook.settings.socialStream,
+    settingsHook.settings.liveConnectors.socialStreamNinja,
     enqueueLiveComments,
   );
+  useEffect(() => {
+    socialStreamSendRef.current = socialStreamBus.send;
+  }, [socialStreamBus.send]);
 
   useInterval(() => {
     if (
       !isLiveRuntimeOwner ||
       !autoBroadcastEnabled ||
-      settingsHook.settings.stream.platform === 'none' ||
+      (settingsHook.settings.stream.platform === 'none' &&
+        !settingsHook.settings.liveConnectors.ordinaryRoad.enabled &&
+        !settingsHook.settings.liveConnectors.socialStreamNinja.enabled) ||
       isProcessing ||
       isSpeaking ||
       queueDepth > 0 ||
       oldestQueueAgeMs > 0
     )
       return;
-    const prompt = liveDirector.nextProactivePrompt();
-    if (prompt) {
-      proactiveSpeechRef.current = true;
-      void processChat(prompt, {
-        displayText: `${runtimeProfile.displayName}正在和直播间互动`,
-        source: 'live',
-        showInput: false,
-        persistInteraction: false,
-      });
-      return;
-    }
-
     const room = liveDirector.getRoomSnapshot();
     const interfaceContext = [
       `当前时间：${new Date().toLocaleString('zh-CN', {
@@ -2649,63 +3159,32 @@ export default function App() {
       },
     );
     if (awareness) {
-      const proactiveEventId = `proactive:${crypto.randomUUID()}`;
-      emitRuntimeEvent({
-        eventId: proactiveEventId,
-        stage: 'proactive-selected',
-        at: Date.now(),
-        source: 'quiet-room-awareness',
+      enqueueProactiveSpeech({
+        prompt: awareness.prompt,
         awarenessSource: awareness.source,
         audiencePresent: room.estimatedAudience > 0,
         scheduledNextAt: awareness.scheduledNextAt,
-      });
-      proactiveSpeechRef.current = true;
-      void processChat(awareness.prompt, {
-        displayText: `${runtimeProfile.displayName}的空场独白`,
-        source: 'live',
-        showInput: false,
-        persistInteraction: false,
-        eventId: proactiveEventId,
       });
     }
   }, 10_000);
 
   const handleYoutubeComment = useCallback(
     (comment: YouTubeChatMessage) => {
-      markLiveActivity();
-      if (proactiveSpeechRef.current && isSpeaking) {
-        stop();
-        proactiveSpeechRef.current = false;
-        resetAvatarReaction();
-      }
+      markLiveActivity('youtube-comment');
+      interruptProactiveSpeech(comment.id, comment.userName);
       enqueueYouTubeComments([comment]);
     },
-    [
-      enqueueYouTubeComments,
-      isSpeaking,
-      markLiveActivity,
-      resetAvatarReaction,
-      stop,
-    ],
+    [enqueueYouTubeComments, interruptProactiveSpeech, markLiveActivity],
   );
 
   const handleTwitchComment = useCallback(
     (comment: TwitchChatMessage) => {
-      markLiveActivity();
-      if (proactiveSpeechRef.current && isSpeaking) {
-        stop();
-        proactiveSpeechRef.current = false;
-        resetAvatarReaction();
-      }
+      const eventId = `twitch:${crypto.randomUUID()}`;
+      markLiveActivity('twitch-comment');
+      interruptProactiveSpeech(eventId, comment.userName);
       enqueueTwitchComments([comment]);
     },
-    [
-      enqueueTwitchComments,
-      isSpeaking,
-      markLiveActivity,
-      resetAvatarReaction,
-      stop,
-    ],
+    [enqueueTwitchComments, interruptProactiveSpeech, markLiveActivity],
   );
 
   const handleLiveRoomEvent = useCallback(
@@ -2724,50 +3203,199 @@ export default function App() {
                   ? 'like'
                   : undefined;
       if (supportSignal) {
+        const decisions = dispatchLiveHostEvent({
+          type: 'engagement',
+          at: comment.timestamp || Date.now(),
+          eventId: comment.id,
+          viewerId: comment.author.id,
+          engagementKind: supportSignal,
+          priority:
+            supportSignal === 'superchat' || supportSignal === 'guard'
+              ? 'high'
+              : 'normal',
+        });
+        const interrupt = decisions.find(
+          (decision) => decision.kind === 'interrupt',
+        );
+        if (interrupt?.kind === 'interrupt') {
+          interruptSpeech(interrupt.mode);
+        }
         liveDirector.recordRelationshipSignal(
-          { id: comment.author.id, name: comment.author.name },
+          {
+            id: comment.author.id,
+            name: comment.author.name,
+            platform: String(comment.metadata?.platformId || 'unknown'),
+          },
           supportSignal,
         );
       }
-      if (comment.type === 'entry') {
-        markLiveActivity();
+      if (!isQuietRoomInteraction(comment.type)) {
+        const platform = String(comment.metadata?.platformId || 'unknown');
+        dispatchLiveHostEvent({
+          type: 'viewer-presence',
+          kind: 'join',
+          at: comment.timestamp || Date.now(),
+          eventId: comment.id,
+          viewer: {
+            id: comment.author.id,
+            displayName: comment.author.name,
+            platform:
+              platform === 'bilibili' ||
+              platform === 'douyin' ||
+              platform === 'youtube' ||
+              platform === 'twitch'
+                ? platform
+                : 'unknown',
+            addressable: true,
+            mayMentionName: false,
+          },
+        });
         liveDirector.observeViewerEntry(
           {
             id: comment.author.id,
             name: comment.author.name,
+            platform: String(comment.metadata?.platformId || 'unknown'),
           },
           Number(comment.metadata?.firstSeenAt) || undefined,
         );
+        emitRuntimeEvent({
+          eventId: comment.id,
+          stage: 'skipped',
+          at: Date.now(),
+          source: platform,
+          viewerId: comment.author.id,
+          viewerName: comment.author.name,
+          reason: 'viewer_presence_only',
+        });
         return;
       }
-      markLiveActivity();
-      if (proactiveSpeechRef.current && isSpeaking) {
-        stop();
-        proactiveSpeechRef.current = false;
-        resetAvatarReaction();
+      // The radar is an optional parent display, never a second comment
+      // consumer. Forward only normalized real comments over the existing
+      // iframe bridge; the parent performs its own city parsing and cooldown.
+      if (
+        comment.type === 'comment' &&
+        comment.text.trim() &&
+        window.parent !== window
+      ) {
+        window.parent.postMessage(
+          {
+            type: 'aituber:live-comment',
+            version: 1,
+            id: comment.id,
+            text: comment.text.trim(),
+            viewerId: comment.author.id,
+            viewerName: comment.author.name,
+            platform:
+              typeof comment.metadata?.platformId === 'string'
+                ? comment.metadata.platformId
+                : 'live',
+            receivedAt: comment.timestamp,
+          },
+          '*',
+        );
+      }
+      markLiveActivity(
+        `${String(comment.metadata?.platformId || 'live')}-${comment.type}`,
+      );
+      if (!supportSignal) {
+        interruptProactiveSpeech(comment.id, comment.author.id);
+      } else {
+        cancelQueuedProactiveSpeech('engagement_waits_for_next_beat');
       }
       enqueueLiveRoomEvents([comment]);
     },
     [
+      cancelQueuedProactiveSpeech,
+      dispatchLiveHostEvent,
+      emitRuntimeEvent,
       enqueueLiveRoomEvents,
-      isSpeaking,
+      interruptProactiveSpeech,
+      interruptSpeech,
       liveDirector,
       markLiveActivity,
-      resetAvatarReaction,
-      stop,
     ],
   );
+
+  const handleSimulatedLiveRoomEvent = useCallback(
+    (event: LiveRoomEvent) => {
+      // This is called directly from a control-room button. Resume Web Audio
+      // before the LLM/TTS round-trip so browser autoplay policy cannot leave
+      // a successfully generated reply silent.
+      void unlock().catch(() => undefined);
+      // Keep the simulator on the same live-room path while making the test
+      // room self-contained; it must not require a real platform connection.
+      liveDirector.updateRoomState({
+        isLive: true,
+      });
+      dispatchLiveHostEvent({ type: 'stream-state', at: Date.now(), isLive: true });
+      handleLiveRoomEvent(event);
+    },
+    [dispatchLiveHostEvent, handleLiveRoomEvent, liveDirector, unlock],
+  );
+
+  const handleOrdinaryRoadStatus = useCallback(
+    (status: LiveRoomStatus) => {
+      liveDirector.updateRoomState(status);
+      dispatchLiveHostEvent({
+        type: 'stream-state',
+        at: Date.now(),
+        isLive: status.isLive === true,
+      });
+      setOrdinaryRoadStatus(status);
+      if (status.state === 'online') {
+        setStreamErrorMessage('');
+      } else if (status.state === 'error') {
+        setStreamErrorMessage(status.error || 'OrdinaryRoad 连接器正在重连。');
+      }
+    },
+    [dispatchLiveHostEvent, liveDirector],
+  );
+
+  useEffect(() => {
+    if (!settingsHook.settings.liveConnectors.ordinaryRoad.enabled) return;
+    let cancelled = false;
+    const refresh = async () => {
+      try {
+        const status = await fetchOrdinaryRoadStatus(
+          settingsHook.settings.liveConnectors.ordinaryRoad.gatewayUrl,
+        );
+        if (!cancelled) handleOrdinaryRoadStatus(status);
+      } catch (error) {
+        if (cancelled) return;
+        handleOrdinaryRoadStatus({
+          state: 'error',
+          error:
+            error instanceof Error
+              ? error.message
+              : 'ordinaryroad_health_failed',
+        });
+      }
+    };
+    void refresh();
+    const timer = window.setInterval(refresh, 10_000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [
+    handleOrdinaryRoadStatus,
+    settingsHook.settings.liveConnectors.ordinaryRoad.enabled,
+    settingsHook.settings.liveConnectors.ordinaryRoad.gatewayUrl,
+  ]);
 
   const handleLiveRoomStatus = useCallback(
     (status: LiveRoomStatus) => {
       liveDirector.updateRoomState(status);
-      if (status.state === 'online') {
-        setStreamErrorMessage('');
-      } else if (status.state === 'error') {
-        setStreamErrorMessage(status.error || 'B 站直播间守护脚本正在重连。');
+      dispatchLiveHostEvent({
+        type: 'stream-state',
+        at: Date.now(),
+        isLive: status.isLive === true,
+      });
+      if (status.state === 'error') {
+        setStreamErrorMessage(status.error || '自定义直播平台连接正在重试。');
       }
     },
-    [liveDirector],
+    [dispatchLiveHostEvent, liveDirector],
   );
 
   const handleBackgroundImageChange = useCallback((file: File | null) => {
@@ -2930,8 +3558,7 @@ export default function App() {
     isEnabled:
       isLiveRuntimeOwner &&
       settingsHook.settings.stream.platform === 'youtube' &&
-      (!settingsHook.settings.socialStream.enabled ||
-        !settingsHook.settings.socialStream.platforms.includes('youtube')) &&
+      !platformOwner(settingsHook.settings.liveConnectors, 'youtube') &&
       settingsHook.settings.stream.youtubeEnabled,
     intervalMs: settingsHook.settings.stream.youtubeCommentIntervalMs,
     onComment: handleYoutubeComment,
@@ -2944,8 +3571,7 @@ export default function App() {
     isEnabled:
       isLiveRuntimeOwner &&
       settingsHook.settings.stream.platform === 'twitch' &&
-      (!settingsHook.settings.socialStream.enabled ||
-        !settingsHook.settings.socialStream.platforms.includes('twitch')) &&
+      !platformOwner(settingsHook.settings.liveConnectors, 'twitch') &&
       settingsHook.settings.stream.twitchEnabled,
     intervalMs: settingsHook.settings.stream.twitchCommentIntervalMs,
     onComment: handleTwitchComment,
@@ -2962,17 +3588,21 @@ export default function App() {
     },
   });
 
-  useBilibiliComments({
+  useLivePlatformEvents({
+    adapter: ordinaryRoadEventAdapter,
     clientKey: isObsOverlay ? 'obs-runtime' : 'control-runtime',
     isEnabled:
       isLiveRuntimeOwner &&
-      settingsHook.settings.stream.platform === 'bilibili' &&
-      (!settingsHook.settings.socialStream.enabled ||
-        !settingsHook.settings.socialStream.platforms.includes('bilibili')) &&
-      settingsHook.settings.stream.bilibiliEnabled,
-    onComment: handleLiveRoomEvent,
-    onStatus: handleLiveRoomStatus,
+      settingsHook.settings.liveConnectors.ordinaryRoad.enabled,
+    onEvent: handleLiveRoomEvent,
+    onStatus: handleOrdinaryRoadStatus,
   });
+
+  useEffect(() => {
+    if (!settingsHook.settings.liveConnectors.ordinaryRoad.enabled) {
+      setOrdinaryRoadStatus({ state: 'disabled' });
+    }
+  }, [settingsHook.settings.liveConnectors.ordinaryRoad.enabled]);
 
   const customSseAdapter = useMemo(
     () =>
@@ -3082,19 +3712,21 @@ export default function App() {
           onAbortStressTest={() => runStressAction('abort')}
           onCleanupStressTest={() => runStressAction('cleanup')}
           onDeleteQueueItem={(eventId) => {
-            void updateOperatorQueue(eventId, 'delete').then(() =>
-              refreshOperatorQueue(),
-            );
+            void updateOperatorQueue(eventId, 'delete', {
+              auditActor: 'control-room',
+            }).then(() => refreshOperatorQueue());
           }}
           onMoveQueueItem={(eventId, order) => {
-            void updateOperatorQueue(eventId, 'move', { order }).then(() =>
-              refreshOperatorQueue(),
-            );
+            void updateOperatorQueue(eventId, 'move', {
+              order,
+              auditActor: 'control-room',
+            }).then(() => refreshOperatorQueue());
           }}
           onEditQueueReply={(eventId, reply) => {
-            void updateOperatorQueue(eventId, 'edit-reply', { reply }).then(
-              () => refreshOperatorQueue(),
-            );
+            void updateOperatorQueue(eventId, 'edit-reply', {
+              reply,
+              auditActor: 'control-room',
+            }).then(() => refreshOperatorQueue());
           }}
           settings={settingsHook.settings}
           avatarPackage={avatarPackage}
@@ -3111,15 +3743,32 @@ export default function App() {
             stop();
             resetAvatarReaction();
           }}
+          onEmergencyTakeover={emergencyTakeover}
+          liveHostSnapshot={liveHostSnapshot}
+          unsupportedAvatarActionCount={unsupportedAvatarActionCount}
           autoBroadcastEnabled={autoBroadcastEnabled}
-          onToggleAutoBroadcast={() =>
-            setAutoBroadcastEnabled((value) => !value)
-          }
+          onToggleAutoBroadcast={() => {
+            setAutoBroadcastEnabled((value) => {
+              const enabled = !value;
+              if (enabled) {
+                dispatchLiveHostEvent({
+                  type: 'operator-command',
+                  at: Date.now(),
+                  command: 'resume',
+                  isLive: liveDirector.isRoomLive(),
+                });
+              }
+              return enabled;
+            });
+          }}
           onUpdateEmptyRoomAwareness={settingsHook.updateEmptyRoomAwareness}
           onOpenLegacySettings={() => setSettingsOpen(true)}
           socialBusHealth={socialStreamBus.health}
           socialBusError={socialStreamBus.error}
-          onUpdateSocialStream={settingsHook.updateSocialStream}
+          socialDiscoveredPlatforms={socialStreamBus.discoveredPlatforms}
+          ordinaryRoadStatus={ordinaryRoadStatus}
+          onUpdateLiveConnectors={settingsHook.updateLiveConnectors}
+          onSimulateLiveRoomEvent={handleSimulatedLiveRoomEvent}
           onSelectDigitalHuman={settingsHook.selectDigitalHuman}
           onAddDigitalHuman={settingsHook.addDigitalHuman}
           onUpdateDigitalHuman={settingsHook.updateDigitalHuman}
@@ -3131,6 +3780,14 @@ export default function App() {
           onAvatarPackageUpload={handleDigitalHumanAvatarUpload}
           onPreviewVoice={handlePreviewDigitalHumanVoice}
           memory={streamerMemory}
+          onAuditAction={(event) =>
+            emitRuntimeEvent({
+              stage: 'operator_ui_action',
+              actor: { type: 'operator', id: 'control-room' },
+              at: Date.now(),
+              ...event,
+            })
+          }
         />
       )}
 

@@ -50,7 +50,11 @@ interface UseAituberCoreOptions {
   onAudioStream?: (audioStream: AsyncGenerator<ArrayBuffer>) => Promise<void>;
   onSpeechStart?: (screenplay: ScreenplayLike) => void;
   onSpeechEnd?: () => void;
-  onSpeechChunk?: (stage: 'start' | 'end' | 'error', data: Record<string, unknown>) => void;
+  onSpeechInterrupted?: () => void;
+  onSpeechChunk?: (
+    stage: 'start' | 'end' | 'error',
+    data: Record<string, unknown>,
+  ) => void;
   settings: AppSettings;
   getApiKeyForProvider: (provider: ChatProviderOption) => string;
   onAssistantResponse?: (
@@ -77,6 +81,7 @@ interface UseAituberCoreOptions {
       eventId?: string;
     },
   ) => void;
+  speechPlanV2Enabled?: boolean;
 }
 
 type ProcessChatOptions = {
@@ -103,6 +108,14 @@ type ProcessChatOptions = {
 
 const GPT5_SAMPLE_PROVIDER_OPTIONS = { gpt5Preset: 'casual' as const };
 const NO_REPLY_TOKEN = '[[NO_REPLY]]';
+
+function emitRuntimeTrace(event: Record<string, unknown>) {
+  void fetch('/api/live-runtime-events', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(event),
+  }).catch(() => undefined);
+}
 
 function toManneriMessages(
   messages: ChatMessage[],
@@ -464,12 +477,14 @@ export function useAituberCore({
   onAudioStream,
   onSpeechStart,
   onSpeechEnd,
+  onSpeechInterrupted,
   onSpeechChunk,
   settings,
   profile,
   getApiKeyForProvider,
   onAssistantResponse,
   onChatError,
+  speechPlanV2Enabled = true,
 }: UseAituberCoreOptions) {
   const coreRef = useRef<AITuberOnAirCore | null>(null);
   const manneriDetectorRef = useRef<ManneriDetector | null>(null);
@@ -477,6 +492,7 @@ export function useAituberCore({
   const messageIdSequenceRef = useRef(0);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [isProcessing, setIsProcessing] = useState(false);
+  const processingRef = useRef(false);
   const [partialResponse, setPartialResponse] = useState('');
   const [coreGeneration, setCoreGeneration] = useState(0);
   const [isCoreReady, setIsCoreReady] = useState(false);
@@ -490,6 +506,8 @@ export function useAituberCore({
   onSpeechStartRef.current = onSpeechStart;
   const onSpeechEndRef = useRef(onSpeechEnd);
   onSpeechEndRef.current = onSpeechEnd;
+  const onSpeechInterruptedRef = useRef(onSpeechInterrupted);
+  onSpeechInterruptedRef.current = onSpeechInterrupted;
   const onSpeechChunkRef = useRef(onSpeechChunk);
   onSpeechChunkRef.current = onSpeechChunk;
   const onAssistantResponseRef = useRef(onAssistantResponse);
@@ -512,6 +530,10 @@ export function useAituberCore({
     factGuard?: ResponseFactGuard;
     persistInteraction?: boolean;
     onPrepared?: (reply: string) => void;
+  } | null>(null);
+  const lastGuardedResponseRef = useRef<{
+    eventId?: string;
+    text: string;
   } | null>(null);
 
   useEffect(() => {
@@ -601,7 +623,9 @@ export function useAituberCore({
       model: resolvedModel,
       providerOptions,
       chatOptions: {
-        systemPrompt: buildCharacterSystemPrompt(profile),
+        systemPrompt: buildCharacterSystemPrompt(profile, {
+          speechPlanV2Enabled,
+        }),
         // The response contract controls speaking length.  The model still
         // needs enough headroom to close structured answers; a lower ceiling
         // causes continuation retries while TTS has already begun, which
@@ -620,29 +644,103 @@ export function useAituberCore({
             }
           : undefined,
       ),
+      responseSpeechPlanTransform: speechPlanV2Enabled
+        ? (speechPlan) => {
+            const pending = pendingMemoryRef.current;
+            const combinedText = speechPlan.beats
+              .map((beat) => beat.text.trim())
+              .filter(Boolean)
+              .join(' ');
+            const guarded = guardViewerResponse(
+              combinedText,
+              pending?.factGuard,
+            );
+            lastGuardedResponseRef.current = {
+              eventId: pending?.eventId,
+              text: guarded.text,
+            };
+            emitRuntimeTrace({
+              eventId: pending?.eventId,
+              stage: 'speech_plan_transform',
+              actor: { type: 'system', id: 'response-guard' },
+              at: Date.now(),
+              input: { version: speechPlan.version, beats: speechPlan.beats },
+              sanitizedText: guarded.sanitizedText,
+              output: { text: guarded.text },
+              rewritten: guarded.rewritten,
+              reasons: guarded.reasons,
+              factGuard: pending?.factGuard,
+            });
+            if (guarded.rewritten || guarded.text !== combinedText) {
+              return {
+                version: 2 as const,
+                beats: [
+                  {
+                    ...speechPlan.beats[0],
+                    text: guarded.text,
+                    ttsText: formatTtsSpeechScript(guarded.text),
+                    pauseAfterMs: 0,
+                    interruptibleAfter: true,
+                  },
+                ],
+              };
+            }
+            return {
+              version: 2 as const,
+              beats: speechPlan.beats.map((beat) => ({
+                ...beat,
+                text: sanitizeSpeechText(beat.text),
+                ttsText: formatTtsSpeechScript(sanitizeSpeechText(beat.text)),
+              })),
+            };
+          }
+        : undefined,
       responseScreenplayTransform: (screenplay) => {
+        const pending = pendingMemoryRef.current;
         const guarded = guardViewerResponse(
           screenplay.ttsText || screenplay.text,
-          pendingMemoryRef.current?.factGuard,
+          pending?.factGuard,
         );
+        const ttsText = formatTtsSpeechScript(guarded.text);
+        lastGuardedResponseRef.current = {
+          eventId: pending?.eventId,
+          text: guarded.text,
+        };
+        emitRuntimeTrace({
+          eventId: pending?.eventId,
+          stage: 'response_transform',
+          actor: { type: 'system', id: 'response-guard' },
+          at: Date.now(),
+          input: {
+            screenplayText: screenplay.text,
+            screenplayTtsText: screenplay.ttsText,
+          },
+          sanitizedText: guarded.sanitizedText,
+          output: {
+            text: guarded.text,
+            ttsText,
+          },
+          rewritten: guarded.rewritten,
+          reasons: guarded.reasons,
+          factGuard: pending?.factGuard,
+        });
         if (guarded.rewritten) {
-          void fetch('/api/live-runtime-events', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              eventId: pendingMemoryRef.current?.eventId,
-              stage: guarded.unsafeArtifacts
-                ? 'sanitizer_failure'
-                : 'fact_validation_rewrite',
-              at: Date.now(),
-              reasons: guarded.reasons,
-            }),
-          }).catch(() => undefined);
+          emitRuntimeTrace({
+            eventId: pending?.eventId,
+            stage: guarded.unsafeArtifacts
+              ? 'sanitizer_failure'
+              : 'fact_validation_rewrite',
+            actor: { type: 'system', id: 'response-guard' },
+            at: Date.now(),
+            before: screenplay.ttsText || screenplay.text,
+            after: guarded.text,
+            reasons: guarded.reasons,
+          });
         }
         return {
           ...screenplay,
           text: guarded.text,
-          ttsText: formatTtsSpeechScript(guarded.text),
+          ttsText,
         };
       },
       speechChunking: {
@@ -658,11 +756,13 @@ export function useAituberCore({
 
     // Subscribe to core events
     core.on(AITuberOnAirCoreEvent.PROCESSING_START, () => {
+      processingRef.current = true;
       setIsProcessing(true);
       setPartialResponse('');
     });
 
     core.on(AITuberOnAirCoreEvent.PROCESSING_END, () => {
+      processingRef.current = false;
       setIsProcessing(false);
       setPartialResponse('');
     });
@@ -687,6 +787,11 @@ export function useAituberCore({
           message?: { content?: string } | string;
           screenplay?: { text?: string };
           rawText?: string;
+          modelRawText?: string;
+          finishReason?: unknown;
+          responseStatus?: unknown;
+          incompleteDetails?: unknown;
+          usage?: unknown;
         };
         const msg = d?.message;
         const cleanText = d?.screenplay?.text?.trim();
@@ -697,7 +802,53 @@ export function useAituberCore({
             String(data));
       }
       const noReply = content.trim() === NO_REPLY_TOKEN;
-      const viewerContent = noReply ? '' : extractViewerFacingText(content);
+      const pending = pendingMemoryRef.current;
+      const responseData =
+        data && typeof data === 'object'
+          ? (data as {
+              message?: { content?: string } | string;
+              screenplay?: { text?: string; ttsText?: string };
+              rawText?: string;
+              modelRawText?: string;
+              finishReason?: unknown;
+              responseStatus?: unknown;
+              incompleteDetails?: unknown;
+              usage?: unknown;
+            })
+          : null;
+      emitRuntimeTrace({
+        eventId: pending?.eventId,
+        stage: 'model_output',
+        actor: { type: 'system', id: 'chat-model' },
+        at: Date.now(),
+        provider: settings.llm.provider,
+        model: settings.llm.model,
+        modelRawText:
+          responseData?.modelRawText ??
+          (typeof data === 'string' ? data : undefined),
+        parsedText:
+          typeof responseData?.message === 'string'
+            ? responseData.message
+            : responseData?.message?.content,
+        transformedScreenplay: responseData?.screenplay,
+        finalText: content,
+        finishReason: responseData?.finishReason,
+        responseStatus: responseData?.responseStatus,
+        incompleteDetails: responseData?.incompleteDetails,
+        usage: responseData?.usage,
+      });
+      const lastGuardedResponse = lastGuardedResponseRef.current;
+      let guardedFallback = '';
+      if (
+        pending &&
+        lastGuardedResponse &&
+        lastGuardedResponse.eventId === pending.eventId
+      ) {
+        guardedFallback = lastGuardedResponse.text;
+      }
+      const viewerContent = noReply
+        ? ''
+        : extractViewerFacingText(content) || guardedFallback;
       if (viewerContent) {
         setMessages((prev) => [
           ...prev,
@@ -709,8 +860,8 @@ export function useAituberCore({
           },
         ]);
       }
-      const pending = pendingMemoryRef.current;
       pendingMemoryRef.current = null;
+      lastGuardedResponseRef.current = null;
       if (pending && viewerContent && pending.persistInteraction !== false) {
         onAssistantResponseRef.current?.(pending.input, viewerContent, pending);
       }
@@ -728,8 +879,14 @@ export function useAituberCore({
     core.on(AITuberOnAirCoreEvent.SPEECH_END, () => {
       onSpeechEndRef.current?.();
     });
+    core.on(AITuberOnAirCoreEvent.SPEECH_INTERRUPTED, () => {
+      onSpeechInterruptedRef.current?.();
+    });
 
-    const forwardSpeechChunk = (stage: 'start' | 'end' | 'error', data: unknown) => {
+    const forwardSpeechChunk = (
+      stage: 'start' | 'end' | 'error',
+      data: unknown,
+    ) => {
       const value = (data || {}) as Record<string, unknown>;
       const rawError = value.error;
       const error =
@@ -742,14 +899,17 @@ export function useAituberCore({
               : String(rawError);
       // Error instances serialize as `{}` in the runtime event JSONL. Convert
       // them at the boundary so a failed TTS beat stays diagnosable.
-      onSpeechChunkRef.current?.(
-        stage,
-        error ? { ...value, error } : value,
-      );
+      onSpeechChunkRef.current?.(stage, error ? { ...value, error } : value);
     };
-    core.on('speechChunkStart' as AITuberOnAirCoreEvent, (data: unknown) => forwardSpeechChunk('start', data));
-    core.on('speechChunkEnd' as AITuberOnAirCoreEvent, (data: unknown) => forwardSpeechChunk('end', data));
-    core.on('speechChunkError' as AITuberOnAirCoreEvent, (data: unknown) => forwardSpeechChunk('error', data));
+    core.on('speechChunkStart' as AITuberOnAirCoreEvent, (data: unknown) =>
+      forwardSpeechChunk('start', data),
+    );
+    core.on('speechChunkEnd' as AITuberOnAirCoreEvent, (data: unknown) =>
+      forwardSpeechChunk('end', data),
+    );
+    core.on('speechChunkError' as AITuberOnAirCoreEvent, (data: unknown) =>
+      forwardSpeechChunk('error', data),
+    );
 
     core.on(AITuberOnAirCoreEvent.ERROR, (error: unknown) => {
       console.error('AITuberOnAirCore error:', error);
@@ -793,6 +953,7 @@ export function useAituberCore({
     createMessageId,
     profile,
     coreGeneration,
+    speechPlanV2Enabled,
   ]);
 
   // Effect 2: Update voice service when TTS settings change (no core recreation)
@@ -835,9 +996,11 @@ export function useAituberCore({
 
   const processChat = useCallback(
     async (text: string, options?: ProcessChatOptions): Promise<boolean> => {
-      if (!coreRef.current || !text.trim()) return false;
+      if (!coreRef.current || processingRef.current || !text.trim())
+        return false;
 
       const displayText = (options?.displayText ?? text).trim();
+      lastGuardedResponseRef.current = null;
       pendingMemoryRef.current = {
         input: displayText,
         viewerId: options?.viewerId,
@@ -892,6 +1055,22 @@ export function useAituberCore({
       }
 
       try {
+        emitRuntimeTrace({
+          eventId: options?.eventId,
+          stage: 'model_request',
+          actor: { type: 'system', id: 'chat-runtime' },
+          at: Date.now(),
+          provider: settings.llm.provider,
+          model: settings.llm.model,
+          viewerInput: displayText,
+          systemPrompt: buildCharacterSystemPrompt(profile, {
+            speechPlanV2Enabled,
+          }),
+          transientContext,
+          factGuard: options?.factGuard,
+          source: options?.source ?? 'chat',
+          sourceLabel: options?.sourceLabel,
+        });
         return await coreRef.current.processChat(displayText, {
           speak: !options?.silent,
           transientContext,
@@ -903,7 +1082,13 @@ export function useAituberCore({
         return false;
       }
     },
-    [createMessageId],
+    [
+      createMessageId,
+      profile,
+      settings.llm.model,
+      settings.llm.provider,
+      speechPlanV2Enabled,
+    ],
   );
 
   const processVisionChat = useCallback(
@@ -931,64 +1116,80 @@ export function useAituberCore({
     [createMessageId],
   );
 
-  const speakPrepared = useCallback(async (text: string) => {
-    const spokenText = text.trim();
-    if (!spokenText) return;
-    // Operator-queue playback must not inherit a provider adapter request
-    // that can remain pending after MiniMax has completed upstream.  This
-    // same-origin bridge returns one verified, finite MP3 response and keeps
-    // the existing avatar/audio callbacks as the single playback surface.
-    if (settings.tts.engine === 'minimax') {
-      const startedAt = Date.now();
-      const chunk = {
-        index: 0,
-        count: 1,
-        text: spokenText,
-        startedAt,
-        bridge: 'minimax-audio',
-      };
-      onSpeechStartRef.current?.({ text: spokenText });
-      onSpeechChunkRef.current?.('start', chunk);
-      try {
-        const response = await fetch('/api/minimax-audio', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ text: spokenText }),
-        });
-        if (!response.ok) {
-          const detail = await response.text().catch(() => '');
-          throw new Error(`minimax_audio_bridge_failed:${response.status}:${detail.slice(0, 120)}`);
+  const speakPrepared = useCallback(
+    async (text: string) => {
+      const spokenText = text.trim();
+      if (!spokenText) return;
+      // Operator-queue playback must not inherit a provider adapter request
+      // that can remain pending after MiniMax has completed upstream.  This
+      // same-origin bridge returns one verified, finite MP3 response and keeps
+      // the existing avatar/audio callbacks as the single playback surface.
+      if (settings.tts.engine === 'minimax') {
+        const startedAt = Date.now();
+        const chunk = {
+          index: 0,
+          count: 1,
+          text: spokenText,
+          startedAt,
+          bridge: 'minimax-audio',
+        };
+        let speechStarted = false;
+        try {
+          const response = await fetch('/api/minimax-audio', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ text: spokenText }),
+          });
+          if (!response.ok) {
+            const detail = await response.text().catch(() => '');
+            throw new Error(
+              `minimax_audio_bridge_failed:${response.status}:${detail.slice(0, 120)}`,
+            );
+          }
+          const audio = await response.arrayBuffer();
+          if (audio.byteLength < 16)
+            throw new Error('minimax_audio_bridge_empty');
+          // Do not announce a speech start while the provider request is
+          // still pending. The queue watchdog must measure real playback,
+          // otherwise a valid MP3 can be marked stale before Web Audio ever
+          // receives it.
+          onSpeechStartRef.current?.({ text: spokenText });
+          onSpeechChunkRef.current?.('start', chunk);
+          speechStarted = true;
+          await onAudioPlayRef.current(audio);
+          onSpeechChunkRef.current?.('end', {
+            ...chunk,
+            endedAt: Date.now(),
+          });
+          onSpeechEndRef.current?.();
+        } catch (error) {
+          onSpeechChunkRef.current?.('error', {
+            ...chunk,
+            endedAt: Date.now(),
+            error: error instanceof Error ? error.message : String(error),
+          });
+          // SPEECH_END is paired only with a real start. Calling it for a
+          // provider failure can falsely complete a different queued item.
+          if (speechStarted) onSpeechEndRef.current?.();
+          throw error;
         }
-        const audio = await response.arrayBuffer();
-        if (audio.byteLength < 16) throw new Error('minimax_audio_bridge_empty');
-        await onAudioPlayRef.current(audio);
-        onSpeechChunkRef.current?.('end', {
-          ...chunk,
-          endedAt: Date.now(),
-        });
-        onSpeechEndRef.current?.();
-      } catch (error) {
-        onSpeechChunkRef.current?.('error', {
-          ...chunk,
-          endedAt: Date.now(),
-          error: error instanceof Error ? error.message : String(error),
-        });
-        onSpeechEndRef.current?.();
-        throw error;
+        return;
       }
-      return;
-    }
-    if (!coreRef.current) return;
-    await coreRef.current.speakTextWithOptions(spokenText, {
-      enableAnimation: true,
-    });
-  }, [settings.tts.engine]);
+      if (!coreRef.current) return;
+      await coreRef.current.speakTextWithOptions(spokenText, {
+        enableAnimation: true,
+      });
+    },
+    [settings.tts.engine],
+  );
 
   // A provider request can outlive its transport timeout.  Retire that core
   // instance so its private processing lock cannot reject every later queue
   // item while the React-facing state looks idle.
   const recoverChatRuntime = useCallback(() => {
     pendingMemoryRef.current = null;
+    lastGuardedResponseRef.current = null;
+    processingRef.current = false;
     coreRef.current?.offAll();
     coreRef.current = null;
     setIsProcessing(false);
@@ -996,6 +1197,13 @@ export function useAituberCore({
     setIsCoreReady(false);
     setCoreGeneration((generation) => generation + 1);
   }, []);
+
+  const interruptSpeech = useCallback(
+    (mode: 'immediate' | 'beat-boundary' = 'beat-boundary') => {
+      coreRef.current?.interruptSpeech(mode);
+    },
+    [],
+  );
 
   return {
     messages,
@@ -1006,5 +1214,6 @@ export function useAituberCore({
     processVisionChat,
     isCoreReady,
     recoverChatRuntime,
+    interruptSpeech,
   };
 }

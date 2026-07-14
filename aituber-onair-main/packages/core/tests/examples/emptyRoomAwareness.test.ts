@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
   EmptyRoomAwarenessPlanner,
   type EmptyRoomAwarenessContext,
+  isQuietRoomInteraction,
 } from '../../examples/react-purupuru-app/src/lib/emptyRoomAwareness';
 import type { EmptyRoomAwarenessSettings } from '../../examples/react-purupuru-app/src/types/settings';
 
@@ -26,6 +27,12 @@ const context: EmptyRoomAwarenessContext = {
 };
 
 describe('empty room awareness planner', () => {
+  it('does not treat viewer presence as a chat interaction', () => {
+    expect(isQuietRoomInteraction('entry')).toBe(false);
+    expect(isQuietRoomInteraction('comment')).toBe(true);
+    expect(isQuietRoomInteraction('gift')).toBe(true);
+  });
+
   it('schedules every pulse inside the configured random window', () => {
     const planner = new EmptyRoomAwarenessPlanner(() => 0.5);
     planner.markActivity(settings, 1_000);

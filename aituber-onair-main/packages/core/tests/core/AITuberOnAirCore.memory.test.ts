@@ -37,6 +37,12 @@ vi.mock('@aituber-onair/chat', () => {
     Message: {},
     ChatServiceOptions: {},
     textsToScreenplay: vi.fn(),
+    speechPlanToScreenplay: vi.fn((plan) => plan.beats[0]),
+    textToSpeechPlan: vi.fn((text) => ({
+      version: 2,
+      beats: [{ text, ttsText: text, interruptibleAfter: true }],
+    })),
+    screenplayToText: vi.fn(() => ''),
   };
 });
 

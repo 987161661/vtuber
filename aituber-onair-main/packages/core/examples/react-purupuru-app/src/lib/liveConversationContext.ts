@@ -5,7 +5,10 @@ export type RecentLiveTurn = {
   at: number;
   input: string;
   reply?: string;
+  viewerId?: string;
   viewerName?: string;
+  sourceLabel?: string;
+  sourcesSeen?: string[];
   skills?: string[];
   status?: OperatorQueueStatus;
 };
@@ -18,8 +21,11 @@ export type LiveResponseContract = {
   hasPrimaryQuestion: boolean;
 };
 
-const FOLLOW_UP_MARKERS =
-  /哪来|从哪|为什么|怎么|依据|来源|刚才|上句|上一|那个|这个|它|呢|真的吗|确定|吓|离开|后来|然后/;
+export type SkillRoutingDecision = {
+  inheritTyphoon: boolean;
+  reason: string;
+};
+
 const QUESTION_OR_REQUEST =
   /[？?]|哪|什么|怎么|为何|为什么|多少|几个|是否|能否|可以吗|有没有|查|说说|讲讲|告诉/;
 const EMOTION_SIDE_CHANNEL = /吓|怕|哭|急|慌|担心|紧张|笑死|哈哈|难受|生气/;
@@ -44,7 +50,7 @@ export function buildLiveRoomTranscript(turns: RecentLiveTurn[]) {
   const transcript = turns
     .map(
       (turn) =>
-        `观众${turn.viewerName ? `（${turn.viewerName}）` : ''}：${turn.input}${
+      `观众${turn.viewerName ? `（${turn.viewerName}）` : ''}${turn.viewerId ? ` [${turn.viewerId}]` : ''}${turn.sourceLabel ? `，来源：${turn.sourceLabel}` : ''}：${turn.input}${
           turn.reply ? `\n凌岚：${turn.reply}` : '\n（该条未播出回复）'
         }${turn.skills?.length ? `\n已用技能：${turn.skills.join('、')}` : ''}`,
     )
@@ -55,6 +61,7 @@ export function buildLiveRoomTranscript(turns: RecentLiveTurn[]) {
 export function buildLiveResponseContract(
   input: string,
   turns: RecentLiveTurn[],
+  routing: SkillRoutingDecision = { inheritTyphoon: false, reason: 'not_routed' },
 ): LiveResponseContract {
   const currentBeijingTime = new Intl.DateTimeFormat('zh-CN', {
     timeZone: 'Asia/Shanghai',
@@ -85,34 +92,19 @@ export function buildLiveResponseContract(
     );
   const previous = related ?? recentAnswered[0];
   const hasPrimaryQuestion = QUESTION_OR_REQUEST.test(input);
-  const isFollowUp = Boolean(
-    previous &&
-      input.length <= 80 &&
-      (FOLLOW_UP_MARKERS.test(input) ||
-        inputBigrams.some((term) => previous.reply?.includes(term))),
-  );
-  const relatedSkilledTurn = isFollowUp
-    ? recentAnswered.find(
-        (turn) =>
-          Boolean(turn.skills?.length) &&
-          (inputBigrams.some(
-            (term) => turn.input.includes(term) || turn.reply?.includes(term),
-          ) ||
-            FOLLOW_UP_MARKERS.test(input)),
-      )
-    : undefined;
-  // Skills describe the subject currently being discussed, not the host's
-  // permanent personality.  Carry them only when this message actually
-  // follows that subject; otherwise a weather turn turns every ordinary
-  // greeting, joke, or emotional check-in into a weather bulletin.
-  const inheritedSkills = isFollowUp
-    ? relatedSkilledTurn?.skills ?? previous?.skills ?? []
+  // An LLM routing turn, not lexical overlap, decides whether a new message
+  // truly asks to continue the previous weather investigation.
+  const isFollowUp = routing.inheritTyphoon;
+  const inheritedSkills = routing.inheritTyphoon
+    ? ['typhoon-boss-radar']
     : [];
   const preferMultipleBeats = Boolean(
     hasPrimaryQuestion &&
-      (isFollowUp || EMOTION_SIDE_CHANNEL.test(input) || inheritedSkills.length),
+      (isFollowUp ||
+        EMOTION_SIDE_CHANNEL.test(input) ||
+        inheritedSkills.length),
   );
-  const contract = `\n\n<live_response_contract>\n当前观众原话：${input}\n主问题存在：${hasPrimaryQuestion ? '是' : '否'}\n承接上一轮：${isFollowUp ? '是' : '否'}\n${
+  const contract = `\n\n<live_response_contract>\n当前观众原话：${input}\n主问题存在：${hasPrimaryQuestion ? '是' : '否'}\n承接上一轮：${isFollowUp ? '是' : '否'}\n技能路由判断：${routing.reason}\n${
     previous?.reply ? `上一轮主播实际说过：${previous.reply}\n` : ''
   }${
     inheritedSkills.length
@@ -130,7 +122,7 @@ export function buildLiveResponseContract(
     preferMultipleBeats
       ? '本轮适合在确有查证、承接或情绪反应时使用两到三句短节拍；最后一个节拍必须给出完整主答案。'
       : '无需为了表演强行拆句。'
-  }\n拟人要求：只有当观众明确询问台风、天气、雷达或相关的上一轮追问时，才调用或提及台风。普通问候、情绪、玩笑、关系和生活话题，就像一个有自己性格的主播一样直接回应，不要拿台风实况做转场。\n长度要求：大多数情况下用 2 到 4 句完成，总长不超过 160 个中文字；不要重复题目、不要带出推理过程或内部规则。\n</live_response_contract>`;
+  }\n拟人要求：只有当观众明确询问台风、天气、雷达或相关的上一轮追问时，才调用或提及台风。普通问候、情绪、玩笑、关系和生活话题，就像一个有自己性格的主播一样直接回应，不要拿台风实况做转场。\n回答策略：第一句直接回答观众真正问的内容；资料不能支持时，明确说不知道或资料未提供，不得拿相关但不同的问题代替。\n长度要求：大多数情况下用 1 到 2 句完成，总长不超过 80 个中文字；不要重复题目、不要带出推理过程或内部规则。\n</live_response_contract>`;
   return {
     contract: runtimeClockContext + contract,
     inheritedSkills,

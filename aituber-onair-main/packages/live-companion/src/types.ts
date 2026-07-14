@@ -94,6 +94,8 @@ export interface LiveMemoryPromptOptions {
 export type LivePlatform =
   | 'youtube'
   | 'twitch'
+  | 'bilibili'
+  | 'douyin'
   | 'web'
   | 'discord'
   | 'custom'
@@ -292,4 +294,157 @@ export interface EmotionBehaviorMapper {
     emotion: EmotionSignal,
     context: EmotionBehaviorContext,
   ): AvatarBehaviorEvent | Promise<AvatarBehaviorEvent>;
+}
+
+export type LiveHostPhase =
+  | 'offline'
+  | 'observing'
+  | 'deliberating'
+  | 'speaking'
+  | 'cooldown'
+  | 'recovering'
+  | 'operator_hold';
+
+export type LiveHostPriority = 'low' | 'normal' | 'high' | 'urgent';
+export type LiveHostTurnKind =
+  | 'viewer'
+  | 'proactive'
+  | 'engagement'
+  | 'safety'
+  | 'operator';
+
+export interface LiveHostTurn {
+  eventId: string;
+  kind: LiveHostTurnKind;
+  priority: LiveHostPriority;
+  createdAt: number;
+  targetViewerId?: string;
+  proactiveSource?: string;
+}
+
+export interface LiveHostPolicy {
+  quietThresholdMs: number;
+  proactiveCooldownMs: number;
+  maxProactiveTurns: number;
+}
+
+export type LiveHostEvent =
+  | { type: 'stream-state'; at: number; isLive: boolean; eventId?: string }
+  | (ViewerPresenceEvent & {
+      type: 'viewer-presence';
+      eventId?: string;
+    })
+  | {
+      type: 'audience-message';
+      at: number;
+      eventId: string;
+      viewerId?: string;
+      priority?: LiveHostPriority;
+    }
+  | {
+      type: 'engagement';
+      at: number;
+      eventId: string;
+      viewerId?: string;
+      priority?: LiveHostPriority;
+      engagementKind: 'follow' | 'like' | 'gift' | 'superchat' | 'guard';
+    }
+  | {
+      type: 'environment';
+      at: number;
+      eventId: string;
+      priority: LiveHostPriority;
+    }
+  | {
+      type: 'quiet-candidate';
+      at: number;
+      eventId: string;
+      source: string;
+      prompt: string;
+      busy: boolean;
+    }
+  | {
+      type: 'generation';
+      at: number;
+      eventId: string;
+      stage: 'started' | 'completed' | 'failed';
+      turn: LiveHostTurn;
+    }
+  | {
+      type: 'speech';
+      at: number;
+      eventId: string;
+      stage:
+        | 'started'
+        | 'beat-completed'
+        | 'completed'
+        | 'interrupted'
+        | 'failed';
+      beatIndex?: number;
+      interruptibleAfter?: boolean;
+    }
+  | {
+      type: 'runtime-fault';
+      at: number;
+      eventId?: string;
+      reasonCode: string;
+    }
+  | {
+      type: 'operator-command';
+      at: number;
+      eventId?: string;
+      command: 'takeover' | 'mute' | 'resume';
+      isLive?: boolean;
+    };
+
+export type LiveHostDecision =
+  | {
+      kind: 'queue-audience-turn';
+      eventId: string;
+      targetViewerId?: string;
+      priority: LiveHostPriority;
+      reasonCode: string;
+    }
+  | {
+      kind: 'prepare-reply';
+      eventId: string;
+      turnKind: LiveHostTurnKind;
+      prompt?: string;
+      reasonCode: string;
+    }
+  | { kind: 'speak-turn'; eventId: string; reasonCode: string }
+  | {
+      kind: 'interrupt';
+      eventId?: string;
+      mode: 'immediate' | 'beat-boundary';
+      reasonCode: string;
+    }
+  | { kind: 'drop'; eventId?: string; reasonCode: string }
+  | {
+      kind: 'emit-avatar-intent';
+      eventId: string;
+      intent: 'observing' | 'speaking' | 'recovering';
+      reasonCode: string;
+    }
+  | { kind: 'enter-recovery'; eventId?: string; reasonCode: string }
+  | {
+      kind: 'request-operator-attention';
+      eventId?: string;
+      reasonCode: string;
+    };
+
+export interface LiveHostSnapshot {
+  phase: LiveHostPhase;
+  activeTurn?: LiveHostTurn;
+  pendingInterruptEventId?: string;
+  lastAudienceActivityAt: number;
+  lastHostSpeechAt: number;
+  proactiveDeliveredCount: number;
+  proactiveRemaining: number;
+  nextProactiveAt: number;
+  lastProactiveSource?: string;
+  recoveryCount: number;
+  currentBeatIndex?: number;
+  currentBeatInterruptible: boolean;
+  lastDecisionReason: string;
 }

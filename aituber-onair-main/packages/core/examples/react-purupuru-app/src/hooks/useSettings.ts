@@ -21,9 +21,11 @@ import type {
   ChatProviderOption,
   StreamingPlatformOption,
   SocialStreamSettings,
+  LiveConnectorSettings,
   TTSEngineOption,
   VisualSettings,
 } from '../types/settings';
+import { createPlatformConnection } from '../services/live-platform/connectors';
 
 type ApiKeyProvider = Exclude<ChatProviderOption, 'gemini-nano'>;
 
@@ -437,6 +439,7 @@ function getDefaultSettings(): AppSettings {
       twitchCommentIntervalMs: 20_000,
       bilibiliEnabled: false,
       bilibiliReplyEnabled: false,
+      bilibiliGatewayUrl: '/api/bilibili',
       customSseEndpoint: '',
       customSseEnabled: false,
     },
@@ -445,6 +448,26 @@ function getDefaultSettings(): AppSettings {
       sessionId: '',
       serverUrl: 'wss://io.socialstream.ninja',
       platforms: [],
+    },
+    liveConnectors: {
+      schemaVersion: 1,
+      ordinaryRoad: {
+        enabled: false,
+        gatewayUrl: '/api/live-connectors/ordinaryroad',
+        platforms: {
+          bilibili: createPlatformConnection('', false),
+          douyu: createPlatformConnection(),
+          huya: createPlatformConnection(),
+          douyin: createPlatformConnection(),
+          kuaishou: createPlatformConnection(),
+        },
+      },
+      socialStreamNinja: {
+        enabled: false,
+        sessionId: '',
+        serverUrl: 'wss://io.socialstream.ninja',
+        platforms: {},
+      },
     },
     commentIntelligence: {
       enabled: true,
@@ -548,6 +571,87 @@ function loadSettings(): AppSettings {
       if (activeProfile?.voiceSpeaker) {
         tts.speaker = activeProfile.voiceSpeaker;
       }
+      const savedConnectors = saved.liveConnectors;
+      const legacyBilibiliEnabled = Boolean(saved.stream?.bilibiliEnabled);
+      const legacyBilibiliReplyEnabled = Boolean(
+        saved.stream?.bilibiliReplyEnabled,
+      );
+      const normalizeConnectionMap = (
+        current: Record<string, Partial<ReturnType<typeof createPlatformConnection>>> | undefined,
+        fallback: Record<string, ReturnType<typeof createPlatformConnection>>,
+      ) =>
+        Object.fromEntries(
+          Object.entries({ ...fallback, ...(current ?? {}) }).map(
+            ([platformId, value]) => [
+              platformId,
+              createPlatformConnection(value.roomId, value.enabled, value.outbound),
+            ],
+          ),
+        );
+      const needsLegacyConnectorMigration = savedConnectors?.schemaVersion !== 1;
+      const liveConnectors: LiveConnectorSettings = {
+        schemaVersion: 1,
+        ordinaryRoad: {
+          ...defaults.liveConnectors.ordinaryRoad,
+          ...savedConnectors?.ordinaryRoad,
+          enabled:
+            savedConnectors?.ordinaryRoad?.enabled ?? legacyBilibiliEnabled,
+          gatewayUrl:
+            savedConnectors?.ordinaryRoad?.gatewayUrl ||
+            (saved.stream?.bilibiliGatewayUrl === '/api/bilibili'
+              ? defaults.liveConnectors.ordinaryRoad.gatewayUrl
+              : saved.stream?.bilibiliGatewayUrl) ||
+            defaults.liveConnectors.ordinaryRoad.gatewayUrl,
+          platforms: normalizeConnectionMap(
+            savedConnectors?.ordinaryRoad?.platforms,
+            {
+              ...defaults.liveConnectors.ordinaryRoad.platforms,
+              bilibili: createPlatformConnection('', legacyBilibiliEnabled, {
+                viewerReplies: legacyBilibiliReplyEnabled,
+                proactiveSpeech: legacyBilibiliReplyEnabled,
+                operatorBroadcasts: legacyBilibiliReplyEnabled,
+              }),
+            },
+          ),
+        },
+        socialStreamNinja: {
+          ...defaults.liveConnectors.socialStreamNinja,
+          ...savedConnectors?.socialStreamNinja,
+          enabled:
+            savedConnectors?.socialStreamNinja?.enabled ??
+            Boolean(saved.socialStream?.enabled),
+          sessionId:
+            savedConnectors?.socialStreamNinja?.sessionId ||
+            saved.socialStream?.sessionId ||
+            '',
+          serverUrl:
+            savedConnectors?.socialStreamNinja?.serverUrl ||
+            saved.socialStream?.serverUrl ||
+            defaults.liveConnectors.socialStreamNinja.serverUrl,
+          platforms: normalizeConnectionMap(
+            savedConnectors?.socialStreamNinja?.platforms,
+            Object.fromEntries(
+              (saved.socialStream?.platforms ?? []).map((platformId) => [
+                platformId,
+                createPlatformConnection('', true),
+              ]),
+            ),
+          ),
+        },
+      };
+      if (needsLegacyConnectorMigration) {
+        const bilibili = liveConnectors.ordinaryRoad.platforms.bilibili;
+        bilibili.enabled = bilibili.enabled || legacyBilibiliEnabled;
+        liveConnectors.ordinaryRoad.enabled =
+          liveConnectors.ordinaryRoad.enabled || legacyBilibiliEnabled;
+        if (legacyBilibiliReplyEnabled) {
+          bilibili.outbound = {
+            viewerReplies: true,
+            proactiveSpeech: true,
+            operatorBroadcasts: true,
+          };
+        }
+      }
       return {
         digitalHumans,
         llm: {
@@ -571,6 +675,7 @@ function loadSettings(): AppSettings {
               )
             : defaults.socialStream.platforms,
         },
+        liveConnectors,
         commentIntelligence: {
           ...defaults.commentIntelligence,
           ...saved.commentIntelligence,
@@ -658,7 +763,10 @@ export function useSettings(runtimeRole: RuntimeSettingsRole = 'standalone') {
         const remote = (await response.json()) as AppSettings;
         if (cancelled) return;
         const local = loadSettings();
-        const runtimeSettings: AppSettings = retainLocalTtsCredentials(remote, local);
+        const runtimeSettings: AppSettings = retainLocalTtsCredentials(
+          remote,
+          local,
+        );
         const normalizedRuntimeSettings: AppSettings = {
           ...runtimeSettings,
           visual: {
@@ -669,7 +777,10 @@ export function useSettings(runtimeRole: RuntimeSettingsRole = 'standalone') {
           },
           stream: runtimeSettings.stream,
         };
-        localStorage.setItem(STORAGE_KEY, JSON.stringify(normalizedRuntimeSettings));
+        localStorage.setItem(
+          STORAGE_KEY,
+          JSON.stringify(normalizedRuntimeSettings),
+        );
         setSettings(loadSettings());
       } catch {
         // Keep the last settings cached by the OBS browser source.
@@ -1402,7 +1513,13 @@ export function useSettings(runtimeRole: RuntimeSettingsRole = 'standalone') {
   const updateBilibiliEnabled = useCallback((bilibiliEnabled: boolean) => {
     setSettings((prev) => ({
       ...prev,
-      stream: { ...prev.stream, bilibiliEnabled },
+      stream: {
+        ...prev.stream,
+        bilibiliEnabled,
+        bilibiliReplyEnabled: bilibiliEnabled
+          ? prev.stream.bilibiliReplyEnabled
+          : false,
+      },
     }));
   }, []);
 
@@ -1415,6 +1532,13 @@ export function useSettings(runtimeRole: RuntimeSettingsRole = 'standalone') {
     },
     [],
   );
+
+  const updateBilibiliGatewayUrl = useCallback((bilibiliGatewayUrl: string) => {
+    setSettings((prev) => ({
+      ...prev,
+      stream: { ...prev.stream, bilibiliGatewayUrl },
+    }));
+  }, []);
 
   const updateCustomSseEndpoint = useCallback((customSseEndpoint: string) => {
     setSettings((prev) => ({
@@ -1435,6 +1559,16 @@ export function useSettings(runtimeRole: RuntimeSettingsRole = 'standalone') {
       setSettings((prev) => ({
         ...prev,
         socialStream: { ...prev.socialStream, ...update },
+      }));
+    },
+    [],
+  );
+
+  const updateLiveConnectors = useCallback(
+    (update: (current: LiveConnectorSettings) => LiveConnectorSettings) => {
+      setSettings((prev) => ({
+        ...prev,
+        liveConnectors: update(prev.liveConnectors),
       }));
     },
     [],
@@ -1874,9 +2008,11 @@ export function useSettings(runtimeRole: RuntimeSettingsRole = 'standalone') {
     updateTwitchCommentIntervalMs,
     updateBilibiliEnabled,
     updateBilibiliReplyEnabled,
+    updateBilibiliGatewayUrl,
     updateCustomSseEndpoint,
     updateCustomSseEnabled,
     updateSocialStream,
+    updateLiveConnectors,
     selectDigitalHuman,
     addDigitalHuman,
     updateDigitalHuman,

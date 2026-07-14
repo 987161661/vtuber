@@ -145,6 +145,7 @@ export interface StreamSettings {
   twitchCommentIntervalMs: number;
   bilibiliEnabled: boolean;
   bilibiliReplyEnabled: boolean;
+  bilibiliGatewayUrl: string;
   customSseEndpoint: string;
   customSseEnabled: boolean;
 }
@@ -155,6 +156,46 @@ export interface SocialStreamSettings {
   serverUrl: string;
   /** Platforms handled by SSN must not also run through a native adapter. */
   platforms: string[];
+}
+
+export type LiveConnectorId = 'ordinaryroad' | 'social-stream-ninja';
+export type LivePlatformId =
+  | 'bilibili'
+  | 'douyu'
+  | 'huya'
+  | 'douyin'
+  | 'kuaishou'
+  | string;
+
+export interface PlatformOutboundPolicy {
+  viewerReplies: boolean;
+  proactiveSpeech: boolean;
+  operatorBroadcasts: boolean;
+}
+
+export interface PlatformConnectionSettings {
+  enabled: boolean;
+  roomId: string;
+  outbound: PlatformOutboundPolicy;
+}
+
+export interface OrdinaryRoadConnectorSettings {
+  enabled: boolean;
+  gatewayUrl: string;
+  platforms: Record<string, PlatformConnectionSettings>;
+}
+
+export interface SocialStreamNinjaConnectorSettings {
+  enabled: boolean;
+  sessionId: string;
+  serverUrl: string;
+  platforms: Record<string, PlatformConnectionSettings>;
+}
+
+export interface LiveConnectorSettings {
+  schemaVersion: 1;
+  ordinaryRoad: OrdinaryRoadConnectorSettings;
+  socialStreamNinja: SocialStreamNinjaConnectorSettings;
 }
 
 export interface CommentIntelligenceSettings {
@@ -257,6 +298,7 @@ export interface AppSettings {
   screenVision: ScreenVisionSettings;
   stream: StreamSettings;
   socialStream: SocialStreamSettings;
+  liveConnectors: LiveConnectorSettings;
   commentIntelligence: CommentIntelligenceSettings;
   manneri: ManneriSettings;
   emptyRoomAwareness: EmptyRoomAwarenessSettings;

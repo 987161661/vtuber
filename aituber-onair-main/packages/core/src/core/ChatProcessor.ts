@@ -10,7 +10,8 @@ import {
   ToolChatCompletion,
   ToolChatBlock,
   DEFAULT_VISION_PROMPT,
-  textsToScreenplay,
+  speechPlanToScreenplay,
+  textToSpeechPlan,
 } from '@aituber-onair/chat';
 import { MemoryManager } from './MemoryManager';
 import { EventEmitter } from './EventEmitter';
@@ -473,6 +474,7 @@ export class ChatProcessor extends EventEmitter {
     let toSend = send;
     let hops = 0;
     let first = true;
+    let truncationRetryUsed = false;
 
     // check if the chat service is claude
     const isClaude = this.isClaudeProvider();
@@ -507,7 +509,8 @@ export class ChatProcessor extends EventEmitter {
           .join('');
 
         if (truncated) {
-          if (hops < this.maxHops) {
+          if (!truncationRetryUsed && hops < this.maxHops) {
+            truncationRetryUsed = true;
             // Do not publish or speak a partial sentence. Ask the provider to
             // regenerate the complete final answer while the original prompt,
             // live transcript, tools and facts are still in context.
@@ -527,7 +530,8 @@ export class ChatProcessor extends EventEmitter {
           );
         }
 
-        const screenplay = textsToScreenplay([full])[0];
+        const speechPlan = textToSpeechPlan(full);
+        const screenplay = speechPlanToScreenplay(speechPlan);
         const assistantMessage: Message = {
           role: 'assistant',
           // Keep structured TTS metadata out of the visible chat log and
@@ -540,6 +544,11 @@ export class ChatProcessor extends EventEmitter {
         const responsePayload = {
           message: assistantMessage,
           screenplay,
+          speechPlan,
+          // Preserve the exact provider text before screenplay parsing and
+          // any downstream safety rewrite. Runtime audit consumers need this
+          // to explain every audience-facing transformation.
+          modelRawText: full,
           visionSource,
           truncated: false,
           finishReason: finish_reason,

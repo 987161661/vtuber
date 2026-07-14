@@ -78,4 +78,25 @@ describe('AvatarBehaviorBus', () => {
     expect(receipts[0]?.status).toBe('failed');
     expect(receipts[0]?.error).toBeInstanceOf(Error);
   });
+
+  it('reports unsupported production motion as skipped', async () => {
+    const dispatch = vi.fn();
+    const bus = new AvatarBehaviorBus();
+    bus.register({
+      id: 'audio-driven-production',
+      capabilities: { actionKinds: [], emotionNames: '*' },
+      dispatch,
+    });
+    const event = createAvatarBehaviorEvent(
+      { name: 'neutral', intensity: 0.5 },
+      { streamId: 'stream-a', source: 'assistant' },
+      [{ kind: 'motion', name: 'fake-bounce' }],
+      3_000,
+    );
+
+    await expect(bus.dispatch(event)).resolves.toEqual([
+      { adapterId: 'audio-driven-production', status: 'skipped' },
+    ]);
+    expect(dispatch).not.toHaveBeenCalled();
+  });
 });

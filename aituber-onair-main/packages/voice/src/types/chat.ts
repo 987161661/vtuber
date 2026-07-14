@@ -32,6 +32,15 @@ export interface ChatScreenplay {
   gesture?: 'still' | 'subtle' | 'expressive';
 }
 
+export interface SpeechBeat extends ChatScreenplay {
+  interruptibleAfter: boolean;
+}
+
+export interface SpeechPlanV2 {
+  version: 2;
+  beats: SpeechBeat[];
+}
+
 /**
  * Speech synthesis options
  */

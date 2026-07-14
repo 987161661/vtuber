@@ -189,7 +189,10 @@ describe('ChatProcessor', () => {
       // check other necessary events
       expect(emitSpy).toHaveBeenCalledWith(
         'assistantResponse',
-        expect.any(Object),
+        expect.objectContaining({
+          modelRawText: 'Once upon a time',
+          message: expect.objectContaining({ content: 'Once upon a time' }),
+        }),
       );
     });
 
@@ -266,6 +269,29 @@ describe('ChatProcessor', () => {
         }),
       );
       expect(mockChatService.chatOnce).toHaveBeenCalledTimes(2);
+    });
+
+    it('retries a truncated final answer only once', async () => {
+      mockChatService.chatOnce.mockResolvedValue({
+        blocks: [{ type: 'text', text: 'Still partial' }],
+        stop_reason: 'end',
+        truncated: true,
+        finish_reason: 'length',
+      });
+      const emitSpy = vi.spyOn(chatProcessor as any, 'emit');
+      await (chatProcessor as any).processTextChat('Hello');
+
+      expect(mockChatService.chatOnce).toHaveBeenCalledTimes(2);
+      expect(emitSpy).toHaveBeenCalledWith(
+        'error',
+        expect.objectContaining({
+          message: expect.stringMatching(/remained truncated/i),
+        }),
+      );
+      expect(emitSpy).not.toHaveBeenCalledWith(
+        'assistantResponse',
+        expect.anything(),
+      );
     });
   });
 

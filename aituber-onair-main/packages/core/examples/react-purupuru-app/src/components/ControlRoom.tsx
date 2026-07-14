@@ -9,6 +9,8 @@ import type {
   DigitalHumanProfile,
 } from '../types/settings';
 import type { StreamBusHealth } from '../hooks/useSocialStreamBus';
+import type { LiveRoomStatus } from '../services/live-platform/types';
+import type { LiveRoomEvent } from '../services/live-platform/types';
 import type {
   InteractionFeedItem,
   InteractionFeedSummary,
@@ -24,6 +26,9 @@ import {
   type MinimaxVoiceOption,
 } from '../lib/minimaxVoicePreview';
 import { StressTestPanel, type StressRunState } from './StressTestPanel';
+import { LiveConnectorConsole } from './LiveConnectorConsole';
+import { SimulatorRoomConsole } from './SimulatorRoomConsole';
+import type { LiveHostSnapshot } from '@aituber-onair/live-companion';
 
 type Workspace =
   | 'avatars'
@@ -58,6 +63,9 @@ interface ControlRoomProps {
   onSend: (text: string) => void;
   onBroadcast: (text: string) => void;
   onStop: () => void;
+  onEmergencyTakeover: () => void;
+  liveHostSnapshot: LiveHostSnapshot;
+  unsupportedAvatarActionCount: number;
   autoBroadcastEnabled: boolean;
   onToggleAutoBroadcast: () => void;
   onUpdateEmptyRoomAwareness: (
@@ -66,7 +74,14 @@ interface ControlRoomProps {
   onOpenLegacySettings: () => void;
   socialBusHealth: StreamBusHealth;
   socialBusError: string;
-  onUpdateSocialStream: (update: Partial<AppSettings['socialStream']>) => void;
+  socialDiscoveredPlatforms: string[];
+  ordinaryRoadStatus: LiveRoomStatus;
+  onUpdateLiveConnectors: (
+    update: (
+      current: AppSettings['liveConnectors'],
+    ) => AppSettings['liveConnectors'],
+  ) => void;
+  onSimulateLiveRoomEvent: (event: LiveRoomEvent) => void;
   onSelectDigitalHuman: (id: string) => void;
   onAddDigitalHuman: () => void;
   onUpdateDigitalHuman: (
@@ -85,7 +100,18 @@ interface ControlRoomProps {
   onResumeStressTest: () => void | Promise<void>;
   onAbortStressTest: () => void | Promise<void>;
   onCleanupStressTest: () => void | Promise<void>;
+  onAuditAction: (event: Record<string, unknown>) => void;
 }
+
+type RuntimeHealth = {
+  lastFaults?: Partial<
+    Record<
+      'model' | 'skill' | 'tts' | 'flashhead' | 'platform',
+      { at: number; stage: string; reason?: string }
+    >
+  >;
+  repeatedReplyCount?: number;
+};
 
 const workspaceLabels: Record<Workspace, string> = {
   avatars: '数字人管理',
@@ -131,6 +157,20 @@ function formatEventTime(timestamp: number) {
   });
 }
 
+function sourceRoomLabel(source: string) {
+  if (source === 'simulator') return '模拟直播间 · sim-room-001';
+  if (source === 'typhoon-radar' || source === 'parent-message') {
+    return '台风 Boss 雷达 · 输入';
+  }
+  if (source === 'external-chat-bridge') return '外部聊天桥接';
+  if (source === 'bilibili') return 'Bilibili 直播间';
+  if (source === 'douyin') return '抖音直播间';
+  if (source === 'douyu') return '斗鱼直播间';
+  if (source === 'huya') return '虎牙直播间';
+  if (source === 'kuaishou') return '快手直播间';
+  return source || '未知直播间';
+}
+
 function queueTone(status: OperatorQueueItem['status']) {
   if (status === 'done') return 'replied';
   if (status === 'skipped') return 'skipped';
@@ -164,13 +204,134 @@ function skipReasonLabel(reason?: string) {
   return '该消息未被采用';
 }
 
+function describeOperatorControl(
+  target: EventTarget | null,
+  interaction: 'click' | 'blur',
+): Record<string, unknown> | null {
+  if (!(target instanceof HTMLElement)) return null;
+  const control =
+    interaction === 'click'
+      ? target.closest<HTMLElement>(
+          'button, a, input, textarea, select, [role="button"]',
+        )
+      : target;
+  if (!control) return null;
+
+  const field =
+    control.getAttribute('name') ||
+    control.getAttribute('id') ||
+    control.getAttribute('data-audit-action') ||
+    undefined;
+  const label =
+    control.getAttribute('data-audit-action') ||
+    control.getAttribute('aria-label') ||
+    control.getAttribute('title') ||
+    control.textContent?.replace(/\s+/g, ' ').trim().slice(0, 120) ||
+    field ||
+    control.tagName.toLowerCase();
+  const isSensitive = /key|token|secret|password|cookie|credential/i.test(
+    `${field ?? ''} ${label}`,
+  );
+  let value: unknown;
+  if (control instanceof HTMLInputElement) {
+    value =
+      control.type === 'checkbox' || control.type === 'radio'
+        ? control.checked
+        : isSensitive || control.type === 'password'
+          ? '[REDACTED]'
+          : control.value;
+  } else if (
+    control instanceof HTMLTextAreaElement ||
+    control instanceof HTMLSelectElement
+  ) {
+    value = isSensitive ? '[REDACTED]' : control.value;
+  }
+
+  return {
+    interaction,
+    control: control.tagName.toLowerCase(),
+    field,
+    label,
+    value,
+  };
+}
+
 export function ControlRoom(props: ControlRoomProps) {
   const [workspace, setWorkspace] = useState<Workspace>('overview');
+  const [simulatorOpen, setSimulatorOpen] = useState(false);
+  const [radarInput, setRadarInput] = useState('');
   const [minimaxVoices, setMinimaxVoices] = useState<MinimaxVoiceOption[]>([]);
   const [voiceLoadError, setVoiceLoadError] = useState('');
   const [previewingVoiceId, setPreviewingVoiceId] = useState<string | null>(
     null,
   );
+  const [runtimeHealth, setRuntimeHealth] = useState<RuntimeHealth>({});
+  const sourceRooms = useMemo(() => {
+    const connectors = props.settings.liveConnectors;
+    const ordinaryRoad = Object.entries(connectors.ordinaryRoad.platforms)
+      .filter(([, item]) => item.enabled && item.roomId.trim())
+      .map(([platformId, item]) => ({
+        id: `ordinaryroad:${platformId}:${item.roomId}`,
+        label: `${sourceRoomLabel(platformId)} · ${item.roomId}`,
+        tone: 'connected',
+      }));
+    const social = Object.entries(connectors.socialStreamNinja.platforms)
+      .filter(([, item]) => item.enabled)
+      .map(([platformId, item]) => ({
+        id: `social:${platformId}:${item.roomId}`,
+        label: `${sourceRoomLabel(platformId)}${item.roomId.trim() ? ` · ${item.roomId}` : ''}`,
+        tone: 'external',
+      }));
+    return [
+      ...ordinaryRoad,
+      ...social,
+      { id: 'simulator', label: sourceRoomLabel('simulator'), tone: 'simulator' },
+      { id: 'typhoon-radar', label: sourceRoomLabel('typhoon-radar'), tone: 'radar' },
+    ];
+  }, [props.settings.liveConnectors]);
+  const formatSourceRoom = (source: string) =>
+    sourceRooms.find(
+      (room) =>
+        room.id.startsWith(`ordinaryroad:${source}:`) ||
+        room.id.startsWith(`social:${source}:`),
+    )?.label ?? sourceRoomLabel(source);
+
+  const submitRadarInput = () => {
+    const text = radarInput.trim();
+    if (!text) return;
+    props.onSimulateLiveRoomEvent({
+      id: `typhoon-radar:${crypto.randomUUID()}`,
+      type: 'comment',
+      text,
+      timestamp: Date.now(),
+      author: { id: 'radar-viewer-001', name: '001号人类' },
+      metadata: {
+        connectorId: 'typhoon-boss-radar',
+        platformId: 'typhoon-radar',
+        sourcePlatform: 'typhoon-radar',
+        roomId: 'typhoon-boss-radar',
+        sourceLabel: '台风 Boss 雷达 · 输入',
+      },
+    });
+    setRadarInput('');
+  };
+  useEffect(() => {
+    let cancelled = false;
+    const refresh = () => {
+      void fetch('/api/live-runtime-health', { cache: 'no-store' })
+        .then((response) => (response.ok ? response.json() : {}))
+        .then((health: RuntimeHealth) => {
+          if (!cancelled) setRuntimeHealth(health);
+        })
+        .catch(() => undefined);
+    };
+    refresh();
+    const timer = window.setInterval(refresh, 2_000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, []);
   const [selectedQueueId, setSelectedQueueId] = useState<string | null>(null);
   const [replyDraft, setReplyDraft] = useState('');
   const [draggingQueueId, setDraggingQueueId] = useState<string | null>(null);
@@ -223,14 +384,6 @@ export function ControlRoom(props: ControlRoomProps) {
       : props.queueDepth
         ? '等待处理'
         : '待命';
-  const toggleBusPlatform = (platform: string) => {
-    const platforms = props.settings.socialStream.platforms;
-    props.onUpdateSocialStream({
-      platforms: platforms.includes(platform)
-        ? platforms.filter((item) => item !== platform)
-        : [...platforms, platform],
-    });
-  };
   const activeDigitalHuman =
     props.settings.digitalHumans.profiles.find(
       (profile) => profile.id === props.settings.digitalHumans.activeId,
@@ -283,7 +436,17 @@ export function ControlRoom(props: ControlRoomProps) {
   };
 
   return (
-    <main className="control-room">
+    <main
+      className="control-room"
+      onClickCapture={(event) => {
+        const auditEvent = describeOperatorControl(event.target, 'click');
+        if (auditEvent) props.onAuditAction(auditEvent);
+      }}
+      onBlurCapture={(event) => {
+        const auditEvent = describeOperatorControl(event.target, 'blur');
+        if (auditEvent) props.onAuditAction(auditEvent);
+      }}
+    >
       <header className="control-room-header">
         <div className="control-room-brand">
           <span className="control-room-eyebrow">
@@ -424,12 +587,8 @@ export function ControlRoom(props: ControlRoomProps) {
               </div>
             </details>
           </div>
-          <button
-            className="danger-action"
-            onClick={props.onStop}
-            disabled={!props.isSpeaking && !props.isProcessing}
-          >
-            停止当前播出
+          <button className="danger-action" onClick={props.onEmergencyTakeover}>
+            紧急接管
           </button>
         </div>
       </header>
@@ -763,409 +922,507 @@ export function ControlRoom(props: ControlRoomProps) {
           </section>
         )}
         {workspace === 'overview' && (
-          <div className="control-room-grid">
-            <section className="console-panel audience-panel">
-              <div className="panel-heading">
-                <span>互动雷达</span>
-                <small>最近 {props.interactionEvents.length} 条</small>
-              </div>
-              <div className="interaction-metrics" aria-label="互动处理概览">
-                <button
-                  className={`interaction-metric-button ${queueFilter === 'active' ? 'is-active' : ''}`}
-                  onClick={() => setQueueFilter('active')}
-                >
-                  <strong>
-                    {Math.max(
-                      props.queueDepth,
-                      props.interactionSummary.pending,
-                    )}
-                  </strong>
-                  <span>等待回复</span>
-                </button>
-                <button
-                  className={`interaction-metric-button ${queueFilter === 'replied' ? 'is-active' : ''}`}
-                  onClick={() => setQueueFilter('replied')}
-                >
-                  <strong>
-                    {
-                      props.operatorQueue.filter(
-                        (item) => item.status === 'done',
-                      ).length
-                    }
-                  </strong>
-                  <span>已回应</span>
-                </button>
-                <button
-                  className={`interaction-metric-button ${queueFilter === 'skipped' ? 'is-active' : ''}`}
-                  onClick={() => setQueueFilter('skipped')}
-                >
-                  <strong>
-                    {
-                      props.operatorQueue.filter(
-                        (item) => item.status === 'skipped',
-                      ).length
-                    }
-                  </strong>
-                  <span>未采用</span>
-                </button>
-              </div>
-              <small className="queue-age">
-                {Math.max(props.queueDepth, props.interactionSummary.pending)
-                  ? `最早等待 ${formatAge(props.oldestQueueAgeMs)}`
-                  : '所有已接收互动都已做出处理决定'}
-              </small>
-              <div className="operator-queue" aria-label="可调度的消息队列">
-                {visibleQueue.length ? (
-                  visibleQueue.map((item, index) => (
-                    <article
-                      key={item.eventId}
-                      draggable={queueFilter === 'active'}
-                      onDragStart={() => setDraggingQueueId(item.eventId)}
-                      onDragOver={(event) => {
-                        if (queueFilter === 'active') event.preventDefault();
-                      }}
-                      onDrop={() => {
-                        if (
-                          queueFilter === 'active' &&
-                          draggingQueueId &&
-                          draggingQueueId !== item.eventId
-                        ) {
-                          props.onMoveQueueItem(draggingQueueId, index);
-                        }
-                        setDraggingQueueId(null);
-                      }}
-                      onClick={() => setSelectedQueueId(item.eventId)}
-                      className={`operator-queue-item is-${queueTone(item.status)} ${selectedQueueItem?.eventId === item.eventId ? 'is-selected' : ''}`}
-                    >
-                      {queueFilter === 'active' ? (
-                        <span className="operator-drag" aria-hidden="true">
-                          ⠿
-                        </span>
-                      ) : null}
-                      <div>
-                        <b>
-                          {item.viewerName || '观众'} ·{' '}
-                          {queueStatusLabel(item.status)}
-                        </b>
-                        <p>{item.text}</p>
-                      </div>
-                      <button
-                        className="queue-delete"
-                        aria-label="删除此消息"
-                        onClick={(event) => {
-                          event.stopPropagation();
-                          props.onDeleteQueueItem(item.eventId);
-                        }}
-                      >
-                        删除
-                      </button>
-                    </article>
-                  ))
-                ) : (
-                  <p className="empty-state">
-                    {queueFilter === 'replied'
-                      ? '暂时没有已回应的消息。'
-                      : queueFilter === 'skipped'
-                        ? '暂时没有未采用的消息。'
-                        : '新互动会先进入这里，LLM 会在播报空档前准备回复。'}
-                  </p>
-                )}
-              </div>
-              <div className="message-list interaction-feed" aria-live="polite">
-                {props.interactionEvents.length ? (
-                  props.interactionEvents.slice(0, 12).map((event) => (
-                    <article
-                      key={event.eventId}
-                      className={`interaction-card is-${event.stage}`}
-                    >
-                      <header>
-                        <span>{event.viewerName || '匿名观众'}</span>
-                        <small>
-                          {event.sourcesSeen.join(' / ') || '直播间'}
-                        </small>
-                        <time>{formatEventTime(event.at)}</time>
-                      </header>
-                      <p>{event.text}</p>
-                      <footer>
-                        <b>{interactionStageLabels[event.stage]}</b>
-                        {event.dropReason ? (
-                          <small>
-                            {dropReasonLabels[event.dropReason] ||
-                              event.dropReason}
-                          </small>
-                        ) : null}
-                      </footer>
-                    </article>
-                  ))
-                ) : (
-                  <p className="empty-state">
-                    互动接入后会在这里显示接收、筛选与回应结果。
-                  </p>
-                )}
-              </div>
-              <div className="recent-broadcasts">
-                <span>最近播出</span>
-                {recentMessages
-                  .filter((message) => message.role === 'assistant')
-                  .slice(0, 2)
-                  .map((message) => (
-                    <p key={message.id}>{message.content}</p>
-                  ))}
-              </div>
-            </section>
-
-            <section className="console-panel program-panel">
-              <div className="panel-heading">
-                <span>{selectedQueueItem ? '模型回复草稿' : '主播台词'}</span>
-                <small>
-                  {selectedQueueItem
-                    ? '点选左侧队列后查看与编辑'
-                    : '空闲时可直接安排主播说话'}
-                </small>
-              </div>
-              <div className="program-stage">
-                <span className="stage-label">NOW</span>
-                <h1>{stage}</h1>
-                <p>
-                  {props.partialResponse ||
-                    (props.isSpeaking
-                      ? `${activeDigitalHuman?.displayName || '当前主播'}正在播出当前回复。`
-                      : '等待新的互动或手动播报。')}
-                </p>
-              </div>
-              <div className="reply-editor">
+          <>
+            <div className="interaction-metrics" aria-label="主播协调器状态">
+              <article>
+                <strong>{props.liveHostSnapshot.phase}</strong>
+                <span>主播状态</span>
+              </article>
+              <article>
+                <strong>
+                  {props.liveHostSnapshot.activeTurn?.eventId ?? '—'}
+                </strong>
+                <span>活动回合</span>
+              </article>
+              <article>
+                <strong>
+                  {props.liveHostSnapshot.activeTurn?.targetViewerId ?? '—'}
+                </strong>
+                <span>目标观众</span>
+              </article>
+              <article>
+                <strong>{props.liveHostSnapshot.proactiveRemaining}</strong>
+                <span>主动发言余额</span>
+              </article>
+              <article>
+                <strong>
+                  {props.liveHostSnapshot.nextProactiveAt
+                    ? new Date(
+                        props.liveHostSnapshot.nextProactiveAt,
+                      ).toLocaleTimeString('zh-CN')
+                    : '—'}
+                </strong>
+                <span>下次主动发言</span>
+              </article>
+              <article>
+                <strong>
+                  {props.liveHostSnapshot.currentBeatIndex === undefined
+                    ? '—'
+                    : `${props.liveHostSnapshot.currentBeatIndex + 1} / ${
+                        props.liveHostSnapshot.currentBeatInterruptible
+                          ? '可中断'
+                          : '不可中断'
+                      }`}
+                </strong>
+                <span>语音节拍</span>
+              </article>
+              <article>
+                <strong>{props.liveHostSnapshot.recoveryCount}</strong>
+                <span>恢复次数</span>
+              </article>
+              <article>
+                <strong>{props.unsupportedAvatarActionCount}</strong>
+                <span>不支持动作</span>
+              </article>
+            </div>
+            <small className="queue-age">
+              最近决策：{props.liveHostSnapshot.lastDecisionReason}
+            </small>
+            <small className="queue-age">
+              最近故障：
+              {(['model', 'skill', 'tts', 'flashhead', 'platform'] as const)
+                .map((kind) =>
+                  runtimeHealth.lastFaults?.[kind]
+                    ? `${kind}=${runtimeHealth.lastFaults[kind]?.stage}`
+                    : `${kind}=—`,
+                )
+                .join(' · ')}
+              {' · '}重复回复={runtimeHealth.repeatedReplyCount ?? 0}
+            </small>
+            <div className="control-room-grid">
+              <section className="console-panel audience-panel">
                 <div className="panel-heading">
-                  <span>
-                    {selectedReplyIsHistory
-                      ? '回复历史'
-                      : selectedQueueItem
-                        ? '待播回复'
-                        : '手动播报'}
-                  </span>
+                  <span>互动雷达</span>
+                  <small>最近 {props.interactionEvents.length} 条</small>
+                </div>
+                <div className="source-room-board" aria-label="已接入消息来源">
+                  <div className="source-room-board-heading">
+                    <span>消息来源直播间</span>
+                    <small>来源会随每条互动保留</small>
+                  </div>
+                  <div className="source-room-list">
+                    {sourceRooms.map((room) => (
+                      <span key={room.id} className={`source-room-chip is-${room.tone}`}>
+                        {room.label}
+                      </span>
+                    ))}
+                  </div>
+                  <div className="radar-input-row">
+                    <input value={radarInput} placeholder="从台风 Boss 雷达发送一条观众提问…" onChange={(event) => setRadarInput(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter') submitRadarInput(); }} />
+                    <button type="button" disabled={!radarInput.trim()} onClick={submitRadarInput}>送入数字人</button>
+                  </div>
+                </div>
+                <div className="interaction-metrics" aria-label="互动处理概览">
+                  <button
+                    className={`interaction-metric-button ${queueFilter === 'active' ? 'is-active' : ''}`}
+                    onClick={() => setQueueFilter('active')}
+                  >
+                    <strong>
+                      {Math.max(
+                        props.queueDepth,
+                        props.interactionSummary.pending,
+                      )}
+                    </strong>
+                    <span>等待回复</span>
+                  </button>
+                  <button
+                    className={`interaction-metric-button ${queueFilter === 'replied' ? 'is-active' : ''}`}
+                    onClick={() => setQueueFilter('replied')}
+                  >
+                    <strong>
+                      {
+                        props.operatorQueue.filter(
+                          (item) => item.status === 'done',
+                        ).length
+                      }
+                    </strong>
+                    <span>已回应</span>
+                  </button>
+                  <button
+                    className={`interaction-metric-button ${queueFilter === 'skipped' ? 'is-active' : ''}`}
+                    onClick={() => setQueueFilter('skipped')}
+                  >
+                    <strong>
+                      {
+                        props.operatorQueue.filter(
+                          (item) => item.status === 'skipped',
+                        ).length
+                      }
+                    </strong>
+                    <span>未采用</span>
+                  </button>
+                </div>
+                <small className="queue-age">
+                  {Math.max(props.queueDepth, props.interactionSummary.pending)
+                    ? `最早等待 ${formatAge(props.oldestQueueAgeMs)}`
+                    : '所有已接收互动都已做出处理决定'}
+                </small>
+                <div className="operator-queue" aria-label="可调度的消息队列">
+                  {visibleQueue.length ? (
+                    visibleQueue.map((item, index) => (
+                      <article
+                        key={item.eventId}
+                        draggable={queueFilter === 'active'}
+                        onDragStart={() => setDraggingQueueId(item.eventId)}
+                        onDragOver={(event) => {
+                          if (queueFilter === 'active') event.preventDefault();
+                        }}
+                        onDrop={() => {
+                          if (
+                            queueFilter === 'active' &&
+                            draggingQueueId &&
+                            draggingQueueId !== item.eventId
+                          ) {
+                            props.onMoveQueueItem(draggingQueueId, index);
+                          }
+                          setDraggingQueueId(null);
+                        }}
+                        onClick={() => setSelectedQueueId(item.eventId)}
+                        className={`operator-queue-item is-${queueTone(item.status)} ${selectedQueueItem?.eventId === item.eventId ? 'is-selected' : ''}`}
+                      >
+                        {queueFilter === 'active' ? (
+                          <span className="operator-drag" aria-hidden="true">
+                            ⠿
+                          </span>
+                        ) : null}
+                        <div>
+                          <b>
+                            {item.viewerName || '观众'} ·{' '}
+                            {queueStatusLabel(item.status)}
+                          </b>
+                          <small className="queue-source-room">
+                            {(item.sourcesSeen.length ? item.sourcesSeen : [item.source])
+                              .map(formatSourceRoom)
+                              .join(' / ')}
+                          </small>
+                          <p>{item.text}</p>
+                        </div>
+                        <button
+                          className="queue-delete"
+                          aria-label="删除此消息"
+                          onClick={(event) => {
+                            event.stopPropagation();
+                            props.onDeleteQueueItem(item.eventId);
+                          }}
+                        >
+                          删除
+                        </button>
+                      </article>
+                    ))
+                  ) : (
+                    <p className="empty-state">
+                      {queueFilter === 'replied'
+                        ? '暂时没有已回应的消息。'
+                        : queueFilter === 'skipped'
+                          ? '暂时没有未采用的消息。'
+                          : '新互动会先进入这里，LLM 会在播报空档前准备回复。'}
+                    </p>
+                  )}
+                </div>
+                <div
+                  className="message-list interaction-feed"
+                  aria-live="polite"
+                >
+                  {props.interactionEvents.length ? (
+                    props.interactionEvents.slice(0, 12).map((event) => (
+                      <article
+                        key={event.eventId}
+                        className={`interaction-card is-${event.stage}`}
+                      >
+                        <header>
+                          <span>{event.viewerName || '匿名观众'}</span>
+                          <small>
+                            {(event.sourcesSeen.length
+                              ? event.sourcesSeen
+                              : ['unknown']
+                            ).map(formatSourceRoom).join(' / ')}
+                          </small>
+                          <time>{formatEventTime(event.at)}</time>
+                        </header>
+                        <p>{event.text}</p>
+                        <footer>
+                          <b>{interactionStageLabels[event.stage]}</b>
+                          {event.dropReason ? (
+                            <small>
+                              {dropReasonLabels[event.dropReason] ||
+                                event.dropReason}
+                            </small>
+                          ) : null}
+                        </footer>
+                      </article>
+                    ))
+                  ) : (
+                    <p className="empty-state">
+                      互动接入后会在这里显示接收、筛选与回应结果。
+                    </p>
+                  )}
+                </div>
+                <div className="recent-broadcasts">
+                  <span>最近播出</span>
+                  {recentMessages
+                    .filter((message) => message.role === 'assistant')
+                    .slice(0, 2)
+                    .map((message) => (
+                      <p key={message.id}>{message.content}</p>
+                    ))}
+                </div>
+              </section>
+
+              <section className="console-panel program-panel">
+                <div className="panel-heading">
+                  <span>{selectedQueueItem ? '模型回复草稿' : '主播台词'}</span>
                   <small>
                     {selectedQueueItem
-                      ? selectedQueueItem.skills.length
-                        ? `已使用 ${selectedQueueItem.skills.join('、')}`
-                        : '未使用 Skills'
-                      : '输入内容将原样进入播报队列'}
+                      ? '点选左侧队列后查看与编辑'
+                      : '空闲时可直接安排主播说话'}
                   </small>
                 </div>
-                {selectedQueueItem && selectedReplyIsHistory ? (
-                  <div className="reply-history">
-                    <p className="reply-question">
-                      观众消息：{selectedQueueItem.text}
-                    </p>
-                    <article>
-                      <span>主播回复</span>
-                      <p>
-                        {selectedQueueItem.preparedReply ||
-                          '该条回复没有保留可展示文本。'}
-                      </p>
-                    </article>
-                    <dl>
-                      <div>
-                        <dt>观众等待时间</dt>
-                        <dd>{formatViewerWait(selectedQueueItem)}</dd>
-                      </div>
-                      <div>
-                        <dt>Skills</dt>
-                        <dd>
-                          {selectedQueueItem.skills.length
-                            ? `已使用 ${selectedQueueItem.skills.join('、')}`
-                            : '未使用 Skills'}
-                        </dd>
-                      </div>
-                    </dl>
-                  </div>
-                ) : selectedQueueItem && selectedQueueIsSkipped ? (
-                  <div className="reply-history">
-                    <p className="reply-question">
-                      观众消息：{selectedQueueItem.text}
-                    </p>
-                    <article>
-                      <span>未采用原因</span>
-                      <p>{skipReasonLabel(selectedQueueItem.skipReason)}</p>
-                    </article>
-                    <dl>
-                      <div>
-                        <dt>处理时间</dt>
-                        <dd>{formatEventTime(selectedQueueItem.updatedAt)}</dd>
-                      </div>
-                      <div>
-                        <dt>Skills</dt>
-                        <dd>未调用</dd>
-                      </div>
-                    </dl>
-                  </div>
-                ) : selectedQueueItem ? (
-                  <>
-                    <p className="reply-question">{selectedQueueItem.text}</p>
-                    <textarea
-                      value={replyDraft}
-                      placeholder={
-                        selectedQueueItem.status === 'preparing'
-                          ? 'LLM 正在准备回复…'
-                          : 'LLM 回复会显示在这里'
-                      }
-                      onChange={(event) => setReplyDraft(event.target.value)}
-                    />
-                    <button
-                      disabled={!replyDraft.trim()}
-                      onClick={() =>
-                        props.onEditQueueReply(
-                          selectedQueueItem.eventId,
-                          replyDraft,
-                        )
-                      }
-                    >
-                      保存待播回复
-                    </button>
-                  </>
-                ) : (
-                  <div className="idle-broadcast-editor">
-                    <p>
-                      当前没有待回复消息。输入主播接下来要说的话，发送后会直接进入现有播报队列。
-                    </p>
-                    <ChatInput
-                      onSend={props.onBroadcast}
-                      disabled={props.isProcessing}
-                      placeholder="输入主播要说的话（Enter 立即播报，Shift+Enter 换行）"
-                      sendLabel="安排播报"
-                    />
-                  </div>
-                )}
-              </div>
-              <div className="manual-send">
-                <div className="panel-heading">
-                  <span>手动播报</span>
-                  <small>直接送入当前安全链路</small>
-                </div>
-                <ChatInput
-                  onSend={props.onSend}
-                  disabled={props.isProcessing}
-                />
-              </div>
-              <div className="broadcast-pulse" aria-label="播出脉冲">
-                {['接入', '筛选', '生成', '语音', '头像', '播出'].map(
-                  (label, index) => (
-                    <span
-                      key={label}
-                      className={
-                        index <
-                        (props.isSpeaking ? 6 : props.isProcessing ? 3 : 1)
-                          ? 'is-complete'
-                          : ''
-                      }
-                    >
-                      {label}
-                    </span>
-                  ),
-                )}
-              </div>
-            </section>
-
-            <section className="console-panel system-panel">
-              <div className="panel-heading">
-                <span>运行预览</span>
-                <small>{props.settings.tts.engine}</small>
-              </div>
-              <div className="avatar-preview">
-                <AvatarBackground
-                  mouthLevel={props.mouthLevel}
-                  voiceLevel={props.voiceLevel}
-                  isSpeaking={props.isSpeaking}
-                  avatarPackage={props.avatarPackage}
-                  avatarReaction={props.avatarReaction}
-                  idleMotionEnabled={props.settings.visual.idleMotionEnabled}
-                  avatarViewTransform={props.avatarViewTransform}
-                  onAvatarViewTransformChange={
-                    props.onAvatarViewTransformChange
-                  }
-                  avatarMotion={props.avatarMotion}
-                  usePersonaLiveAvatar
-                  speakingAvatarVideoUrl={props.speakingAvatarVideoUrl}
-                />
-              </div>
-              <dl className="health-list">
-                <div>
-                  <dt>LLM</dt>
-                  <dd>就绪 · {props.settings.llm.model}</dd>
-                </div>
-                <div>
-                  <dt>TTS</dt>
-                  <dd>
-                    {props.isSpeaking ? '播放中' : '就绪'} ·{' '}
-                    {props.settings.tts.speaker || '未选择音色'}
-                  </dd>
-                </div>
-                <div>
-                  <dt>头像</dt>
-                  <dd>{props.isSpeaking ? '渲染中' : '待命'}</dd>
-                </div>
-                <div>
-                  <dt>消息总线</dt>
-                  <dd className={`health-${props.socialBusHealth}`}>
-                    {props.socialBusHealth === 'connected'
-                      ? 'SSN 已连接'
-                      : props.socialBusHealth === 'disabled'
-                        ? '未启用'
-                        : props.socialBusHealth}
-                  </dd>
-                </div>
-              </dl>
-              <aside className="broadcast-sidebar" aria-label="播出调度">
-                <div className="panel-heading">
-                  <span>当前播出</span>
-                  <small>{props.isSpeaking ? '播出中' : '待命'}</small>
-                </div>
-                <div className="sidebar-now">
-                  <b>{stage}</b>
+                <div className="program-stage">
+                  <span className="stage-label">NOW</span>
+                  <h1>{stage}</h1>
                   <p>
                     {props.partialResponse ||
                       (props.isSpeaking
-                        ? `${activeDigitalHuman?.displayName || '当前主播'}正在播出回复。`
-                        : '暂时没有正在播出的内容。')}
+                        ? `${activeDigitalHuman?.displayName || '当前主播'}正在播出当前回复。`
+                        : '等待新的互动或手动播报。')}
                   </p>
                 </div>
-                <div className="panel-heading next-reply-heading">
-                  <span>下一个待播回复</span>
-                  <small>
-                    {
-                      props.operatorQueue.filter(
-                        (item) => item.status === 'ready',
-                      ).length
-                    }{' '}
-                    条已准备
-                  </small>
-                </div>
-                <div className="sidebar-next-replies">
-                  {props.operatorQueue
-                    .filter((item) => item.status === 'ready')
-                    .slice(0, 3)
-                    .map((item) => (
-                      <article key={item.eventId}>
-                        <small>
-                          {item.viewerName || '观众'} ·{' '}
-                          {item.skills.length
-                            ? `已使用 ${item.skills.join('、')}`
-                            : '未使用 Skills'}
-                        </small>
-                        <p>{item.preparedReply || '等待 LLM 回复'}</p>
+                <div className="reply-editor">
+                  <div className="panel-heading">
+                    <span>
+                      {selectedReplyIsHistory
+                        ? '回复历史'
+                        : selectedQueueItem
+                          ? '待播回复'
+                          : '手动播报'}
+                    </span>
+                    <small>
+                      {selectedQueueItem
+                        ? selectedQueueItem.skills.length
+                          ? `已使用 ${selectedQueueItem.skills.join('、')}`
+                          : '未使用 Skills'
+                        : '输入内容将原样进入播报队列'}
+                    </small>
+                  </div>
+                  {selectedQueueItem && selectedReplyIsHistory ? (
+                    <div className="reply-history">
+                      <p className="reply-question">
+                        观众消息：{selectedQueueItem.text}
+                      </p>
+                      <article>
+                        <span>主播回复</span>
+                        <p>
+                          {selectedQueueItem.preparedReply ||
+                            '该条回复没有保留可展示文本。'}
+                        </p>
                       </article>
-                    ))}
-                  {!props.operatorQueue.some(
-                    (item) => item.status === 'ready',
-                  ) && <p className="empty-state">暂无已准备的待播回复。</p>}
+                      <dl>
+                        <div>
+                          <dt>观众等待时间</dt>
+                          <dd>{formatViewerWait(selectedQueueItem)}</dd>
+                        </div>
+                        <div>
+                          <dt>Skills</dt>
+                          <dd>
+                            {selectedQueueItem.skills.length
+                              ? `已使用 ${selectedQueueItem.skills.join('、')}`
+                              : '未使用 Skills'}
+                          </dd>
+                        </div>
+                      </dl>
+                    </div>
+                  ) : selectedQueueItem && selectedQueueIsSkipped ? (
+                    <div className="reply-history">
+                      <p className="reply-question">
+                        观众消息：{selectedQueueItem.text}
+                      </p>
+                      <article>
+                        <span>未采用原因</span>
+                        <p>{skipReasonLabel(selectedQueueItem.skipReason)}</p>
+                      </article>
+                      <dl>
+                        <div>
+                          <dt>处理时间</dt>
+                          <dd>
+                            {formatEventTime(selectedQueueItem.updatedAt)}
+                          </dd>
+                        </div>
+                        <div>
+                          <dt>Skills</dt>
+                          <dd>未调用</dd>
+                        </div>
+                      </dl>
+                    </div>
+                  ) : selectedQueueItem ? (
+                    <>
+                      <p className="reply-question">{selectedQueueItem.text}</p>
+                      <textarea
+                        value={replyDraft}
+                        placeholder={
+                          selectedQueueItem.status === 'preparing'
+                            ? 'LLM 正在准备回复…'
+                            : 'LLM 回复会显示在这里'
+                        }
+                        onChange={(event) => setReplyDraft(event.target.value)}
+                      />
+                      <button
+                        disabled={!replyDraft.trim()}
+                        onClick={() =>
+                          props.onEditQueueReply(
+                            selectedQueueItem.eventId,
+                            replyDraft,
+                          )
+                        }
+                      >
+                        保存待播回复
+                      </button>
+                    </>
+                  ) : (
+                    <div className="idle-broadcast-editor">
+                      <p>
+                        当前没有待回复消息。输入主播接下来要说的话，发送后会直接进入现有播报队列。
+                      </p>
+                      <ChatInput
+                        onSend={props.onBroadcast}
+                        disabled={props.isProcessing}
+                        placeholder="输入主播要说的话（Enter 立即播报，Shift+Enter 换行）"
+                        sendLabel="安排播报"
+                      />
+                    </div>
+                  )}
                 </div>
-                <div className="sidebar-manual">
+                <div className="manual-send">
+                  <div className="panel-heading">
+                    <span>手动播报</span>
+                    <small>直接送入当前安全链路</small>
+                  </div>
                   <ChatInput
                     onSend={props.onSend}
                     disabled={props.isProcessing}
                   />
                 </div>
-              </aside>
-            </section>
-          </div>
+                <div className="broadcast-pulse" aria-label="播出脉冲">
+                  {['接入', '筛选', '生成', '语音', '头像', '播出'].map(
+                    (label, index) => (
+                      <span
+                        key={label}
+                        className={
+                          index <
+                          (props.isSpeaking ? 6 : props.isProcessing ? 3 : 1)
+                            ? 'is-complete'
+                            : ''
+                        }
+                      >
+                        {label}
+                      </span>
+                    ),
+                  )}
+                </div>
+              </section>
+
+              <section className="console-panel system-panel">
+                <div className="panel-heading">
+                  <span>运行预览</span>
+                  <small>{props.settings.tts.engine}</small>
+                </div>
+                <div className="avatar-preview">
+                  <AvatarBackground
+                    mouthLevel={props.mouthLevel}
+                    voiceLevel={props.voiceLevel}
+                    isSpeaking={props.isSpeaking}
+                    avatarPackage={props.avatarPackage}
+                    avatarReaction={props.avatarReaction}
+                    idleMotionEnabled={props.settings.visual.idleMotionEnabled}
+                    avatarViewTransform={props.avatarViewTransform}
+                    onAvatarViewTransformChange={
+                      props.onAvatarViewTransformChange
+                    }
+                    avatarMotion={props.avatarMotion}
+                    usePersonaLiveAvatar
+                    speakingAvatarVideoUrl={props.speakingAvatarVideoUrl}
+                  />
+                </div>
+                <dl className="health-list">
+                  <div>
+                    <dt>LLM</dt>
+                    <dd>就绪 · {props.settings.llm.model}</dd>
+                  </div>
+                  <div>
+                    <dt>TTS</dt>
+                    <dd>
+                      {props.isSpeaking ? '播放中' : '就绪'} ·{' '}
+                      {props.settings.tts.speaker || '未选择音色'}
+                    </dd>
+                  </div>
+                  <div>
+                    <dt>头像</dt>
+                    <dd>{props.isSpeaking ? '渲染中' : '待命'}</dd>
+                  </div>
+                  <div>
+                    <dt>消息总线</dt>
+                    <dd className={`health-${props.socialBusHealth}`}>
+                      {props.socialBusHealth === 'connected'
+                        ? 'SSN 已连接'
+                        : props.socialBusHealth === 'disabled'
+                          ? '未启用'
+                          : props.socialBusHealth}
+                    </dd>
+                  </div>
+                </dl>
+                <aside className="broadcast-sidebar" aria-label="播出调度">
+                  <div className="panel-heading">
+                    <span>当前播出</span>
+                    <small>{props.isSpeaking ? '播出中' : '待命'}</small>
+                  </div>
+                  <div className="sidebar-now">
+                    <b>{stage}</b>
+                    <p>
+                      {props.partialResponse ||
+                        (props.isSpeaking
+                          ? `${activeDigitalHuman?.displayName || '当前主播'}正在播出回复。`
+                          : '暂时没有正在播出的内容。')}
+                    </p>
+                  </div>
+                  <div className="panel-heading next-reply-heading">
+                    <span>下一个待播回复</span>
+                    <small>
+                      {
+                        props.operatorQueue.filter(
+                          (item) => item.status === 'ready',
+                        ).length
+                      }{' '}
+                      条已准备
+                    </small>
+                  </div>
+                  <div className="sidebar-next-replies">
+                    {props.operatorQueue
+                      .filter((item) => item.status === 'ready')
+                      .slice(0, 3)
+                      .map((item) => (
+                        <article key={item.eventId}>
+                          <small>
+                            {item.viewerName || '观众'} ·{' '}
+                            {item.skills.length
+                              ? `已使用 ${item.skills.join('、')}`
+                              : '未使用 Skills'}
+                          </small>
+                          <p>{item.preparedReply || '等待 LLM 回复'}</p>
+                        </article>
+                      ))}
+                    {!props.operatorQueue.some(
+                      (item) => item.status === 'ready',
+                    ) && <p className="empty-state">暂无已准备的待播回复。</p>}
+                  </div>
+                  <div className="sidebar-manual">
+                    <ChatInput
+                      onSend={props.onSend}
+                      disabled={props.isProcessing}
+                    />
+                  </div>
+                </aside>
+              </section>
+            </div>
+          </>
         )}
 
         {workspace === 'memory' && (
@@ -1302,62 +1559,28 @@ export function ControlRoom(props: ControlRoomProps) {
         )}
         {workspace === 'config' && (
           <section className="workspace-card config-workspace">
-            <h1>平台与消息总线</h1>
-            <p>
-              SSN 是可选的外部消息接入层。它不会取得模型密钥、语音或头像控制权。
-            </p>
-            <label>
-              <input
-                type="checkbox"
-                checked={props.settings.socialStream.enabled}
-                onChange={(event) =>
-                  props.onUpdateSocialStream({ enabled: event.target.checked })
-                }
-              />{' '}
-              启用 Social Stream Ninja
-            </label>
-            <label>
-              Session ID
-              <input
-                value={props.settings.socialStream.sessionId}
-                onChange={(event) =>
-                  props.onUpdateSocialStream({ sessionId: event.target.value })
-                }
-                placeholder="SSN session ID"
-              />
-            </label>
-            <label>
-              消息总线地址
-              <input
-                value={props.settings.socialStream.serverUrl}
-                onChange={(event) =>
-                  props.onUpdateSocialStream({ serverUrl: event.target.value })
-                }
-              />
-            </label>
-            <div className="bus-platforms">
-              <span>交由 SSN 接入的平台</span>
-              {['youtube', 'twitch', 'bilibili', 'kick', 'tiktok'].map(
-                (platform) => (
-                  <label key={platform}>
-                    <input
-                      type="checkbox"
-                      checked={props.settings.socialStream.platforms.includes(
-                        platform,
-                      )}
-                      onChange={() => toggleBusPlatform(platform)}
-                    />{' '}
-                    {platform}
-                  </label>
-                ),
-              )}
+            <div className="connector-workspace-heading">
+              <div>
+                <span>LIVE SIGNAL ROUTER</span>
+                <h1>直播信号路由台</h1>
+              </div>
+              <p>
+                两个连接器同级运行；每个平台只允许一个连接器接管，所有事件共用回复、TTS
+                与数字人链路。
+              </p>
+              <button type="button" className="simulator-open-button" onClick={() => setSimulatorOpen((current) => !current)}>
+                {simulatorOpen ? '关闭模拟直播间' : '打开模拟直播间'}
+              </button>
             </div>
-            {props.socialBusError && (
-              <p className="config-error">{props.socialBusError}</p>
-            )}
-            <button onClick={props.onOpenLegacySettings}>
-              打开完整运行配置
-            </button>
+            <LiveConnectorConsole
+              settings={props.settings.liveConnectors}
+              ordinaryRoadStatus={props.ordinaryRoadStatus}
+              socialBusHealth={props.socialBusHealth}
+              socialBusError={props.socialBusError}
+              socialDiscoveredPlatforms={props.socialDiscoveredPlatforms}
+              onChange={props.onUpdateLiveConnectors}
+            />
+            {simulatorOpen && <SimulatorRoomConsole onEmit={props.onSimulateLiveRoomEvent} />}
           </section>
         )}
       </section>

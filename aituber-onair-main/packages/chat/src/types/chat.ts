@@ -67,3 +67,13 @@ export interface Screenplay {
   gaze?: AvatarGaze;
   gesture?: AvatarGesture;
 }
+
+export interface SpeechBeat extends Screenplay {
+  /** Safe boundary where a coordinator may stop before the next beat. */
+  interruptibleAfter: boolean;
+}
+
+export interface SpeechPlanV2 {
+  version: 2;
+  beats: SpeechBeat[];
+}

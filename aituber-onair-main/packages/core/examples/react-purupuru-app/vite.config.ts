@@ -31,10 +31,16 @@ const LIVE_RUNTIME_LOG_PATH = join(
   'logs',
   'linglan-live-runtime-events.jsonl',
 );
+const AUDIT_TRAIL_PATH = join(APP_ROOT, 'logs', 'linglan-audit-trail.jsonl');
 const OPERATOR_QUEUE_PATH = join(
   APP_ROOT,
   'logs',
   'linglan-operator-queue.json',
+);
+const ACCEPTANCE_LEDGER_PATH = join(
+  APP_ROOT,
+  '.runtime',
+  'acceptance-ledger.json',
 );
 const REPLY_LATENCY_LOG_PATH = join(
   WORKSPACE_ROOT,
@@ -49,6 +55,111 @@ const pendingTtsUpdates = new Map<
   { ttsStartAt?: number; ttsEndAt?: number }
 >();
 let historyMutationQueue: Promise<void> = Promise.resolve();
+let auditMutationQueue: Promise<void> = Promise.resolve();
+let auditSequence = 0;
+let auditPreviousHash = 'GENESIS';
+let auditStateLoaded = false;
+
+const SENSITIVE_AUDIT_KEY =
+  /(?:api[-_]?key|authorization|cookie|sessdata|bili_jct|csrf|token|secret|password|credential)/i;
+const SENSITIVE_INLINE_VALUE =
+  /((?:api[-_]?key|authorization|cookie|sessdata|bili_jct|csrf|token|secret|password|credential)\s*[:=]\s*)([^\s,;]+)/gi;
+
+function redactAuditValue(value: unknown, key = ''): unknown {
+  if (SENSITIVE_AUDIT_KEY.test(key)) {
+    const present =
+      typeof value === 'string' ? Boolean(value.trim()) : value != null;
+    return present ? '[REDACTED]' : value;
+  }
+  if (typeof value === 'string') {
+    return value.replace(SENSITIVE_INLINE_VALUE, '$1[REDACTED]');
+  }
+  if (Array.isArray(value)) {
+    return value.map((entry) => redactAuditValue(entry));
+  }
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(
+      Object.entries(value as Record<string, unknown>).map(
+        ([entryKey, entry]) => [entryKey, redactAuditValue(entry, entryKey)],
+      ),
+    );
+  }
+  return value;
+}
+
+async function loadAuditState() {
+  if (auditStateLoaded) return;
+  auditStateLoaded = true;
+  try {
+    const raw = await readFile(AUDIT_TRAIL_PATH, 'utf8');
+    const lastLine = raw.split(/\r?\n/).filter(Boolean).at(-1);
+    if (!lastLine) return;
+    const last = JSON.parse(lastLine) as {
+      sequence?: unknown;
+      entryHash?: unknown;
+    };
+    auditSequence = Math.max(0, Number(last.sequence) || 0);
+    auditPreviousHash =
+      typeof last.entryHash === 'string' && last.entryHash
+        ? last.entryHash
+        : 'GENESIS';
+  } catch {
+    // The first audit entry creates the file and starts a new hash chain.
+  }
+}
+
+function appendAuditEntry(event: Record<string, unknown>): Promise<void> {
+  auditMutationQueue = auditMutationQueue.then(async () => {
+    await loadAuditState();
+    const receivedAt = Date.now();
+    const sequence = ++auditSequence;
+    const safeEvent = redactAuditValue(event) as Record<string, unknown>;
+    const entryWithoutHash = {
+      ...safeEvent,
+      schemaVersion: 1,
+      auditId: `audit-${receivedAt}-${sequence}`,
+      sequence,
+      occurredAt: finiteTimestamp(safeEvent.occurredAt) ?? receivedAt,
+      receivedAt,
+      previousHash: auditPreviousHash,
+    };
+    const entryHash = createHash('sha256')
+      .update(JSON.stringify(entryWithoutHash))
+      .digest('hex');
+    const entry = { ...entryWithoutHash, entryHash };
+    await mkdir(join(AUDIT_TRAIL_PATH, '..'), { recursive: true });
+    await appendFile(AUDIT_TRAIL_PATH, `${JSON.stringify(entry)}\n`, 'utf8');
+    auditPreviousHash = entryHash;
+  });
+  return auditMutationQueue;
+}
+
+function verifyAuditEntries(entries: Record<string, unknown>[]) {
+  let previousHash = 'GENESIS';
+  for (const entry of entries) {
+    const { entryHash, ...entryWithoutHash } = entry;
+    const calculated = createHash('sha256')
+      .update(JSON.stringify(entryWithoutHash))
+      .digest('hex');
+    if (
+      entry.previousHash !== previousHash ||
+      typeof entryHash !== 'string' ||
+      entryHash !== calculated
+    ) {
+      return {
+        valid: false,
+        checkedEntries: entries.indexOf(entry),
+        firstInvalidSequence: entry.sequence ?? null,
+      };
+    }
+    previousHash = entryHash;
+  }
+  return {
+    valid: true,
+    checkedEntries: entries.length,
+    firstInvalidSequence: null,
+  };
+}
 const externalChatQueue = new Map<
   string,
   {
@@ -570,6 +681,17 @@ const liveRuntimeState = {
   reportedQueueDepth: 0,
   reportedOldestQueueAgeMs: 0,
   isSpeaking: false,
+  hostTelemetry: {} as Record<string, unknown>,
+  lastFaults: {} as Partial<
+    Record<
+      'model' | 'skill' | 'tts' | 'flashhead' | 'platform',
+      {
+        at: number;
+        stage: string;
+        reason?: string;
+      }
+    >
+  >,
 };
 
 function finiteTimestamp(value: unknown): number | undefined {
@@ -962,7 +1084,7 @@ function runtimeSettingsPlugin(): Plugin {
           size += chunk.length;
           if (size <= 1024 * 1024) chunks.push(chunk);
         });
-        req.on('end', () => {
+        req.on('end', async () => {
           if (size > 1024 * 1024) {
             res.statusCode = 413;
             res.end(JSON.stringify({ error: 'settings too large' }));
@@ -970,6 +1092,9 @@ function runtimeSettingsPlugin(): Plugin {
           }
           try {
             const raw = Buffer.concat(chunks).toString('utf8');
+            const previousSettings = runtimeSettings
+              ? (JSON.parse(runtimeSettings) as Record<string, unknown>)
+              : null;
             const next = JSON.parse(raw) as {
               tts?: {
                 speaker?: unknown;
@@ -1025,6 +1150,15 @@ function runtimeSettingsPlugin(): Plugin {
               next.tts.speaker = activeProfile.voiceSpeaker;
             }
             runtimeSettings = JSON.stringify(next);
+            await appendAuditEntry({
+              category: 'configuration',
+              action: 'runtime_settings_saved',
+              actor: { type: 'operator', id: 'control-room' },
+              occurredAt: Date.now(),
+              status: 'succeeded',
+              before: previousSettings,
+              after: next,
+            });
             res.statusCode = 204;
             res.end();
           } catch (error) {
@@ -1034,6 +1168,14 @@ function runtimeSettingsPlugin(): Plugin {
               error instanceof Error && error.message
                 ? error.message.slice(0, 160)
                 : 'unknown_settings_error';
+            void appendAuditEntry({
+              category: 'configuration',
+              action: 'runtime_settings_saved',
+              actor: { type: 'operator', id: 'control-room' },
+              occurredAt: Date.now(),
+              status: 'failed',
+              error: reason,
+            }).catch(() => undefined);
             res.statusCode = 400;
             res.end(
               JSON.stringify({
@@ -1073,6 +1215,8 @@ function minimaxAudioBridgePlugin(): Plugin {
           if (size <= 64 * 1024) chunks.push(chunk);
         });
         req.on('end', async () => {
+          let auditText = '';
+          const requestedAt = Date.now();
           try {
             if (size > 64 * 1024) throw new Error('tts_request_too_large');
             const request = JSON.parse(
@@ -1083,6 +1227,7 @@ function minimaxAudioBridgePlugin(): Plugin {
             const text =
               typeof request.text === 'string' ? request.text.trim() : '';
             if (!text) throw new Error('tts_text_missing');
+            auditText = text;
             const settings = JSON.parse(runtimeSettings || '{}') as {
               tts?: { minimaxApiKey?: unknown; speaker?: unknown };
             };
@@ -1137,21 +1282,117 @@ function minimaxAudioBridgePlugin(): Plugin {
             }
             const audio = Buffer.from(payload.data.audio, 'hex');
             if (audio.length < 16) throw new Error('minimax_audio_empty');
+            await appendAuditEntry({
+              category: 'tts',
+              action: 'minimax_synthesis',
+              actor: { type: 'system', id: 'minimax-audio-bridge' },
+              correlationId: `tts:${createHash('sha256')
+                .update(text)
+                .digest('hex')
+                .slice(0, 16)}:${requestedAt}`,
+              occurredAt: requestedAt,
+              status: 'succeeded',
+              request: { text, speaker, model: 'speech-2.8-turbo' },
+              result: {
+                httpStatus: upstream.status,
+                providerStatus: payload.base_resp?.status_code ?? 0,
+                audioByteLength: audio.length,
+              },
+            });
             res.statusCode = 200;
             res.setHeader('Content-Type', 'audio/mpeg');
             res.setHeader('Content-Length', String(audio.length));
             res.end(audio);
           } catch (error) {
+            const reason =
+              error instanceof Error
+                ? error.message.slice(0, 160)
+                : 'minimax_audio_bridge_failed';
+            void appendAuditEntry({
+              category: 'tts',
+              action: 'minimax_synthesis',
+              actor: { type: 'system', id: 'minimax-audio-bridge' },
+              correlationId: `tts:${createHash('sha256')
+                .update(auditText)
+                .digest('hex')
+                .slice(0, 16)}:${requestedAt}`,
+              occurredAt: requestedAt,
+              status: 'failed',
+              request: { text: auditText },
+              error: reason,
+            }).catch(() => undefined);
             res.statusCode = 502;
             res.setHeader('Content-Type', 'application/json; charset=utf-8');
             res.end(
               JSON.stringify({
-                error:
-                  error instanceof Error
-                    ? error.message.slice(0, 160)
-                    : 'minimax_audio_bridge_failed',
+                error: reason,
               }),
             );
+          }
+        });
+      });
+    },
+  };
+}
+
+/** A small semantic routing turn keeps domain tools out of ordinary chat. */
+function skillRoutingAgentPlugin(): Plugin {
+  return {
+    name: 'skill-routing-agent',
+    configureServer(server) {
+      server.middlewares.use('/api/skill-route', (req, res) => {
+        res.setHeader('Content-Type', 'application/json; charset=utf-8');
+        res.setHeader('Cache-Control', 'no-store');
+        if (req.method !== 'POST') {
+          res.statusCode = 405;
+          res.end(JSON.stringify({ error: 'method not allowed' }));
+          return;
+        }
+        const chunks: Buffer[] = [];
+        req.on('data', (chunk: Buffer) => chunks.push(chunk));
+        req.on('end', async () => {
+          try {
+            const body = JSON.parse(Buffer.concat(chunks).toString('utf8')) as {
+              text?: unknown; speaker?: unknown; turns?: unknown;
+            };
+            const settings = JSON.parse(runtimeSettings || '{}') as {
+              llm?: { provider?: unknown; model?: unknown; endpoint?: unknown; apiKeys?: Record<string, unknown> };
+            };
+            const endpoint = typeof settings.llm?.endpoint === 'string' ? settings.llm.endpoint.trim() : '';
+            const key = typeof settings.llm?.apiKeys?.['openai-compatible'] === 'string'
+              ? settings.llm.apiKeys['openai-compatible'].trim() : '';
+            if (!endpoint || !key || settings.llm?.provider !== 'openai-compatible') {
+              throw new Error('semantic_router_not_configured');
+            }
+            const upstream = await fetch(endpoint, {
+              method: 'POST',
+              headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                model: typeof settings.llm.model === 'string' ? settings.llm.model : 'MiniMax-M3',
+                temperature: 0,
+                reasoning_split: false,
+                max_completion_tokens: 220,
+                response_format: { type: 'json_object' },
+                messages: [{
+                  role: 'system',
+                  content: '你是直播间技能路由智能体。根据当前发言者身份、来源直播间与最近转写，判断是否必须重新查询台风/天气/雷达实时事实。只有明确问台风天气雷达，或同一观众正在追问上一条台风事实时 inheritTyphoon 才为 true。问候、心情、记忆、关系、闲聊，即使历史里出现台风或有相同时间词，也必须为 false。只输出 JSON：{"inheritTyphoon":boolean,"reason":"不超过25字"}。'
+                }, { role: 'user', content: JSON.stringify(body) }],
+              }),
+              signal: AbortSignal.timeout(8_000),
+            });
+            const payload = await upstream.json() as { choices?: Array<{ message?: { content?: unknown } }> };
+            const raw = payload.choices?.[0]?.message?.content;
+            if (!upstream.ok || typeof raw !== 'string') throw new Error('semantic_router_failed');
+            const cleaned = raw.replace(/^<think>[\s\S]*?<\/think>\s*/i, '').replace(/^```json\s*/i, '').replace(/```$/i, '').trim();
+            const start = cleaned.indexOf('{'); const end = cleaned.lastIndexOf('}');
+            const decision = JSON.parse(start >= 0 && end > start ? cleaned.slice(start, end + 1) : cleaned) as { inheritTyphoon?: unknown; reason?: unknown };
+            res.end(JSON.stringify({
+              inheritTyphoon: decision.inheritTyphoon === true,
+              reason: typeof decision.reason === 'string' ? decision.reason.slice(0, 100) : 'agent_route',
+            }));
+          } catch (error) {
+            res.statusCode = 503;
+            res.end(JSON.stringify({ error: error instanceof Error ? error.message : 'semantic_router_failed' }));
           }
         });
       });
@@ -1183,6 +1424,8 @@ function stressTestPlugin(): Plugin {
         const chunks: Buffer[] = [];
         req.on('data', (chunk: Buffer) => chunks.push(chunk));
         req.on('end', async () => {
+          let auditAction = 'start';
+          let auditRequest: Record<string, unknown> = {};
           try {
             const body = chunks.length
               ? (JSON.parse(Buffer.concat(chunks).toString('utf8')) as Record<
@@ -1191,6 +1434,8 @@ function stressTestPlugin(): Plugin {
                 >)
               : {};
             const action = String(body.action || 'start');
+            auditAction = action;
+            auditRequest = body;
             let ownerAvailability = runtimeOwnerAvailability();
             let claimedRuntimeOwner = false;
             const provisionalOwnerId = String(
@@ -1212,10 +1457,28 @@ function stressTestPlugin(): Plugin {
             if (action === 'start' || action === 'diagnose') {
               lastStressDiagnostics = await collectStressDiagnostics();
               if (action === 'diagnose') {
+                await appendAuditEntry({
+                  category: 'operator_control',
+                  action: 'stress_test_diagnose',
+                  actor: { type: 'operator', id: 'control-room' },
+                  occurredAt: Date.now(),
+                  status: 'succeeded',
+                  request: body,
+                  result: lastStressDiagnostics,
+                });
                 res.end(JSON.stringify({ diagnostics: lastStressDiagnostics }));
                 return;
               }
               if (!lastStressDiagnostics.ready) {
+                await appendAuditEntry({
+                  category: 'operator_control',
+                  action: `stress_test_${action}`,
+                  actor: { type: 'operator', id: 'control-room' },
+                  occurredAt: Date.now(),
+                  status: 'rejected',
+                  request: body,
+                  result: lastStressDiagnostics,
+                });
                 res.statusCode = 422;
                 res.end(
                   JSON.stringify({
@@ -1227,6 +1490,15 @@ function stressTestPlugin(): Plugin {
               }
             }
             if (action === 'start' && !ownerAvailability.active) {
+              await appendAuditEntry({
+                category: 'operator_control',
+                action: 'stress_test_start',
+                actor: { type: 'operator', id: 'control-room' },
+                occurredAt: Date.now(),
+                status: 'rejected',
+                request: body,
+                error: 'no_active_runtime_owner',
+              });
               res.statusCode = 409;
               res.end(
                 JSON.stringify({
@@ -1237,6 +1509,15 @@ function stressTestPlugin(): Plugin {
               return;
             }
             if (action === 'start' && !ownerAvailability.available) {
+              await appendAuditEntry({
+                category: 'operator_control',
+                action: 'stress_test_start',
+                actor: { type: 'operator', id: 'control-room' },
+                occurredAt: Date.now(),
+                status: 'rejected',
+                request: body,
+                error: 'runtime_owner_busy',
+              });
               res.statusCode = 409;
               res.end(
                 JSON.stringify({
@@ -1263,15 +1544,113 @@ function stressTestPlugin(): Plugin {
                         : (() => {
                             throw new Error('invalid stress action');
                           })();
+            await appendAuditEntry({
+              category: 'operator_control',
+              action: `stress_test_${action}`,
+              actor: { type: 'operator', id: 'control-room' },
+              occurredAt: Date.now(),
+              status: 'succeeded',
+              request: body,
+              result,
+            });
             res.end(JSON.stringify({ ...result, claimedRuntimeOwner }));
+          } catch (error) {
+            const reason =
+              error instanceof Error ? error.message : 'stress action failed';
+            void appendAuditEntry({
+              category: 'operator_control',
+              action: `stress_test_${auditAction}`,
+              actor: { type: 'operator', id: 'control-room' },
+              occurredAt: Date.now(),
+              status: 'failed',
+              request: auditRequest,
+              error: reason,
+            }).catch(() => undefined);
+            res.statusCode = 400;
+            res.end(
+              JSON.stringify({
+                error: reason,
+              }),
+            );
+          }
+        });
+      });
+    },
+  };
+}
+
+function acceptanceLedgerPlugin(): Plugin {
+  return {
+    name: 'acceptance-ledger',
+    configureServer(server) {
+      server.middlewares.use('/api/acceptance-ledger', (req, res) => {
+        res.setHeader('Content-Type', 'application/json; charset=utf-8');
+        res.setHeader('Cache-Control', 'no-store');
+        if (req.method === 'GET') {
+          void readFile(ACCEPTANCE_LEDGER_PATH, 'utf8')
+            .then((value) => res.end(value))
+            .catch(() =>
+              res.end(
+                JSON.stringify({ schemaVersion: 1, updatedAt: 0, results: {} }),
+              ),
+            );
+          return;
+        }
+        if (req.method !== 'POST' && req.method !== 'PATCH') {
+          res.statusCode = 405;
+          res.end(JSON.stringify({ error: 'method_not_allowed' }));
+          return;
+        }
+        const chunks: Buffer[] = [];
+        req.on('data', (chunk: Buffer) => chunks.push(chunk));
+        req.on('end', async () => {
+          try {
+            const result = JSON.parse(
+              Buffer.concat(chunks).toString('utf8'),
+            ) as Record<string, unknown>;
+            const scenarioId = String(result.scenarioId || '').trim();
+            const status = String(result.status || '');
+            const reasonCode = String(result.reasonCode || '').trim();
+            if (
+              !scenarioId ||
+              !reasonCode ||
+              !['passed', 'failed', 'skipped'].includes(status)
+            ) {
+              throw new Error('invalid_acceptance_result');
+            }
+            let current: {
+              schemaVersion: 1;
+              updatedAt: number;
+              results: Record<string, unknown>;
+            } = { schemaVersion: 1, updatedAt: 0, results: {} };
+            try {
+              current = JSON.parse(
+                await readFile(ACCEPTANCE_LEDGER_PATH, 'utf8'),
+              ) as typeof current;
+            } catch {
+              // First acceptance result creates the ignored runtime ledger.
+            }
+            const completedAt = Number(result.completedAt) || Date.now();
+            current.updatedAt = completedAt;
+            current.results[scenarioId] = {
+              ...result,
+              scenarioId,
+              status,
+              reasonCode,
+              completedAt,
+            };
+            await mkdir(dirname(ACCEPTANCE_LEDGER_PATH), { recursive: true });
+            await writeFile(
+              ACCEPTANCE_LEDGER_PATH,
+              `${JSON.stringify(current, null, 2)}\n`,
+              'utf8',
+            );
+            res.end(JSON.stringify(current));
           } catch (error) {
             res.statusCode = 400;
             res.end(
               JSON.stringify({
-                error:
-                  error instanceof Error
-                    ? error.message
-                    : 'stress action failed',
+                error: error instanceof Error ? error.message : 'invalid_body',
               }),
             );
           }
@@ -1362,6 +1741,15 @@ function liveRuntimeMonitorPlugin(): Plugin {
             lastGeneratedAt: liveRuntimeState.lastGeneratedAt || null,
             lastEventAt: liveRuntimeState.lastEventAt || null,
             isSpeaking: liveRuntimeState.isSpeaking,
+            host: liveRuntimeState.hostTelemetry,
+            lastFaults: liveRuntimeState.lastFaults,
+            recoveryCount:
+              Number(liveRuntimeState.hostTelemetry.recoveryCount) || 0,
+            unsupportedAvatarActionCount:
+              Number(
+                liveRuntimeState.hostTelemetry.unsupportedAvatarActionCount,
+              ) || 0,
+            repeatedReplyCount: liveRuntimeState.duplicateDrops,
             supervisor,
             alerts,
             acceptance30m,
@@ -1461,7 +1849,10 @@ function liveRuntimeMonitorPlugin(): Plugin {
         }
         const chunks: Buffer[] = [];
         req.on('data', (chunk: Buffer) => chunks.push(chunk));
-        req.on('end', () => {
+        req.on('end', async () => {
+          let auditBody: Record<string, unknown> = {};
+          let auditAction = req.method === 'POST' ? 'ingest' : 'unknown';
+          let auditBefore: OperatorQueueItem | null = null;
           try {
             const body = JSON.parse(
               Buffer.concat(chunks).toString('utf8'),
@@ -1469,6 +1860,12 @@ function liveRuntimeMonitorPlugin(): Plugin {
             const action = String(
               body.action || (req.method === 'POST' ? 'ingest' : ''),
             ).trim();
+            auditBody = body;
+            auditAction = action;
+            const auditEventId = String(body.eventId || '').trim();
+            auditBefore = auditEventId
+              ? structuredClone(operatorQueue.get(auditEventId) ?? null)
+              : null;
             const now = Date.now();
             if (action === 'ingest' || action === 'manual-broadcast') {
               const eventId = String(body.eventId || '').trim();
@@ -1631,6 +2028,14 @@ function liveRuntimeMonitorPlugin(): Plugin {
                     ? body.reason.trim()
                     : 'llm_no_reply';
                 item.finishReason = item.skipReason;
+              } else if (action === 'fail') {
+                item.status = 'failed';
+                item.finishReason =
+                  typeof body.reason === 'string' && body.reason.trim()
+                    ? body.reason.trim()
+                    : 'runtime_failed';
+                item.leaseOwnerId = undefined;
+                item.leaseExpiresAt = undefined;
               } else if (action === 'retry') {
                 item.retryCount = (item.retryCount || 0) + 1;
                 item.leaseOwnerId = undefined;
@@ -1806,7 +2211,40 @@ function liveRuntimeMonitorPlugin(): Plugin {
               item.updatedAt = now;
               normalizeOperatorQueueOrder();
             }
-            void persistOperatorQueue();
+            await persistOperatorQueue();
+            const eventId = String(body.eventId || '').trim();
+            const actorId =
+              typeof body.auditActor === 'string' && body.auditActor.trim()
+                ? body.auditActor.trim()
+                : ['manual-broadcast', 'delete', 'move', 'edit-reply'].includes(
+                      action,
+                    )
+                  ? 'control-room'
+                  : body.testRunId
+                    ? 'stress-test'
+                    : 'runtime';
+            await appendAuditEntry({
+              category: 'operator_queue',
+              action,
+              actor: {
+                type:
+                  actorId === 'control-room'
+                    ? 'operator'
+                    : actorId === 'stress-test'
+                      ? 'test'
+                      : 'system',
+                id: actorId,
+              },
+              correlationId: eventId || undefined,
+              eventId: eventId || undefined,
+              occurredAt: now,
+              status: 'succeeded',
+              request: body,
+              before: auditBefore,
+              after: eventId
+                ? structuredClone(operatorQueue.get(eventId) ?? null)
+                : null,
+            });
             res.end(
               JSON.stringify({
                 item: operatorQueue.get(String(body.eventId || '')),
@@ -1814,17 +2252,88 @@ function liveRuntimeMonitorPlugin(): Plugin {
               }),
             );
           } catch (error) {
+            const reason =
+              error instanceof Error ? error.message : 'invalid queue request';
+            void appendAuditEntry({
+              category: 'operator_queue',
+              action: auditAction,
+              actor: {
+                type: 'operator',
+                id:
+                  typeof auditBody.auditActor === 'string'
+                    ? auditBody.auditActor
+                    : 'unknown-client',
+              },
+              correlationId:
+                typeof auditBody.eventId === 'string'
+                  ? auditBody.eventId
+                  : undefined,
+              eventId:
+                typeof auditBody.eventId === 'string'
+                  ? auditBody.eventId
+                  : undefined,
+              occurredAt: Date.now(),
+              status: 'failed',
+              request: auditBody,
+              before: auditBefore,
+              error: reason,
+            }).catch(() => undefined);
             res.statusCode = 400;
             res.end(
               JSON.stringify({
-                error:
-                  error instanceof Error
-                    ? error.message
-                    : 'invalid queue request',
+                error: reason,
               }),
             );
           }
         });
+      });
+      server.middlewares.use('/api/audit-trail', (req, res) => {
+        res.setHeader('Content-Type', 'application/json; charset=utf-8');
+        res.setHeader('Cache-Control', 'no-store');
+        if (req.method !== 'GET') {
+          res.statusCode = 405;
+          res.end(JSON.stringify({ error: 'method not allowed' }));
+          return;
+        }
+        const requestUrl = new URL(req.url || '/', 'http://localhost');
+        const correlationId = requestUrl.searchParams.get('correlationId');
+        const requestedLimit = Number(requestUrl.searchParams.get('limit'));
+        const limit = Math.max(
+          1,
+          Math.min(
+            5000,
+            Number.isFinite(requestedLimit) ? requestedLimit : 500,
+          ),
+        );
+        void readFile(AUDIT_TRAIL_PATH, 'utf8')
+          .then((raw) => {
+            const allEntries = raw
+              .split(/\r?\n/)
+              .filter(Boolean)
+              .map((line) => JSON.parse(line) as Record<string, unknown>);
+            const integrity = verifyAuditEntries(allEntries);
+            const entries = allEntries
+              .filter(
+                (entry) =>
+                  !correlationId ||
+                  entry.correlationId === correlationId ||
+                  entry.eventId === correlationId,
+              )
+              .slice(-limit);
+            res.end(JSON.stringify({ entries, integrity }));
+          })
+          .catch(() =>
+            res.end(
+              JSON.stringify({
+                entries: [],
+                integrity: {
+                  valid: true,
+                  checkedEntries: 0,
+                  firstInvalidSequence: null,
+                },
+              }),
+            ),
+          );
       });
       server.middlewares.use('/api/live-runtime-events', (req, res) => {
         res.setHeader('Content-Type', 'application/json; charset=utf-8');
@@ -1872,6 +2381,19 @@ function liveRuntimeMonitorPlugin(): Plugin {
                   ttsConfigured: event.ttsConfigured === true,
                 });
               }
+              liveRuntimeState.hostTelemetry = {
+                hostPhase: event.hostPhase,
+                activeTurnId: event.activeTurnId,
+                targetViewerId: event.targetViewerId,
+                lastDecisionReason: event.lastDecisionReason,
+                proactiveRemaining: event.proactiveRemaining,
+                nextProactiveAt: event.nextProactiveAt,
+                currentBeatIndex: event.currentBeatIndex,
+                currentBeatInterruptible: event.currentBeatInterruptible,
+                recoveryCount: event.recoveryCount,
+                unsupportedAvatarActionCount:
+                  event.unsupportedAvatarActionCount,
+              };
             }
             if (typeof event.queueDepth === 'number') {
               liveRuntimeState.reportedQueueDepth = Math.max(
@@ -1912,7 +2434,9 @@ function liveRuntimeMonitorPlugin(): Plugin {
               liveRuntimeState.lastSpeechAt = now;
               liveRuntimeState.isSpeaking = true;
             }
-            if (stage === 'done' || stage === 'tts_rate_limit') {
+            if (
+              ['done', 'tts_rate_limit', 'failed', 'dropped'].includes(stage)
+            ) {
               liveRuntimeState.isSpeaking = false;
             }
             if (stage === 'sanitizer_failure') {
@@ -1920,6 +2444,41 @@ function liveRuntimeMonitorPlugin(): Plugin {
             }
             if (stage === 'tts_rate_limit') {
               liveRuntimeState.ttsRateLimitTimes.push(now);
+            }
+            const reason =
+              typeof event.reason === 'string'
+                ? event.reason
+                : typeof event.error === 'string'
+                  ? event.error
+                  : undefined;
+            if (
+              stage === 'model-truncated' ||
+              (stage === 'failed' &&
+                /generation|model|chat/i.test(reason || ''))
+            ) {
+              liveRuntimeState.lastFaults.model = { at: now, stage, reason };
+            }
+            if (stage.includes('skill') && /fail|timeout|error/.test(stage)) {
+              liveRuntimeState.lastFaults.skill = { at: now, stage, reason };
+            }
+            if (
+              stage.startsWith('tts-') &&
+              /error|failed|timeout|rate/.test(stage)
+            ) {
+              liveRuntimeState.lastFaults.tts = { at: now, stage, reason };
+            }
+            if (
+              stage.includes('flashhead') &&
+              /error|failed|timeout/.test(stage)
+            ) {
+              liveRuntimeState.lastFaults.flashhead = {
+                at: now,
+                stage,
+                reason,
+              };
+            }
+            if (stage === 'live_platform_delivery_failed') {
+              liveRuntimeState.lastFaults.platform = { at: now, stage, reason };
             }
             await mkdir(join(LIVE_RUNTIME_LOG_PATH, '..'), {
               recursive: true,
@@ -1929,6 +2488,23 @@ function liveRuntimeMonitorPlugin(): Plugin {
               `${JSON.stringify({ ...event, at: now })}\n`,
               'utf8',
             );
+            await appendAuditEntry({
+              category: 'runtime',
+              action: stage,
+              actor: redactAuditValue(
+                event.actor ?? {
+                  type: stage.startsWith('operator_') ? 'operator' : 'system',
+                  id: stage.startsWith('operator_')
+                    ? 'control-room'
+                    : 'runtime',
+                },
+              ),
+              correlationId: eventId === 'runtime' ? undefined : eventId,
+              eventId: eventId === 'runtime' ? undefined : eventId,
+              occurredAt: now,
+              status: 'succeeded',
+              payload: event,
+            });
             if (
               [
                 'fact_validation_rewrite',
@@ -2281,8 +2857,10 @@ export default defineConfig({
   plugins: [
     react(),
     conversationHistoryPlugin(),
+    acceptanceLedgerPlugin(),
     stressTestPlugin(),
     runtimeSettingsPlugin(),
+    skillRoutingAgentPlugin(),
     minimaxAudioBridgePlugin(),
     liveRuntimeMonitorPlugin(),
     typhoonContextPlugin(),
@@ -2327,6 +2905,14 @@ export default defineConfig({
         changeOrigin: true,
         rewrite: (path) => path.replace(/^\/api\/flashhead/, ''),
       },
+      '/api/live-connectors/ordinaryroad': {
+        target: process.env.BILIBILI_SUPERVISOR_URL || 'http://127.0.0.1:8197',
+        changeOrigin: true,
+        rewrite: (path) =>
+          path.replace(/^\/api\/live-connectors\/ordinaryroad/, ''),
+      },
+      // Compatibility alias for one migration cycle. It is no longer exposed
+      // as a Bilibili-native connector in the product UI.
       '/api/bilibili': {
         target: process.env.BILIBILI_SUPERVISOR_URL || 'http://127.0.0.1:8197',
         changeOrigin: true,

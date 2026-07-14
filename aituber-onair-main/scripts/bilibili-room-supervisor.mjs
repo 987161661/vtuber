@@ -16,6 +16,9 @@ const COMMENT_DEDUPLICATION_MS = 2 * 60_000;
 const CROSS_SOURCE_TEXT_DEDUPLICATION_MS = 90_000;
 const DEFAULT_DANMU_INTERVAL_MS = 1_600;
 const DEFAULT_DANMU_MAX_LENGTH = 20;
+const RUNTIME_AUDIT_URL =
+  process.env.LINGLAN_RUNTIME_AUDIT_URL ||
+  'http://127.0.0.1:5173/api/live-runtime-events';
 const DEFAULT_AUTH_FILE = resolve(
   dirname(fileURLToPath(import.meta.url)),
   '..',
@@ -311,6 +314,24 @@ const WBI_MIXIN_INDEX = [
 function log(level, message, details) {
   const entry = { at: new Date().toISOString(), level, message, ...details };
   console.log(JSON.stringify(entry));
+}
+
+function emitOutboundAudit(event) {
+  log(
+    event.stage?.endsWith('failed') ? 'error' : 'info',
+    `Bilibili outbound audit: ${event.stage}`,
+    { audit: event },
+  );
+  void fetch(RUNTIME_AUDIT_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      actor: { type: 'system', id: 'bilibili-supervisor' },
+      at: Date.now(),
+      ...event,
+    }),
+    signal: AbortSignal.timeout(1_500),
+  }).catch(() => undefined);
 }
 
 export function encodePacket(operation, payload = '', version = 1) {
@@ -1269,6 +1290,16 @@ export function createLocalServer(supervisor, port = DEFAULT_PORT) {
               String(payload?.message || ''),
               String(payload?.idempotencyKey || ''),
             );
+            emitOutboundAudit({
+              eventId: String(payload?.idempotencyKey || '').replace(
+                /^speech:/,
+                '',
+              ),
+              stage: 'bilibili_delivery_succeeded',
+              message: String(payload?.message || ''),
+              idempotencyKey: String(payload?.idempotencyKey || ''),
+              result,
+            });
             response.statusCode = 200;
             response.end(JSON.stringify(result));
           } catch (error) {
@@ -1282,6 +1313,25 @@ export function createLocalServer(supervisor, port = DEFAULT_PORT) {
                   : reason.startsWith('bilibili_send_rejected_')
                     ? 502
                     : 400;
+            let failedPayload = {};
+            try {
+              failedPayload = JSON.parse(
+                Buffer.concat(chunks).toString('utf8'),
+              );
+            } catch {
+              // Invalid requests still receive an audit record without input.
+            }
+            emitOutboundAudit({
+              eventId: String(failedPayload?.idempotencyKey || '').replace(
+                /^speech:/,
+                '',
+              ),
+              stage: 'bilibili_delivery_failed',
+              message: String(failedPayload?.message || ''),
+              idempotencyKey: String(failedPayload?.idempotencyKey || ''),
+              error: reason,
+              httpStatus: statusCode,
+            });
             response.statusCode = statusCode;
             response.end(JSON.stringify({ error: reason }));
           }

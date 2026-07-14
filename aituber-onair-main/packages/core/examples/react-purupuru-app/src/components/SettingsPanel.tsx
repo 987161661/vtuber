@@ -308,6 +308,7 @@ export function SettingsPanel({
   updateTwitchCommentIntervalMs,
   updateBilibiliEnabled,
   updateBilibiliReplyEnabled,
+  updateBilibiliGatewayUrl,
   updateCustomSseEndpoint,
   updateCustomSseEnabled,
   updateCommentIntelligenceEnabled,
@@ -480,18 +481,15 @@ export function SettingsPanel({
     const fetchMinimaxVoices = async () => {
       setIsFetchingMinimaxVoices(true);
       try {
-        const response = await fetch(
-          'https://api.minimaxi.com/v1/get_voice',
-          {
-            method: 'POST',
-            headers: {
-              Authorization: `Bearer ${apiKey}`,
-              'Content-Type': 'application/json',
-            },
-            body: JSON.stringify({ voice_type: 'all' }),
-            signal: controller.signal,
+        const response = await fetch('https://api.minimaxi.com/v1/get_voice', {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${apiKey}`,
+            'Content-Type': 'application/json',
           },
-        );
+          body: JSON.stringify({ voice_type: 'all' }),
+          signal: controller.signal,
+        });
 
         if (!response.ok) {
           throw new Error(`HTTP ${response.status}`);
@@ -506,7 +504,9 @@ export function SettingsPanel({
         if (controller.signal.aborted) return;
 
         if (payload.base_resp && payload.base_resp.status_code !== 0) {
-          throw new Error(payload.base_resp.status_msg || 'MiniMax API 返回错误');
+          throw new Error(
+            payload.base_resp.status_msg || 'MiniMax API 返回错误',
+          );
         }
 
         const voices = [
@@ -783,9 +783,7 @@ export function SettingsPanel({
 
             {settings.llm.provider === 'xai' && (
               <div className="settings-field">
-                <label htmlFor="xai-reasoning-effort">
-                  xAI 推理强度
-                </label>
+                <label htmlFor="xai-reasoning-effort">xAI 推理强度</label>
                 <select
                   id="xai-reasoning-effort"
                   value={xaiReasoningEffortValue}
@@ -904,9 +902,7 @@ export function SettingsPanel({
             {settings.llm.provider === 'gemini-nano' && (
               <>
                 <div className="settings-field">
-                  <small>
-                    Gemini Nano 使用浏览器内置 AI，无需 API 密钥。
-                  </small>
+                  <small>Gemini Nano 使用浏览器内置 AI，无需 API 密钥。</small>
                 </div>
                 <div className="settings-field">
                   <small>{geminiNano.statusText}</small>
@@ -920,15 +916,14 @@ export function SettingsPanel({
                       onClick={() => geminiNano.prepareModel()}
                       disabled={disabled || geminiNano.isPreparing}
                     >
-                      {geminiNano.isPreparing
-                        ? '正在准备……'
-                        : '准备模型'}
+                      {geminiNano.isPreparing ? '正在准备……' : '准备模型'}
                     </button>
                   )}
                   <small>
                     需要 Chrome 138 或更高版本。打开 `chrome://flags`，将
                     `#optimization-guide-on-device-model` 和
-                    `#prompt-api-for-gemini-nano` 设为 `Enabled`，然后重启 Chrome。
+                    `#prompt-api-for-gemini-nano` 设为 `Enabled`，然后重启
+                    Chrome。
                   </small>
                   <small>
                     启用上述标志后，点击“准备模型”即可开始下载。首次下载可能需要数分钟。
@@ -1090,9 +1085,7 @@ export function SettingsPanel({
                   />
                 </div>
                 <div className="settings-field">
-                  <label htmlFor="tts-gemini-prompt">
-                    语音风格提示词
-                  </label>
+                  <label htmlFor="tts-gemini-prompt">语音风格提示词</label>
                   <input
                     id="tts-gemini-prompt"
                     type="text"
@@ -1445,9 +1438,7 @@ export function SettingsPanel({
                   />
                 </div>
                 <div className="settings-field">
-                  <label htmlFor="tts-eleven-similarity">
-                    音色相似度增强
-                  </label>
+                  <label htmlFor="tts-eleven-similarity">音色相似度增强</label>
                   <input
                     id="tts-eleven-similarity"
                     type="number"
@@ -1511,9 +1502,7 @@ export function SettingsPanel({
                   />
                 </div>
                 <div className="settings-field">
-                  <label htmlFor="tts-eleven-speaker-boost">
-                    音色增强
-                  </label>
+                  <label htmlFor="tts-eleven-speaker-boost">音色增强</label>
                   <select
                     id="tts-eleven-speaker-boost"
                     value={settings.tts.elevenLabsUseSpeakerBoost || 'default'}
@@ -1531,9 +1520,7 @@ export function SettingsPanel({
                   </select>
                 </div>
                 <div className="settings-field">
-                  <label htmlFor="tts-eleven-normalization">
-                    文本规范化
-                  </label>
+                  <label htmlFor="tts-eleven-normalization">文本规范化</label>
                   <select
                     id="tts-eleven-normalization"
                     value={
@@ -1692,9 +1679,7 @@ export function SettingsPanel({
                   />
                 </div>
                 <div className="settings-field">
-                  <label htmlFor="tts-inworld-speaking-rate">
-                    语速
-                  </label>
+                  <label htmlFor="tts-inworld-speaking-rate">语速</label>
                   <input
                     id="tts-inworld-speaking-rate"
                     type="number"
@@ -1825,9 +1810,7 @@ export function SettingsPanel({
                   />
                 </div>
                 <div className="settings-field">
-                  <label htmlFor="tts-gradium-similarity">
-                    音色相似度
-                  </label>
+                  <label htmlFor="tts-gradium-similarity">音色相似度</label>
                   <input
                     id="tts-gradium-similarity"
                     type="number"
@@ -1948,8 +1931,9 @@ export function SettingsPanel({
                 </div>
                 <div className="settings-field">
                   <small>
-                    由于体积和第三方许可证限制，项目不包含运行时资源。请参考 README 中的 Piper Plus 安装说明，
-                    在 `public/piper/` 下放置 `dist/`、`src/`、`assets/` 和 `models/`。
+                    由于体积和第三方许可证限制，项目不包含运行时资源。请参考
+                    README 中的 Piper Plus 安装说明， 在 `public/piper/` 下放置
+                    `dist/`、`src/`、`assets/` 和 `models/`。
                   </small>
                 </div>
               </>
@@ -1973,9 +1957,7 @@ export function SettingsPanel({
                   />
                 </div>
                 <div className="settings-field">
-                  <label htmlFor="tts-openai-compatible-url">
-                    接口地址
-                  </label>
+                  <label htmlFor="tts-openai-compatible-url">接口地址</label>
                   <input
                     id="tts-openai-compatible-url"
                     type="text"
@@ -2187,9 +2169,7 @@ export function SettingsPanel({
                       </option>
                     ))}
                     {!settings.tts.minimaxApiKey && (
-                      <option value="">
-                        输入 API 密钥后获取音色列表
-                      </option>
+                      <option value="">输入 API 密钥后获取音色列表</option>
                     )}
                     {settings.tts.minimaxApiKey && isFetchingMinimaxVoices && (
                       <option value="">正在获取音色列表……</option>
@@ -2484,6 +2464,7 @@ export function SettingsPanel({
         updateTwitchCommentIntervalMs={updateTwitchCommentIntervalMs}
         updateBilibiliEnabled={updateBilibiliEnabled}
         updateBilibiliReplyEnabled={updateBilibiliReplyEnabled}
+        updateBilibiliGatewayUrl={updateBilibiliGatewayUrl}
         updateCustomSseEndpoint={updateCustomSseEndpoint}
         updateCustomSseEnabled={updateCustomSseEnabled}
         updateCommentIntelligenceEnabled={updateCommentIntelligenceEnabled}

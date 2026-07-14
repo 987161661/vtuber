@@ -24,6 +24,18 @@ import type { AppSettings } from '../types/settings';
 type Viewer = { id?: string; name?: string };
 const MICRO_SLEEP_INTERVAL = 15 * 60_000;
 
+function emitMemoryAudit(event: Record<string, unknown>) {
+  void fetch('/api/live-runtime-events', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      actor: { type: 'system', id: 'streamer-memory' },
+      at: Date.now(),
+      ...event,
+    }),
+  }).catch(() => undefined);
+}
+
 export interface StreamerMemoryApi {
   records: StreamerMemoryRecord[];
   lastConsolidatedAt: number;
@@ -180,7 +192,14 @@ export function useStreamerMemory(
 
   const persist = useCallback(
     async (record: StreamerMemoryRecord) => {
+      const before = await streamerMemoryStore.get(record.id);
       await streamerMemoryStore.put(record);
+      emitMemoryAudit({
+        eventId: `memory:${record.id}`,
+        stage: 'memory_record_upserted',
+        before: before ?? null,
+        after: record,
+      });
       await refresh();
     },
     [refresh],
@@ -206,6 +225,15 @@ export function useStreamerMemory(
         ]);
         setLastConsolidatedAt(Date.now());
         setLastSleepReport(result.report);
+        emitMemoryAudit({
+          eventId: `memory-sleep:${profile.id}:${result.report.completedAt}`,
+          stage: 'memory_sleep_completed',
+          digitalHumanId: profile.id,
+          mode,
+          beforeCount: current.length,
+          afterCount: result.records.length,
+          result: result.report,
+        });
         await refresh();
         return result.report;
       } finally {
@@ -399,41 +427,74 @@ export function useStreamerMemory(
       remove: async (id: string) => {
         const record = await streamerMemoryStore.get(id);
         if (!record?.protected) await streamerMemoryStore.remove(id);
+        emitMemoryAudit({
+          eventId: `memory:${id}`,
+          stage: record?.protected
+            ? 'memory_record_remove_rejected'
+            : 'memory_record_removed',
+          before: record ?? null,
+          reason: record?.protected ? 'protected' : undefined,
+        });
         await refresh();
       },
       removeDigitalHuman: async (digitalHumanId: string) => {
         const current = await streamerMemoryStore.list();
-        await Promise.all(
-          current
-            .filter((record) => record.digitalHumanId === digitalHumanId)
-            .map((record) => streamerMemoryStore.remove(record.id)),
+        const removed = current.filter(
+          (record) => record.digitalHumanId === digitalHumanId,
         );
+        await Promise.all(
+          removed.map((record) => streamerMemoryStore.remove(record.id)),
+        );
+        emitMemoryAudit({
+          eventId: `memory-digital-human:${digitalHumanId}`,
+          stage: 'memory_digital_human_removed',
+          digitalHumanId,
+          removed,
+        });
         await refresh();
       },
       removeViewer: async (viewerId: string) => {
         const current = await streamerMemoryStore.list();
-        await Promise.all(
-          current
-            .filter((record) => !record.protected && record.subjectId === viewerId)
-            .map((record) => streamerMemoryStore.remove(record.id)),
+        const removed = current.filter(
+          (record) => !record.protected && record.subjectId === viewerId,
         );
+        await Promise.all(
+          removed.map((record) => streamerMemoryStore.remove(record.id)),
+        );
+        emitMemoryAudit({
+          eventId: `memory-viewer:${viewerId}`,
+          stage: 'memory_viewer_removed',
+          viewerId,
+          removed,
+        });
         await refresh();
       },
       clear: async (scope?: StreamerMemoryRecord['scope']) => {
         const current = await streamerMemoryStore.list();
-        await Promise.all(
-          current
-            .filter(
-              (record) =>
-                !record.protected && (!scope || record.scope === scope),
-            )
-            .map((record) => streamerMemoryStore.remove(record.id)),
+        const removed = current.filter(
+          (record) => !record.protected && (!scope || record.scope === scope),
         );
+        await Promise.all(
+          removed.map((record) => streamerMemoryStore.remove(record.id)),
+        );
+        emitMemoryAudit({
+          eventId: `memory-clear:${scope ?? 'all'}:${Date.now()}`,
+          stage: 'memory_scope_cleared',
+          scope: scope ?? 'all',
+          removed,
+        });
         await refresh();
       },
       export: () => streamerMemoryStore.export(),
       import: async (imported: StreamerMemoryRecord[]) => {
+        const before = await streamerMemoryStore.list();
         await streamerMemoryStore.import(imported);
+        emitMemoryAudit({
+          eventId: `memory-import:${Date.now()}`,
+          stage: 'memory_archive_imported',
+          beforeCount: before.length,
+          imported,
+        });
         await refresh();
       },
     }),

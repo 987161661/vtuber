@@ -18,6 +18,7 @@ export type LiveDropReason =
   | 'overflow_merged'
   | 'expired'
   | 'analysis_filtered'
+  | 'audience_cooldown'
   | 'processing_error';
 
 export interface LiveLifecycleTransition {
@@ -70,6 +71,9 @@ interface SchedulerOptions {
   staleAfterMs?: number;
   expireAfterMs?: number;
   dedupeWindowMs?: number;
+  settleWindowMs?: number;
+  burstGroupThreshold?: number;
+  viewerCooldownMs?: number;
 }
 
 const LOW_INFORMATION =
@@ -114,9 +118,10 @@ function isSimilarTopic(left: string, right: string): boolean {
 
 function sourceOf(comment: LiveComment): string {
   return String(
-    comment.metadata?.source ||
-      comment.metadata?.command ||
+    comment.metadata?.platformId ||
       comment.metadata?.sourcePlatform ||
+      comment.metadata?.source ||
+      comment.metadata?.command ||
       comment.platform ||
       'unknown',
   );
@@ -133,6 +138,17 @@ function isPaid(comment: LiveComment): boolean {
   return Boolean(comment.metadata?.superChat);
 }
 
+type AudienceHeat = 'calm' | 'friction' | 'threat';
+
+function audienceHeat(text: string): AudienceHeat {
+  const value = normalizeText(text);
+  if (/(?:弄死|打死|杀了|砍死|捅死|威胁)/.test(value)) return 'threat';
+  if (/(?:找打|想打你|滚(?:开)?|草泥马|操你妈|来劲儿)/.test(value)) {
+    return 'friction';
+  }
+  return 'calm';
+}
+
 export function isLowInformationComment(comment: LiveComment): boolean {
   return LOW_INFORMATION.test(comment.text.trim());
 }
@@ -145,10 +161,14 @@ export class LiveResponseScheduler {
   private readonly staleAfterMs: number;
   private readonly expireAfterMs: number;
   private readonly dedupeWindowMs: number;
+  private readonly settleWindowMs: number;
+  private readonly burstGroupThreshold: number;
+  private readonly viewerCooldownMs: number;
   private readonly groups: QueueGroup[] = [];
   private readonly overflow: QueueGroup[] = [];
   private readonly seenIds = new Map<string, number>();
   private readonly seenText = new Map<string, number>();
+  private readonly viewerCooldowns = new Map<string, number>();
 
   constructor(options: SchedulerOptions = {}) {
     this.now = options.now ?? Date.now;
@@ -158,6 +178,9 @@ export class LiveResponseScheduler {
     this.staleAfterMs = options.staleAfterMs ?? 20_000;
     this.expireAfterMs = options.expireAfterMs ?? 30_000;
     this.dedupeWindowMs = options.dedupeWindowMs ?? 90_000;
+    this.settleWindowMs = options.settleWindowMs ?? 1_500;
+    this.burstGroupThreshold = options.burstGroupThreshold ?? 3;
+    this.viewerCooldownMs = options.viewerCooldownMs ?? 45_000;
   }
 
   get size(): number {
@@ -188,6 +211,18 @@ export class LiveResponseScheduler {
       group.comments.some(isPaid),
     );
     if (paidIndex >= 0) return this.selectAt(paidIndex, now, false);
+
+    // Let a short burst settle before choosing a spokesperson. This turns a
+    // room wave into one host response instead of a serial help-desk queue.
+    const newestAt = this.groups.reduce(
+      (latest, group) => Math.max(latest, group.receivedAt),
+      0,
+    );
+    if (now - newestAt < this.settleWindowMs) return undefined;
+
+    if (this.groups.length >= this.burstGroupThreshold) {
+      return this.selectCatchup(this.groups.slice(0, 5), now);
+    }
 
     const stale = [...this.overflow, ...this.groups].filter(
       (group) => now - group.commentAt >= this.staleAfterMs,
@@ -235,6 +270,24 @@ export class LiveResponseScheduler {
     const fingerprint = `${comment.metadata?.eventType || 'comment'}:${canonicalAuthor(comment)}:${normalized}`;
     const base = this.makeGroup(comment, receivedAt, now, fingerprint);
     this.emitGroup(base, 'received', now);
+
+    const author = canonicalAuthor(comment);
+    const cooldownUntil = this.viewerCooldowns.get(author) ?? 0;
+    if (cooldownUntil > now && !isPaid(comment)) {
+      this.emitGroup(base, 'dropped', now, { dropReason: 'audience_cooldown' });
+      return;
+    }
+    const heat = audienceHeat(comment.text);
+    if (heat === 'threat') {
+      this.viewerCooldowns.set(author, now + this.viewerCooldownMs);
+      this.emitGroup(base, 'dropped', now, { dropReason: 'audience_cooldown' });
+      return;
+    }
+    if (heat === 'friction') {
+      // A single sharp joke can receive one calm de-escalation. Further
+      // friction from the same viewer becomes a quiet moderation action.
+      this.viewerCooldowns.set(author, now + this.viewerCooldownMs);
+    }
 
     if (this.seenIds.has(comment.id)) {
       this.emitGroup(base, 'deduplicated', now, { dropReason: 'duplicate_id' });
@@ -456,6 +509,9 @@ export class LiveResponseScheduler {
       if (now - seenAt > this.dedupeWindowMs) {
         this.seenText.delete(fingerprint);
       }
+    }
+    for (const [author, until] of this.viewerCooldowns) {
+      if (until <= now) this.viewerCooldowns.delete(author);
     }
   }
 }

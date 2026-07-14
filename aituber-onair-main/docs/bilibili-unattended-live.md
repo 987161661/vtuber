@@ -1,53 +1,47 @@
-# 凌岚 B 站直播间自动化
+# 凌岚直播平台网关
 
-这条链路复用一个本地 Supervisor，同时承担两项能力：
+当前运行链路已从项目内的 B 站专用 Supervisor 切换为两层可组合架构：
 
-- 通过公开直播间长链和历史接口接收弹幕、醒目留言、礼物与进场事件。
-- 在显式开启后，用本机登录凭据把主播实际说出的文字同步发到 B 站弹幕区。
+- `ordinaryroad-gateway`：只负责 OrdinaryRoad B 站客户端、长连接事件解析和弹幕发送。
+- `live-platform-gateway.mjs`：负责项目统一的 SSE、健康检查、幂等、分段、限速和审计协议。
 
-接收链路不需要登录。发送链路需要 B 站账号登录凭据，但凭据只保存在工作区外层的
-`.runtime/bilibili-auth.json`，不会写入浏览器设置、日志或 Git。
+前端仍使用原有 `/api/bilibili/events`、`/api/bilibili/send` 和 `/api/bilibili/health`，端口仍为 `8197`，因此现有页面配置无需迁移。后续接入斗鱼等平台时，只需增加协议驱动，不需要复制整套 Supervisor。
 
-## 启动监听
+直播总控的“配置”页把 OrdinaryRoad 和 Social Stream Ninja 显示为两个独立连接器。两者同时接管 B 站时，SSN 负责入站消息，OrdinaryRoad 保持健康检查与文字回写；OrdinaryRoad 收到的重复入站事件不会进入主播队列。
 
-在项目根目录执行：
+## Cookie 无缝沿用
 
-```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .agents/skills/bilibili-live-automation/scripts/invoke-bilibili-automation.ps1 -Action configure -RoomId 12345678 -SelfUid 123456
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .agents/skills/bilibili-live-automation/scripts/invoke-bilibili-automation.ps1 -Action start
-```
+原有 Cookie 继续保存在工作区外层的 `.runtime/bilibili-auth.json`。新网关只接收这个文件的路径，并在发送前动态读取；Cookie 不会写入命令行、浏览器配置、日志或 Git。
 
-将示例数字替换为直播间号和用于发送弹幕的账号 UID。启动应用后，在
-`Settings -> Stream` 中选择 B 站并启用直播间监听。
-
-## 配置文字回发鉴权
-
-不要把 Cookie 发到聊天或命令行参数中。请在自己的 PowerShell 终端运行：
+已有 Cookie 不需要重新输入。需要更新时仍使用原命令：
 
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .agents/skills/bilibili-live-automation/scripts/invoke-bilibili-automation.ps1 -Action configure-auth
 ```
 
-在已登录的 `live.bilibili.com` 页面打开开发者工具，从任意 B 站直播请求的 Request
-Headers 中复制完整 `Cookie` 值，粘贴到隐藏输入框。Cookie 必须包含 `SESSDATA` 和
-`bili_jct`。Supervisor 会动态读取凭据，无需重启。
-
-随后在 `Settings -> Stream` 中开启“主播说话时同步发送文字到 B 站弹幕区”。该开关
-默认关闭；关闭即可立即回退到只监听和语音回复。
-
-清除本机凭据：
+Cookie 必须包含 `SESSDATA` 和 `bili_jct`。清除凭据：
 
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .agents/skills/bilibili-live-automation/scripts/invoke-bilibili-automation.ps1 -Action clear-auth
 ```
 
-## 发送保证
+## 构建与启动
 
-- 在真实 TTS 开始时发送一次最终净化文本，覆盖弹幕回复、主动搭话和总控手动播报；不发送流式半成品或压力测试文本。
-- 使用原始事件 ID 做幂等键；页面重复消费、TTS 重试不会重复发同一条回复。
-- 长回复按 Unicode 字符和标点切段，默认每段最多 20 字符、段间至少 1.6 秒。
-- 如果中途失败，重试会从尚未成功的分段继续。
-- 鉴权账号 UID 会自动加入自身事件过滤，避免数字人回复自己的弹幕形成循环。
+首次构建 Java 适配器：
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File ./Build-OrdinaryRoad-Gateway.ps1
+```
+
+正常运维继续使用原自动化命令：
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .agents/skills/bilibili-live-automation/scripts/invoke-bilibili-automation.ps1 -Action configure -RoomId 12345678 -SelfUid 123456
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .agents/skills/bilibili-live-automation/scripts/invoke-bilibili-automation.ps1 -Action start
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .agents/skills/bilibili-live-automation/scripts/invoke-bilibili-automation.ps1 -Action status
+```
+
+`Run-Bilibili-Supervisor.ps1` 被保留为兼容入口，但它现在委托给 `Run-Live-Platform-Gateway.ps1`。旧的 `scripts/bilibili-room-supervisor.mjs` 暂时保留，作为人工回滚参考，不再由启动器运行。
 
 ## 健康检查
 
@@ -55,17 +49,28 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .agents/skills/bilibili-
 Invoke-RestMethod http://127.0.0.1:8197/health
 ```
 
-`state: online` 表示接收长链已连接。`outbound.configured: true` 表示本机鉴权文件有效，
-首次发送前后 `outbound.authenticated` 会变为 `true`。健康接口不会返回 Cookie 或 CSRF。
+关键字段：
 
-运行日志位于：
+- `state: online`：OrdinaryRoad 直播间长连接已建立。
+- `bridgeEngine: ordinaryroad-live-chat-client`：已由新适配器接管。
+- `outbound.configured: true`：凭据文件结构可用。
+- `outbound.authenticated: true`：B 站已验证当前登录态。
 
-- `logs/bilibili-supervisor.out.log`
-- `logs/bilibili-supervisor.err.log`
+健康接口不会返回 Cookie 或 CSRF。新日志位于：
 
-## 边界
+- `logs/live-platform-gateway.out.log`
+- `logs/live-platform-gateway.err.log`
 
-- 发送使用 B 站网页播放器当前使用的 `/msg/send` 协议，不是开放平台承诺稳定的开发者
-  API；B 站升级网页协议后可能需要同步修改发送适配器。
-- 不自动执行公开测试弹幕。真实发言会影响直播间，必须由用户明确开启开关并触发回复。
-- 推流、OBS 自动重连、Windows 断电恢复和平台内容审核不由本脚本替代。
+## 发送保证
+
+- 只在真实 TTS 开始时发送一次最终净化文本，不发送流式半成品或压力测试文本。
+- 使用原始事件 ID 作为幂等键，页面重连和 TTS 重试不会重复发送同一回复。
+- 长回复按 Unicode 字符和标点切段，默认每段最多 20 个字符，分段限速发送。
+- 中途失败后仅重试尚未成功的分段。
+- 鉴权账号 UID 自动加入自身事件过滤，避免数字人回复自己的弹幕形成循环。
+
+## 审计与边界
+
+统一审计链仍位于 `logs/linglan-audit-trail.jsonl`，发送请求、幂等键、结果与失败原因都进入同一个关联事件；Cookie、Token 和密钥只记录为 `[REDACTED]`。
+
+B 站发送协议不是官方稳定开放 API，平台升级后可能需要更新 OrdinaryRoad 版本或适配器。系统不会自动发送公开测试弹幕；真实发言只会由用户启用文字同步并触发主播回复。推流、OBS 重连、Windows 断电恢复和平台内容审核不属于此网关职责。
