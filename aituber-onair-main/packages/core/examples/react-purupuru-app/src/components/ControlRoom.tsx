@@ -25,7 +25,7 @@ import {
   fetchMinimaxVoiceOptions,
   type MinimaxVoiceOption,
 } from '../lib/minimaxVoicePreview';
-import { StressTestPanel, type StressRunState } from './StressTestPanel';
+import type { StressRunState } from './StressTestPanel';
 import { LiveConnectorConsole } from './LiveConnectorConsole';
 import { SimulatorRoomConsole } from './SimulatorRoomConsole';
 import type { LiveHostSnapshot } from '@aituber-onair/live-companion';
@@ -33,7 +33,7 @@ import type { LiveHostSnapshot } from '@aituber-onair/live-companion';
 type Workspace =
   | 'avatars'
   | 'overview'
-  | 'stress'
+  | 'simulator'
   | 'memory'
   | 'insights'
   | 'config';
@@ -116,7 +116,7 @@ type RuntimeHealth = {
 const workspaceLabels: Record<Workspace, string> = {
   avatars: '数字人管理',
   overview: '总控',
-  stress: '压力测试',
+  simulator: '模拟直播间',
   memory: '记忆',
   insights: '洞察',
   config: '配置',
@@ -157,8 +157,11 @@ function formatEventTime(timestamp: number) {
   });
 }
 
-function sourceRoomLabel(source: string) {
+function sourceRoomLabel(source: string): string {
   if (source === 'simulator') return '模拟直播间 · sim-room-001';
+  if (source.startsWith('simulator:')) {
+    return `模拟直播间 · ${sourceRoomLabel(source.slice('simulator:'.length))}`;
+  }
   if (source === 'typhoon-radar' || source === 'parent-message') {
     return '台风 Boss 雷达 · 输入';
   }
@@ -258,7 +261,6 @@ function describeOperatorControl(
 
 export function ControlRoom(props: ControlRoomProps) {
   const [workspace, setWorkspace] = useState<Workspace>('overview');
-  const [simulatorOpen, setSimulatorOpen] = useState(false);
   const [radarInput, setRadarInput] = useState('');
   const [minimaxVoices, setMinimaxVoices] = useState<MinimaxVoiceOption[]>([]);
   const [voiceLoadError, setVoiceLoadError] = useState('');
@@ -1537,16 +1539,8 @@ export function ControlRoom(props: ControlRoomProps) {
             </div>
           </section>
         )}
-        {workspace === 'stress' && (
-          <StressTestPanel
-            stressRun={props.stressRun}
-            onDiagnose={props.onDiagnoseStressTest}
-            onStart={props.onStartStressTest}
-            onPause={props.onPauseStressTest}
-            onResume={props.onResumeStressTest}
-            onAbort={props.onAbortStressTest}
-            onCleanup={props.onCleanupStressTest}
-          />
+        {workspace === 'simulator' && (
+          <SimulatorRoomConsole onEmit={props.onSimulateLiveRoomEvent} />
         )}
         {workspace === 'insights' && (
           <section className="workspace-card">
@@ -1568,9 +1562,6 @@ export function ControlRoom(props: ControlRoomProps) {
                 两个连接器同级运行；每个平台只允许一个连接器接管，所有事件共用回复、TTS
                 与数字人链路。
               </p>
-              <button type="button" className="simulator-open-button" onClick={() => setSimulatorOpen((current) => !current)}>
-                {simulatorOpen ? '关闭模拟直播间' : '打开模拟直播间'}
-              </button>
             </div>
             <LiveConnectorConsole
               settings={props.settings.liveConnectors}
@@ -1580,7 +1571,6 @@ export function ControlRoom(props: ControlRoomProps) {
               socialDiscoveredPlatforms={props.socialDiscoveredPlatforms}
               onChange={props.onUpdateLiveConnectors}
             />
-            {simulatorOpen && <SimulatorRoomConsole onEmit={props.onSimulateLiveRoomEvent} />}
           </section>
         )}
       </section>

@@ -29,6 +29,7 @@ import {
   isQuietRoomInteraction,
 } from './lib/emptyRoomAwareness';
 import { parseFlashHeadBundle } from './lib/flashheadBundle';
+import { routeSimulatorEventForQueue } from './lib/simulatorRoom';
 import { routeTyphoonSkillWithAgent } from './lib/skillRoutingAgent';
 import { previewMinimaxVoice } from './lib/minimaxVoicePreview';
 import type { PuruPuruAvatarPackage } from './lib/purupuruPackage';
@@ -3302,7 +3303,7 @@ export default function App() {
       } else {
         cancelQueuedProactiveSpeech('engagement_waits_for_next_beat');
       }
-      enqueueLiveRoomEvents([comment]);
+      enqueueLiveRoomEvents([routeSimulatorEventForQueue(comment)]);
     },
     [
       cancelQueuedProactiveSpeech,
