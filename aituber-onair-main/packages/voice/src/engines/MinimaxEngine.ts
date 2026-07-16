@@ -262,12 +262,12 @@ export class MinimaxEngine implements VoiceEngine {
   } {
     return {
       voice_id: voiceId,
-      // Preserve the selected voice exactly as supplied by MiniMax. Mood is
-      // expressed by the text and the provider's emotion field, not synthetic
-      // speed, loudness, or pitch transformations in this application.
-      speed: 1,
-      vol: 1,
-      pitch: 0,
+      // Keep the adjustments deliberately narrow. They complement MiniMax's
+      // native emotion rendering rather than trying to fake acting through a
+      // different voice or large pitch shifts.
+      speed: this.voiceOverrides.speed ?? defaults.speed,
+      vol: this.voiceOverrides.vol ?? defaults.vol,
+      pitch: this.voiceOverrides.pitch ?? defaults.pitch,
       emotion: this.voiceOverrides.emotion ?? defaults.emotion,
     };
   }
@@ -435,6 +435,7 @@ export class MinimaxEngine implements VoiceEngine {
       talk.style || 'talk',
       talk.delivery,
       talk.emotionIntensity,
+      talk.prosody,
     );
 
     const requestBody = {
@@ -526,6 +527,7 @@ export class MinimaxEngine implements VoiceEngine {
       input.style || 'talk',
       input.delivery,
       input.emotionIntensity,
+      input.prosody,
     );
     const streamController = new AbortController();
     const requestTimer = setTimeout(() => streamController.abort(), 30_000);
@@ -747,18 +749,115 @@ export class MinimaxEngine implements VoiceEngine {
     emotion: string,
     delivery?: string,
     intensity = 0.5,
+    prosody?: Talk['prosody'],
   ): {
     speed: number;
     vol: number;
     pitch: number;
     emotion: string;
   } {
-    void delivery;
-    void intensity;
-    const normalizedEmotion =
-      emotion === 'talk' || emotion === 'relaxed' ? 'neutral' : emotion;
+    const strength = Math.min(1, Math.max(0, intensity));
+    const normalizedEmotion = emotion.toLowerCase().trim();
+    // MiniMax exposes a smaller emotion vocabulary than the host planner.
+    // Keep the planner's more specific label in the screenplay, translating
+    // it only at the provider boundary.
+    const providerEmotion =
+      normalizedEmotion === 'impatient'
+        ? 'angry'
+        : normalizedEmotion === 'embarrassed' || normalizedEmotion === 'awkward'
+          ? 'surprised'
+          : normalizedEmotion === 'talk' ||
+              normalizedEmotion === 'relaxed' ||
+              normalizedEmotion === 'bored'
+            ? 'neutral'
+            : ['happy', 'sad', 'angry', 'surprised', 'fearful', 'disgusted'].includes(
+                  normalizedEmotion,
+                )
+              ? normalizedEmotion
+              : 'neutral';
 
-    return { speed: 1, vol: 1, pitch: 0, emotion: normalizedEmotion };
+    const byDelivery: Record<string, { speed: number; vol: number; pitch: number }> = {
+      soft: { speed: 0.93, vol: 0.9, pitch: -1 },
+      warm: { speed: 0.96, vol: 0.96, pitch: 0 },
+      calm: { speed: 0.94, vol: 0.94, pitch: -1 },
+      serious: { speed: 0.9, vol: 0.94, pitch: -2 },
+      playful: { speed: 1.05, vol: 1.02, pitch: 1 },
+      teasing: { speed: 1.02, vol: 0.98, pitch: 1 },
+      excited: { speed: 1.08, vol: 1.05, pitch: 2 },
+      natural: { speed: 1, vol: 1, pitch: 0 },
+    };
+    const deliverySettings =
+      byDelivery[delivery?.toLowerCase().trim() || 'natural'] ??
+      byDelivery.natural;
+    const byEmotion: Record<string, { speed: number; vol: number; pitch: number }> = {
+      sad: { speed: -0.035, vol: -0.04, pitch: -1 },
+      angry: { speed: 0.03, vol: 0.025, pitch: 1 },
+      surprised: { speed: 0.045, vol: 0.025, pitch: 1 },
+      bored: { speed: -0.05, vol: -0.06, pitch: -1 },
+      impatient: { speed: 0.05, vol: 0, pitch: 0 },
+      embarrassed: { speed: -0.025, vol: -0.045, pitch: 0 },
+      awkward: { speed: -0.04, vol: -0.05, pitch: -1 },
+      serious: { speed: -0.04, vol: -0.02, pitch: -1 },
+    };
+    const emotionSettings = byEmotion[normalizedEmotion] ?? {
+      speed: 0,
+      vol: 0,
+      pitch: 0,
+    };
+    const acousticStrength = 0.45 + strength * 0.55;
+    const prosodyValue = (key: keyof NonNullable<Talk['prosody']>) =>
+      typeof prosody?.[key] === 'number'
+        ? Math.min(1, Math.max(-1, prosody[key] as number))
+        : 0;
+    const pace = prosodyValue('pace');
+    const pitch = prosodyValue('pitch');
+    const volume = prosodyValue('volume');
+    const warmth = prosodyValue('warmth');
+    const tension = prosodyValue('tension');
+    const energy = prosodyValue('energy');
+    const assertiveness = prosodyValue('assertiveness');
+    const breathiness = prosodyValue('breathiness');
+    return {
+      speed: Math.min(
+        1.15,
+        Math.max(
+          0.85,
+          deliverySettings.speed +
+            emotionSettings.speed * acousticStrength +
+            pace * 0.12 +
+            energy * 0.06 +
+            tension * 0.035 -
+            breathiness * 0.025,
+        ),
+      ),
+      vol: Math.min(
+        1.12,
+        Math.max(
+          0.85,
+          deliverySettings.vol +
+            emotionSettings.vol * acousticStrength +
+            volume * 0.12 +
+            energy * 0.05 +
+            assertiveness * 0.04 -
+            breathiness * 0.04,
+        ),
+      ),
+      pitch: Math.min(
+        4,
+        Math.max(
+          -4,
+          Math.round(
+            deliverySettings.pitch +
+              emotionSettings.pitch * acousticStrength +
+              pitch * 2 +
+              tension * 0.7 +
+              assertiveness * 0.35 -
+              warmth * 0.3,
+          ),
+        ),
+      ),
+      emotion: providerEmotion,
+    };
   }
 
   /**

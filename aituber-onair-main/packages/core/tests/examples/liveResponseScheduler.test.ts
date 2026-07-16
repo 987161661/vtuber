@@ -113,4 +113,26 @@ describe('LiveResponseScheduler', () => {
       transitions.filter((item) => item.dropReason === 'overflow_merged'),
     ).toHaveLength(9);
   });
+
+  it('keeps a bounded room brief while preserving the aggregate count', () => {
+    const now = 5_000_000;
+    const scheduler = new LiveResponseScheduler({
+      now: () => now,
+      settleWindowMs: 0,
+    });
+    scheduler.enqueue(
+      Array.from({ length: 100 }, (_, index) =>
+        comment(
+          `same-${index}`,
+          '主播你觉得这件事怎么样',
+          now + index,
+          `viewer-${index}`,
+        ),
+      ),
+    );
+    const selected = scheduler.dequeue();
+    expect(selected?.mergedCount).toBe(100);
+    expect(selected?.roomBatch.totalCount).toBe(100);
+    expect(selected?.roomBatch.samples.length).toBeLessThanOrEqual(12);
+  });
 });

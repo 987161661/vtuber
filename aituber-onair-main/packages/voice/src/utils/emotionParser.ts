@@ -71,7 +71,8 @@ export function emotionToTalkStyle(
   emotion?: string,
   fallback: TalkStyle = 'neutral',
 ): TalkStyle {
-  switch ((emotion || 'neutral').toLowerCase()) {
+  const normalizedEmotion = (emotion || 'neutral').toLowerCase();
+  switch (normalizedEmotion) {
     case 'angry':
       return 'angry';
     case 'happy':
@@ -80,8 +81,15 @@ export function emotionToTalkStyle(
       return 'sad';
     case 'surprised':
       return 'surprised';
+    case 'impatient':
+      return 'impatient';
+    case 'embarrassed':
+    case 'awkward':
+      return normalizedEmotion as TalkStyle;
+    case 'bored':
     case 'relaxed':
-      return 'talk';
+    case 'serious':
+      return normalizedEmotion as TalkStyle;
     default:
       return fallback;
   }

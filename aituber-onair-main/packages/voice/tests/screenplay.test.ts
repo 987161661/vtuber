@@ -28,7 +28,7 @@ describe('screenplay utilities', () => {
       ),
     ).toMatchObject({
       text: '安徽目前主要防强降雨。',
-      emotion: 'neutral',
+      emotion: 'serious',
     });
   });
 

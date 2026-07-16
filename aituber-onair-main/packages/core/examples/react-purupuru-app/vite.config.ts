@@ -212,6 +212,27 @@ type OperatorQueueStatus =
   | 'skipped'
   | 'failed'
   | 'deleted';
+type SanitizedRoomContext = {
+  totalCount: number;
+  participantCount: number;
+  catchup: boolean;
+  mergedCount: number;
+  laneCounts: Record<string, number>;
+  samples: Array<{
+    id: string;
+    viewerId: string;
+    viewerName: string;
+    text: string;
+    at: number;
+    hostile: boolean;
+    threat: boolean;
+    targetViewerId?: string;
+  }>;
+  conflictLevel: 'calm' | 'friction' | 'escalating' | 'attack';
+  ambiguous: boolean;
+  clearOffenderIds: string[];
+  observedAt: number;
+};
 type OperatorQueueItem = {
   eventId: string;
   text: string;
@@ -226,6 +247,7 @@ type OperatorQueueItem = {
   order: number;
   status: OperatorQueueStatus;
   preparedReply?: string;
+  preparedSpeechPlan?: PreparedSpeechPlan;
   preparedAt?: number;
   doneAt?: number;
   skipReason?: string;
@@ -255,7 +277,62 @@ type OperatorQueueItem = {
   relationshipVisitDelta?: number;
   otherViewerRelationshipMutated?: boolean;
   assignedOwnerId?: string;
+  roomContext?: SanitizedRoomContext;
 };
+type PreparedSpeechPlan = {
+  version: 2;
+  beats: Array<{
+    text: string;
+    ttsText?: string;
+    emotion?: string;
+    delivery?: string;
+    emotionIntensity?: number;
+    prosody?: Record<string, number>;
+    pauseAfterMs?: number;
+    motion?: string;
+    gaze?: string;
+    gesture?: string;
+    interruptibleAfter?: boolean;
+  }>;
+};
+
+function sanitizePreparedSpeechPlan(value: unknown): PreparedSpeechPlan | undefined {
+  if (!value || typeof value !== 'object') return undefined;
+  const source = value as { version?: unknown; beats?: unknown };
+  if (source.version !== 2 || !Array.isArray(source.beats)) return undefined;
+  const prosodyKeys = new Set([
+    'pace', 'pitch', 'volume', 'warmth', 'tension', 'energy',
+    'assertiveness', 'breathiness',
+  ]);
+  const beats = source.beats.slice(0, 3).flatMap((raw) => {
+    if (!raw || typeof raw !== 'object') return [];
+    const beat = raw as Record<string, unknown>;
+    const text = sanitizeSpeechText(String(beat.text || '')).slice(0, 1_200);
+    if (!text) return [];
+    const prosody = Object.fromEntries(
+      Object.entries((beat.prosody && typeof beat.prosody === 'object' && !Array.isArray(beat.prosody)
+        ? beat.prosody : {}) as Record<string, unknown>)
+        .filter(([key, number]) => prosodyKeys.has(key) && typeof number === 'number' && Number.isFinite(number))
+        .map(([key, number]) => [key, Math.min(1, Math.max(-1, number as number))]),
+    );
+    const string = (key: string, max = 80) =>
+      typeof beat[key] === 'string' ? beat[key].trim().slice(0, max) || undefined : undefined;
+    const numeric = (key: string, min: number, max: number) =>
+      typeof beat[key] === 'number' && Number.isFinite(beat[key])
+        ? Math.min(max, Math.max(min, beat[key] as number)) : undefined;
+    return [{
+      text,
+      ttsText: string('ttsText', 1_400),
+      emotion: string('emotion'), delivery: string('delivery'),
+      emotionIntensity: numeric('emotionIntensity', 0, 1),
+      prosody: Object.keys(prosody).length ? prosody : undefined,
+      pauseAfterMs: numeric('pauseAfterMs', 0, 2_500),
+      motion: string('motion'), gaze: string('gaze'), gesture: string('gesture'),
+      interruptibleAfter: typeof beat.interruptibleAfter === 'boolean' ? beat.interruptibleAfter : undefined,
+    }];
+  });
+  return beats.length ? { version: 2, beats } : undefined;
+}
 // The control-room tab and the overlay iframe do not share React state. This
 // small in-process queue is their explicit, authoritative control protocol.
 const operatorQueue = new Map<string, OperatorQueueItem>();
@@ -922,7 +999,7 @@ const liveRuntimeState = {
   hostTelemetry: {} as Record<string, unknown>,
   lastFaults: {} as Partial<
     Record<
-      'model' | 'skill' | 'tts' | 'flashhead' | 'platform',
+      'model' | 'skill' | 'tts' | 'flashhead' | 'platform' | 'director',
       {
         at: number;
         stage: string;
@@ -932,10 +1009,147 @@ const liveRuntimeState = {
   >,
 };
 
+// Client lifecycle events are best-effort. A browser refresh can lose the
+// terminal `done` event, so they must never outlive the authoritative operator
+// queue indefinitely and turn a historical turn into a false director stall.
+const RUNTIME_QUEUE_EVENT_TTL_MS = 2 * 60_000;
+
+function reconcileRuntimeQueueTelemetry(now: number) {
+  let reconciled = 0;
+  for (const [eventId, queuedAt] of liveRuntimeState.queued) {
+    if (now - queuedAt <= RUNTIME_QUEUE_EVENT_TTL_MS) continue;
+    liveRuntimeState.queued.delete(eventId);
+    reconciled += 1;
+  }
+  if (reconciled) {
+    liveRuntimeState.lastFaults.director = {
+      at: now,
+      stage: 'director_telemetry_reconciled',
+      reason: `cleared_${reconciled}_stale_client_queue_event(s)`,
+    };
+  }
+  return reconciled;
+}
+
 function finiteTimestamp(value: unknown): number | undefined {
   return typeof value === 'number' && Number.isFinite(value) && value > 0
     ? value
     : undefined;
+}
+
+function boundedInteger(value: unknown, max: number): number {
+  const number = Number(value);
+  return Number.isFinite(number)
+    ? Math.max(0, Math.min(max, Math.floor(number)))
+    : 0;
+}
+
+function sanitizeRoomContext(value: unknown): SanitizedRoomContext | undefined {
+  if (!value || typeof value !== 'object') return undefined;
+  const record = value as Record<string, unknown>;
+  const rawSamples = Array.isArray(record.samples) ? record.samples : [];
+  const samples = rawSamples.slice(0, 12).flatMap((sample) => {
+    if (!sample || typeof sample !== 'object') return [];
+    const entry = sample as Record<string, unknown>;
+    const text = typeof entry.text === 'string' ? entry.text.slice(0, 240) : '';
+    const viewerId =
+      typeof entry.viewerId === 'string' ? entry.viewerId.slice(0, 120) : '';
+    if (!text || !viewerId) return [];
+    return [{
+      id: typeof entry.id === 'string' ? entry.id.slice(0, 120) : '',
+      viewerId,
+      viewerName:
+        typeof entry.viewerName === 'string'
+          ? entry.viewerName.slice(0, 120)
+          : viewerId,
+      text,
+      at: finiteTimestamp(entry.at) ?? Date.now(),
+      hostile: entry.hostile === true,
+      threat: entry.threat === true,
+      targetViewerId:
+        typeof entry.targetViewerId === 'string'
+          ? entry.targetViewerId.slice(0, 120)
+          : undefined,
+    }];
+  });
+  const rawLanes =
+    record.laneCounts && typeof record.laneCounts === 'object'
+      ? Object.entries(record.laneCounts as Record<string, unknown>).slice(0, 8)
+      : [];
+  const conflictLevel = ['calm', 'friction', 'escalating', 'attack'].includes(
+    String(record.conflictLevel),
+  )
+    ? (record.conflictLevel as SanitizedRoomContext['conflictLevel'])
+    : 'calm';
+  return {
+    totalCount: boundedInteger(record.totalCount, 10_000),
+    participantCount: boundedInteger(record.participantCount, 10_000),
+    catchup: record.catchup === true,
+    mergedCount: boundedInteger(record.mergedCount, 10_000),
+    laneCounts: Object.fromEntries(
+      rawLanes.map(([key, count]) => [key.slice(0, 40), boundedInteger(count, 10_000)]),
+    ),
+    samples,
+    conflictLevel,
+    ambiguous: record.ambiguous === true,
+    clearOffenderIds: Array.isArray(record.clearOffenderIds)
+      ? record.clearOffenderIds
+          .filter((id): id is string => typeof id === 'string')
+          .slice(0, 12)
+          .map((id) => id.slice(0, 120))
+      : [],
+    observedAt: finiteTimestamp(record.observedAt) ?? Date.now(),
+  };
+}
+
+function mergeRoomContext(
+  current?: SanitizedRoomContext,
+  incoming?: SanitizedRoomContext,
+): SanitizedRoomContext | undefined {
+  if (!current) return incoming;
+  if (!incoming) return current;
+  const rank: Record<SanitizedRoomContext['conflictLevel'], number> = {
+    calm: 0,
+    friction: 1,
+    escalating: 2,
+    attack: 3,
+  };
+  const stronger =
+    rank[incoming.conflictLevel] > rank[current.conflictLevel]
+      ? incoming
+      : current;
+  const samples = new Map(
+    [...current.samples, ...incoming.samples].map((sample) => [sample.id, sample]),
+  );
+  const laneKeys = new Set([
+    ...Object.keys(current.laneCounts),
+    ...Object.keys(incoming.laneCounts),
+  ]);
+  return {
+    ...stronger,
+    totalCount: Math.max(current.totalCount, incoming.totalCount),
+    participantCount: Math.max(
+      current.participantCount,
+      incoming.participantCount,
+    ),
+    mergedCount: Math.max(current.mergedCount, incoming.mergedCount),
+    catchup: current.catchup || incoming.catchup,
+    laneCounts: Object.fromEntries(
+      [...laneKeys].map((lane) => [
+        lane,
+        Math.max(current.laneCounts[lane] ?? 0, incoming.laneCounts[lane] ?? 0),
+      ]),
+    ),
+    samples: [...samples.values()].slice(-12),
+    ambiguous: current.ambiguous || incoming.ambiguous,
+    clearOffenderIds: [
+      ...new Set([
+        ...current.clearOffenderIds,
+        ...incoming.clearOffenderIds,
+      ]),
+    ].slice(0, 12),
+    observedAt: Math.max(current.observedAt, incoming.observedAt),
+  };
 }
 
 function percentile(values: number[], ratio: number): number | null {
@@ -1703,6 +1917,123 @@ function skillRoutingAgentPlugin(): Plugin {
   };
 }
 
+/** Resolves only ambiguous social intent; it never writes dialogue or mutes users. */
+function personaPlanningAgentPlugin(): Plugin {
+  return {
+    name: 'persona-planning-agent',
+    configureServer(server) {
+      server.middlewares.use('/api/persona-plan', (req, res) => {
+        res.setHeader('Content-Type', 'application/json; charset=utf-8');
+        res.setHeader('Cache-Control', 'no-store');
+        if (req.method !== 'POST') {
+          res.statusCode = 405;
+          res.end(JSON.stringify({ error: 'method not allowed' }));
+          return;
+        }
+        const chunks: Buffer[] = [];
+        let byteLength = 0;
+        req.on('data', (chunk: Buffer) => {
+          byteLength += chunk.byteLength;
+          if (byteLength <= 16_384) chunks.push(chunk);
+        });
+        req.on('end', async () => {
+          try {
+            if (byteLength > 16_384) throw new Error('persona_request_too_large');
+            const body = JSON.parse(Buffer.concat(chunks).toString('utf8')) as Record<string, unknown>;
+            const text = typeof body.text === 'string' ? body.text.slice(0, 500) : '';
+            if (!text) throw new Error('persona_text_required');
+            const settings = JSON.parse(runtimeSettings || '{}') as {
+              llm?: {
+                provider?: unknown;
+                model?: unknown;
+                endpoint?: unknown;
+                apiKeys?: Record<string, unknown>;
+              };
+            };
+            const endpoint =
+              typeof settings.llm?.endpoint === 'string'
+                ? settings.llm.endpoint.trim()
+                : '';
+            const key =
+              typeof settings.llm?.apiKeys?.['openai-compatible'] === 'string'
+                ? settings.llm.apiKeys['openai-compatible'].trim()
+                : '';
+            if (!endpoint || !key || settings.llm?.provider !== 'openai-compatible') {
+              throw new Error('persona_agent_not_configured');
+            }
+            const upstream = await fetch(endpoint, {
+              method: 'POST',
+              headers: {
+                Authorization: `Bearer ${key}`,
+                'Content-Type': 'application/json',
+              },
+              signal: AbortSignal.timeout(1_900),
+              body: JSON.stringify({
+                model:
+                  typeof settings.llm.model === 'string'
+                    ? settings.llm.model
+                    : 'MiniMax-M3',
+                temperature: 0,
+                thinking: { type: 'disabled' },
+                max_completion_tokens: 220,
+                response_format: { type: 'json_object' },
+                messages: [
+                  {
+                    role: 'system',
+                    content:
+                      '你是直播人格互动的歧义判定器，不写台词。只判断社交场景、主播立场和动作。输出一个 JSON：{"scene":"casual|banter|boredom|praise|grief|distress|correction|advice_rejection|question|boundary|room_conflict|weather|urgent|variety|welcome|idle","stance":"cool_observer|playful_challenge|restrained_pride|quiet_support|accountable_softness|protective_boundary|professional_serious","primaryMove":"acknowledge|answer|join_bit|offer_choice|leave_space|clarify|correct_self|set_boundary|deescalate|welcome|invite_room","roomAction":"none|deescalate|skip","confidence":0到1,"reasonCode":"不超过40字"}。你无权禁言、封禁、改写安全结论、添加事实或输出主播台词。玩笑与攻击冲突时结合多人指向证据；没有充分证据不要把单人辱骂主播判为观众互吵。',
+                  },
+                  { role: 'user', content: JSON.stringify({ ...body, text }) },
+                ],
+              }),
+            });
+            const upstreamText = await upstream.text();
+            if (!upstream.ok || !upstreamText.trim()) {
+              throw new Error(`persona_agent_http_${upstream.status}`);
+            }
+            const payload = JSON.parse(upstreamText) as {
+              choices?: Array<{ message?: { content?: unknown } }>;
+            };
+            const raw = payload.choices?.[0]?.message?.content;
+            if (typeof raw !== 'string') throw new Error('persona_agent_missing_json');
+            const cleaned = raw
+              .replace(/^<think>[\s\S]*?<\/think>\s*/i, '')
+              .replace(/^```json\s*/i, '')
+              .replace(/```$/i, '')
+              .trim();
+            const start = cleaned.indexOf('{');
+            const end = cleaned.lastIndexOf('}');
+            const decision = JSON.parse(
+              start >= 0 && end > start ? cleaned.slice(start, end + 1) : cleaned,
+            ) as Record<string, unknown>;
+            // Keep the server response narrow. The browser performs the final
+            // enum validation and merges it into its deterministic local plan.
+            res.end(JSON.stringify({
+              scene: decision.scene,
+              stance: decision.stance,
+              primaryMove: decision.primaryMove,
+              roomAction: decision.roomAction,
+              confidence: decision.confidence,
+              reasonCode:
+                typeof decision.reasonCode === 'string'
+                  ? decision.reasonCode.slice(0, 80)
+                  : 'agent_refined',
+            }));
+          } catch (error) {
+            res.statusCode = 503;
+            res.end(JSON.stringify({
+              error:
+                error instanceof Error
+                  ? error.message
+                  : 'persona_agent_failed',
+            }));
+          }
+        });
+      });
+    },
+  };
+}
+
 function stressTestPlugin(): Plugin {
   return {
     name: 'live-stress-test',
@@ -1970,6 +2301,7 @@ function liveRuntimeMonitorPlugin(): Plugin {
       void restoreOperatorQueue();
       const sendHealth = async (res: ServerResponse) => {
         const now = Date.now();
+        const reconciledRuntimeQueueEvents = reconcileRuntimeQueueTelemetry(now);
         liveRuntimeState.ttsRateLimitTimes =
           liveRuntimeState.ttsRateLimitTimes.filter(
             (value) => now - value <= 60_000,
@@ -2002,21 +2334,31 @@ function liveRuntimeMonitorPlugin(): Plugin {
                 Math.min(...authoritativeQueue.map((item) => item.createdAt)),
             )
           : 0;
-        const oldestQueueAgeMs = Math.max(
-          measuredOldestAge,
-          liveRuntimeState.reportedOldestQueueAgeMs,
-          authoritativeOldestAge,
-        );
-        const queueDepth = Math.max(
-          liveRuntimeState.queued.size + externalChatQueue.size,
-          liveRuntimeState.reportedQueueDepth,
-          authoritativeQueue.length,
-        );
+        // The operator queue is authoritative. Client heartbeat values are a
+        // diagnostic fallback only while the browser is fresh; they cannot
+        // keep a completed queue non-empty after a reload or a missed event.
+        const hasAuthoritativeQueue = authoritativeQueue.length > 0;
+        const oldestQueueAgeMs = hasAuthoritativeQueue
+          ? Math.max(authoritativeOldestAge, measuredOldestAge)
+          : 0;
+        const queueDepth = hasAuthoritativeQueue
+          ? Math.max(authoritativeQueue.length, externalChatQueue.size)
+          : 0;
+        const hostPhase = String(liveRuntimeState.hostTelemetry.hostPhase || 'unknown');
+        const directorStatus =
+          hostPhase === 'offline'
+            ? 'stream_offline'
+            : hasAuthoritativeQueue
+              ? 'queue_active'
+              : 'idle';
         const alerts = [
           ...(runtimeOwnerAvailability(now).active
             ? []
             : ['runtime_owner_missing']),
           ...(oldestQueueAgeMs > 15_000 ? ['queue_wait_over_15s'] : []),
+          ...(directorStatus === 'stream_offline'
+            ? ['director_stream_offline']
+            : []),
           ...(authoritativeQueue.some(
             (item) =>
               item.status === 'preparing' &&
@@ -2049,6 +2391,8 @@ function liveRuntimeMonitorPlugin(): Plugin {
             isSpeaking: liveRuntimeState.isSpeaking,
             runtimeOwner: runtimeOwnerAvailability(now),
             host: liveRuntimeState.hostTelemetry,
+            directorStatus,
+            reconciledRuntimeQueueEvents,
             lastFaults: liveRuntimeState.lastFaults,
             recoveryCount:
               Number(liveRuntimeState.hostTelemetry.recoveryCount) || 0,
@@ -2207,6 +2551,9 @@ function liveRuntimeMonitorPlugin(): Plugin {
                 action === 'ingest' && typeof body.directReply === 'string'
                   ? body.directReply.trim()
                   : '';
+              const preparedSpeechPlan = sanitizePreparedSpeechPlan(
+                body.speechPlan,
+              );
               if (directReply.length > 500) throw new Error('invalid direct reply');
               if (action === 'manual-broadcast' && !manualReply) {
                 throw new Error('manual broadcast text is required');
@@ -2270,6 +2617,7 @@ function liveRuntimeMonitorPlugin(): Plugin {
                       : 'pending',
                   skipReason: repeatedByViewer ? 'duplicate_text' : undefined,
                   preparedReply: manualReply || directReply || undefined,
+                  preparedSpeechPlan,
                   preparedAt: manualReply || directReply ? now : undefined,
                   skills: [],
                   testRunId:
@@ -2286,6 +2634,7 @@ function liveRuntimeMonitorPlugin(): Plugin {
                   beatCount: manualReply || directReply
                     ? Math.max(
                         1,
+                        preparedSpeechPlan?.beats.length ??
                         (manualReply || directReply)
                           .split(/(?<=[。！？!?])/u)
                           .filter((part) => part.trim()).length,
@@ -2325,7 +2674,27 @@ function liveRuntimeMonitorPlugin(): Plugin {
                           ].includes(String(signal)),
                       )
                     : undefined,
+                  roomContext: sanitizeRoomContext(body.roomContext),
                 });
+              } else {
+                // Several open runtime pages can observe the same platform
+                // event. Keep queue ingestion idempotent and merge only the
+                // bounded room evidence; never reset an in-flight status.
+                const incomingRoomContext = sanitizeRoomContext(body.roomContext);
+                existing.roomContext = mergeRoomContext(
+                  existing.roomContext,
+                  incomingRoomContext,
+                );
+                existing.sourcesSeen = [
+                  ...new Set([
+                    ...existing.sourcesSeen,
+                    ...(Array.isArray(body.sourcesSeen)
+                      ? body.sourcesSeen.filter(
+                          (source): source is string => typeof source === 'string',
+                        )
+                      : []),
+                  ]),
+                ];
               }
             } else {
               const eventId = String(body.eventId || '').trim();
@@ -2461,6 +2830,9 @@ function liveRuntimeMonitorPlugin(): Plugin {
                   typeof body.reply === 'string'
                     ? body.reply.trim()
                     : item.preparedReply;
+                item.preparedSpeechPlan = sanitizePreparedSpeechPlan(
+                  body.speechPlan,
+                );
                 item.skills = Array.isArray(body.skills)
                   ? body.skills.filter(
                       (skill): skill is string => typeof skill === 'string',
@@ -2478,6 +2850,7 @@ function liveRuntimeMonitorPlugin(): Plugin {
                 if (item.preparedReply) {
                   item.beatCount = Math.max(
                     1,
+                    item.preparedSpeechPlan?.beats.length ??
                     item.preparedReply
                       .split(/(?<=[。！？!?])/u)
                       .filter((part) => part.trim()).length,
@@ -2738,10 +3111,7 @@ function liveRuntimeMonitorPlugin(): Plugin {
               };
             }
             if (typeof event.queueDepth === 'number') {
-              liveRuntimeState.reportedQueueDepth = Math.max(
-                0,
-                event.queueDepth,
-              );
+              liveRuntimeState.reportedQueueDepth = Math.max(0, event.queueDepth);
             }
             if (typeof event.oldestQueueAgeMs === 'number') {
               liveRuntimeState.reportedOldestQueueAgeMs = Math.max(
@@ -3230,6 +3600,7 @@ export default defineConfig({
     stressTestPlugin(),
     runtimeSettingsPlugin(),
     skillRoutingAgentPlugin(),
+    personaPlanningAgentPlugin(),
     minimaxAudioBridgePlugin(),
     liveRuntimeMonitorPlugin(),
     typhoonContextPlugin(),

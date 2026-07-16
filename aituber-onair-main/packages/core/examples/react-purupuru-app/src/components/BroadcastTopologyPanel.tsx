@@ -27,8 +27,8 @@ export type BroadcastRuntimeHealth = {
   lastFaults?: Partial<Record<'model' | 'skill' | 'tts' | 'flashhead' | 'platform', Fault>>;
 };
 
-type NodeId = 'viewer' | 'idle' | 'external' | 'manual' | 'director' | 'model' | 'queue' | 'tts' | 'behavior' | 'renderer' | 'playback';
-type EdgeId = 'viewer-director' | 'idle-director' | 'external-director' | 'manual-queue' | 'director-model' | 'model-queue' | 'queue-tts' | 'tts-behavior' | 'tts-renderer' | 'behavior-playback' | 'renderer-playback';
+type NodeId = 'viewer' | 'idle' | 'external' | 'manual' | 'director' | 'persona' | 'model' | 'queue' | 'tts' | 'behavior' | 'renderer' | 'playback';
+type EdgeId = 'viewer-director' | 'idle-director' | 'external-director' | 'manual-queue' | 'director-persona' | 'persona-model' | 'model-queue' | 'queue-tts' | 'tts-behavior' | 'tts-renderer' | 'behavior-playback' | 'renderer-playback';
 
 const nodes: Array<{ id: NodeId; label: string; meta: string; x: number; y: number; kind?: string }> = [
   { id: 'viewer', label: '观众弹幕', meta: '直播平台输入', x: 20, y: 28 },
@@ -36,11 +36,12 @@ const nodes: Array<{ id: NodeId; label: string; meta: string; x: number; y: numb
   { id: 'external', label: '外部信号', meta: '雷达 / 桥接', x: 20, y: 180 },
   { id: 'manual', label: '手动播送', meta: '总控直达', x: 20, y: 280, kind: 'manual' },
   { id: 'director', label: '演播导演', meta: '选择 · 排序 · 接管', x: 260, y: 110 },
-  { id: 'model', label: '模型生成', meta: '提示词与回复', x: 445, y: 110 },
-  { id: 'queue', label: '播放队列', meta: '技术队列 / 等待播出', x: 455, y: 270 },
-  { id: 'tts', label: 'TTS 音频', meta: '语音节拍', x: 665, y: 270 },
-  { id: 'behavior', label: '行为计划', meta: '表情 / 动作', x: 840, y: 165 },
-  { id: 'renderer', label: 'FlashHead', meta: '音频驱动渲染', x: 840, y: 300 },
+  { id: 'persona', label: '人格编排', meta: '立场 · 动作 · 声音', x: 410, y: 110 },
+  { id: 'model', label: '模型生成', meta: '提示词与回复', x: 560, y: 110 },
+  { id: 'queue', label: '播放队列', meta: '技术队列 / 等待播出', x: 570, y: 270 },
+  { id: 'tts', label: 'TTS 音频', meta: '语音节拍', x: 720, y: 270 },
+  { id: 'behavior', label: '行为计划', meta: '表情 / 动作', x: 865, y: 165 },
+  { id: 'renderer', label: 'FlashHead', meta: '音频驱动渲染', x: 865, y: 300 },
   { id: 'playback', label: '播放端', meta: '音画同步放送', x: 995, y: 232 },
 ];
 
@@ -48,14 +49,15 @@ const edges: Array<{ id: EdgeId; d: string; label?: string }> = [
   { id: 'viewer-director', d: 'M 148 58 C 210 58, 205 140, 260 140' },
   { id: 'idle-director', d: 'M 148 134 C 205 134, 205 140, 260 140' },
   { id: 'external-director', d: 'M 148 210 C 210 210, 205 140, 260 140' },
-  { id: 'manual-queue', d: 'M 148 310 C 285 310, 325 300, 455 300', label: '绕过演播导演与模型生成' },
-  { id: 'director-model', d: 'M 388 140 L 445 140' },
-  { id: 'model-queue', d: 'M 573 140 C 625 140, 615 300, 583 300' },
-  { id: 'queue-tts', d: 'M 583 300 L 665 300' },
-  { id: 'tts-behavior', d: 'M 793 300 C 820 300, 810 195, 840 195' },
-  { id: 'tts-renderer', d: 'M 793 300 L 840 330' },
-  { id: 'behavior-playback', d: 'M 968 195 C 990 195, 978 262, 995 262' },
-  { id: 'renderer-playback', d: 'M 968 330 C 990 330, 978 262, 995 262' },
+  { id: 'manual-queue', d: 'M 148 310 C 330 310, 390 300, 570 300', label: '绕过演播导演、人格编排与模型生成' },
+  { id: 'director-persona', d: 'M 388 140 L 410 140' },
+  { id: 'persona-model', d: 'M 538 140 L 560 140' },
+  { id: 'model-queue', d: 'M 688 140 C 725 140, 700 300, 698 300' },
+  { id: 'queue-tts', d: 'M 698 300 L 720 300' },
+  { id: 'tts-behavior', d: 'M 848 300 C 875 300, 835 195, 865 195' },
+  { id: 'tts-renderer', d: 'M 848 300 L 865 330' },
+  { id: 'behavior-playback', d: 'M 993 195 C 1015 195, 978 262, 995 262' },
+  { id: 'renderer-playback', d: 'M 993 330 C 1015 330, 978 262, 995 262' },
 ];
 
 function isProductionEvent(event: BroadcastRuntimeEvent) {
@@ -66,6 +68,7 @@ function isProductionEvent(event: BroadcastRuntimeEvent) {
     'selected', 'generated', 'started', 'speaking', 'tts_first_audio',
     'completed', 'done', 'dropped', 'failed', 'interrupted',
   ].includes(stage)
+    || stage.startsWith('persona_plan_')
     || stage.startsWith('tts-')
     || stage.startsWith('model_')
     || stage.includes('avatar_action')
@@ -93,7 +96,14 @@ function routeFor(event?: BroadcastRuntimeEvent, queueItem?: OperatorQueueItem) 
   if (stage === 'received' || stage === 'queued' || stage === 'proactive-selected') {
     activeEdges = source === 'manual' ? ['manual-queue'] : [`${source}-director` as EdgeId];
   } else if (stage === 'program_decision' || stage === 'selected') {
-    node = 'director'; activeEdges = ['director-model'];
+    node = 'director'; activeEdges = ['director-persona'];
+  } else if (stage.startsWith('persona_plan_')) {
+    node = 'persona';
+    activeEdges = stage === 'persona_plan_started'
+      ? ['director-persona']
+      : stage === 'persona_plan_skipped'
+        ? []
+        : ['persona-model'];
   } else if (stage === 'generating' || stage.startsWith('model_')) {
     node = 'model';
   } else if (stage === 'generated') {
@@ -125,7 +135,7 @@ function clockTime(value?: number) {
 }
 
 function isTerminalStage(stage?: string) {
-  return stage === 'completed' || stage === 'done' || stage === 'failed' || stage === 'dropped' || stage === 'interrupted';
+  return stage === 'completed' || stage === 'done' || stage === 'failed' || stage === 'dropped' || stage === 'interrupted' || stage === 'persona_plan_skipped';
 }
 
 function nodeTimings(record?: BroadcastTraceRecord) {
@@ -145,6 +155,11 @@ function nodeTimings(record?: BroadcastTraceRecord) {
 export function BroadcastTopologyPanel({ records, queue, health, events }: { records: BroadcastTraceRecord[]; queue: OperatorQueueItem[]; health: BroadcastRuntimeHealth; events: BroadcastRuntimeEvent[] }) {
   const [detail, setDetail] = useState<{ title: string; text: string } | null>(null);
   const [copied, setCopied] = useState(false);
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    const timer = window.setInterval(() => setNow(Date.now()), 1_000);
+    return () => window.clearInterval(timer);
+  }, []);
   const activeItem = queue.find((entry) => ['preparing', 'ready', 'speaking'].includes(entry.status));
   const productionEvents = events.filter(isProductionEvent);
   const event = activeItem
@@ -172,7 +187,7 @@ export function BroadcastTopologyPanel({ records, queue, health, events }: { rec
     return () => window.removeEventListener('keydown', closeOnEscape);
   }, [detail]);
   const nodeFaults = new Map<NodeId, Fault>();
-  const freshFault = (fault?: Fault) => fault && Date.now() - fault.at < 120_000 ? fault : undefined;
+  const freshFault = (fault?: Fault) => fault && now - fault.at < 120_000 ? fault : undefined;
   const platformFault = freshFault(health.lastFaults?.platform);
   const modelFault = freshFault(health.lastFaults?.model) || freshFault(health.lastFaults?.skill);
   const ttsFault = freshFault(health.lastFaults?.tts);
@@ -181,7 +196,7 @@ export function BroadcastTopologyPanel({ records, queue, health, events }: { rec
   if (modelFault) nodeFaults.set('model', modelFault);
   if (ttsFault) nodeFaults.set('tts', ttsFault);
   if (rendererFault) nodeFaults.set('renderer', rendererFault);
-  const itemAge = item ? Date.now() - item.updatedAt : 0;
+  const itemAge = item ? now - item.updatedAt : 0;
   if (item?.status === 'preparing' && itemAge > 8_000 && !nodeFaults.has('model')) {
     nodeFaults.set('model', { at: item.updatedAt, stage: 'generation_timeout', reason: `回合 ${item.eventId} 已在模型生成节点停留 ${ms(itemAge)}。` });
   }
@@ -213,7 +228,7 @@ export function BroadcastTopologyPanel({ records, queue, health, events }: { rec
         const fault = nodeFaults.get(node.id);
         return <button type="button" key={node.id} className={`bt-node bt-node-${node.id} ${route.node === node.id ? 'is-live' : ''} ${fault ? 'is-fault' : ''}`} style={{ left: `${node.x / 11.4}%`, top: `${node.y / 3.8}%` }} onClick={() => fault && setDetail({ title: `节点故障：${node.label} / ${fault.stage}`, text: fault.reason || '该节点报告故障，但没有附带更多原因。' })}><i/><strong>{node.label}</strong><small>{node.meta}</small></button>;
       })}
-      {edgeFault && <button type="button" className={`bt-breakpoint bt-breakpoint-${edgeFault}`} onClick={() => setDetail({ title: `链路断点：${edgeFault}`, text: `事件 ${item?.eventId || '未知'} 在 ${item?.status || '传递'} 状态停留 ${ms(Date.now() - (item?.updatedAt || Date.now()))}。` })}>!</button>}
+      {edgeFault && <button type="button" className={`bt-breakpoint bt-breakpoint-${edgeFault}`} onClick={() => setDetail({ title: `链路断点：${edgeFault}`, text: `事件 ${item?.eventId || '未知'} 在 ${item?.status || '传递'} 状态停留 ${ms(now - (item?.updatedAt || now))}。` })}>!</button>}
     </div>
     <div className="bt-legend"><span><i className="node"/>节点执行</span><span><i className="edge"/>链路传递</span><span><i className="node-fault"/>节点故障</span><span><i className="edge-fault"/>链路中断</span></div>
     <div className="pipeline-history"><div className="pipeline-history-heading"><strong>最近放送</strong><small>真实完成记录</small></div>{records.slice(0, 6).map((record) => <article key={record.requestId}><time>{record.inputAt ? new Date(record.inputAt).toLocaleTimeString('zh-CN') : '—'}</time><p>{record.input || record.eventId || record.requestId}</p><span>{ms(record.inputToEndMs)}</span><em>{record.firstPlaybackAt ? '已放送' : '未完成'}</em></article>)}</div>

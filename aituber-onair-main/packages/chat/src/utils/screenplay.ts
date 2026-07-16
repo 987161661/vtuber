@@ -8,6 +8,11 @@ const ALLOWED_EMOTIONS = new Set([
   'angry',
   'surprised',
   'relaxed',
+  'bored',
+  'impatient',
+  'embarrassed',
+  'awkward',
+  'serious',
 ]);
 const ALLOWED_DELIVERIES = new Set([
   'natural',
@@ -24,6 +29,7 @@ const ALLOWED_VOCAL_TAGS = new Set([
   'chuckle',
   'coughs',
   'clear-throat',
+  'groans',
   'breath',
   'pant',
   'inhale',
@@ -32,8 +38,12 @@ const ALLOWED_VOCAL_TAGS = new Set([
   'sniffs',
   'sighs',
   'snorts',
+  'burps',
+  'lip-smacking',
   'humming',
+  'hissing',
   'emm',
+  'sneezes',
 ]);
 const ALLOWED_MOTIONS = new Set([
   'idle_cold',
@@ -47,6 +57,30 @@ const ALLOWED_MOTIONS = new Set([
 ]);
 const ALLOWED_GAZES = new Set(['camera', 'left', 'right', 'down']);
 const ALLOWED_GESTURES = new Set(['still', 'subtle', 'expressive']);
+const PROSODY_KEYS = [
+  'pace',
+  'pitch',
+  'volume',
+  'warmth',
+  'tension',
+  'energy',
+  'assertiveness',
+  'breathiness',
+] as const;
+
+function normalizeProsody(value: unknown): Screenplay['prosody'] | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return undefined;
+  }
+  const normalized: NonNullable<Screenplay['prosody']> = {};
+  for (const key of PROSODY_KEYS) {
+    const candidate = (value as Record<string, unknown>)[key];
+    if (typeof candidate === 'number' && Number.isFinite(candidate)) {
+      normalized[key] = Math.min(1, Math.max(-1, candidate));
+    }
+  }
+  return Object.keys(normalized).length ? normalized : undefined;
+}
 
 function normalizeStructuredScreenplay(
   value: Record<string, unknown>,
@@ -66,6 +100,7 @@ function normalizeStructuredScreenplay(
     typeof value.emotion_intensity === 'number'
       ? Math.min(1, Math.max(0, value.emotion_intensity))
       : 0.5;
+  const prosody = normalizeProsody(value.prosody);
   const pauseAfterMs =
     typeof value.pause_after_ms === 'number'
       ? Math.min(2500, Math.max(0, Math.round(value.pause_after_ms)))
@@ -98,6 +133,7 @@ function normalizeStructuredScreenplay(
     emotion,
     delivery,
     emotionIntensity,
+    prosody,
     pauseAfterMs,
     motion,
     gaze,

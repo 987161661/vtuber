@@ -40,6 +40,20 @@ export interface BaseChatServiceOptions {
     type: 'text' | 'json_object' | 'json_schema';
     json_schema?: any;
   };
+  /**
+   * Optional, sanitized transport audit hook. The payload must never contain
+   * credentials, prompts, messages, or generated text.
+   */
+  protocolAudit?: (event: {
+    phase: 'request' | 'response_headers';
+    provider: string;
+    model: string;
+    endpointHost: string;
+    stream: boolean;
+    responseFormatType?: 'text' | 'json_object' | 'json_schema';
+    status?: number;
+    contentType?: string | null;
+  }) => void;
   /** Thinking mode options (Z.ai/Kimi only) */
   thinking?: {
     type: 'enabled' | 'disabled';

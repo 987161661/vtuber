@@ -8,6 +8,7 @@ import {
   viewerFollowIdentityKey,
 } from '../../examples/react-purupuru-app/src/lib/viewerFollowRegistry';
 import {
+  createRadarCityCommandRouter,
   isRadarCityCommand,
   isRadarCityCommentEvent,
 } from '../../examples/react-purupuru-app/src/lib/radarCityBridge';
@@ -122,7 +123,31 @@ describe('viewer follow registry', () => {
     expect(isRadarCityCommentEvent(event)).toBe(true);
     expect(isRadarCityCommentEvent({ ...event, receivedAt: undefined })).toBe(false);
     expect(isRadarCityCommand('@上海')).toBe(true);
+    expect(isRadarCityCommand(' @上海！ ')).toBe(true);
+    expect(isRadarCityCommand('@北辰 你闭嘴')).toBe(false);
+    expect(isRadarCityCommand('回复 @北辰')).toBe(false);
     expect(isRadarCityCommand('@Auckland')).toBe(false);
+  });
+
+  it('gives known live-room viewers priority over ambiguous city syntax', () => {
+    let now = 1_000_000;
+    const router = createRadarCityCommandRouter({
+      now: () => now,
+      ttlMs: 60_000,
+      maxViewers: 2,
+    });
+    router.observeViewer({ id: 'viewer-1', name: '北辰' });
+    expect(router.shouldRoute('@北辰')).toBe(false);
+    expect(router.shouldRoute('@上海')).toBe(true);
+
+    router.observeViewer({ id: 'viewer-2', name: '小雨' });
+    router.observeViewer({ id: 'viewer-3', name: '阿岚' });
+    expect(router.size()).toBe(2);
+    expect(router.shouldRoute('@北辰')).toBe(true);
+
+    now += 60_001;
+    expect(router.shouldRoute('@小雨')).toBe(true);
+    expect(router.size()).toBe(0);
   });
 
   it('keeps real and simulator events on the shared live-room bridge path', () => {
@@ -139,9 +164,12 @@ describe('viewer follow registry', () => {
     expect(appSource).toContain("comment.metadata?.source !== 'history-poll'");
     expect(appSource).toContain('liveDirector.updateRoomState({ isLive: true });');
     expect(appSource).toContain('new BroadcastChannel(RADAR_CITY_EVENT_CHANNEL)');
-    expect(appSource).toContain('readRelayedRadarCityComments(after)');
+    expect(appSource).toContain('readRelayedRadarCityComments(');
     expect(appSource).toContain('relayRadarCityComment(radarCityComment)');
     expect(appSource).toContain('if (isCityCommand) {');
+    expect(appSource.indexOf('if (isCityCommand) {')).toBeLessThan(
+      appSource.indexOf('relayRadarCityComment(radarCityComment)'),
+    );
     expect(appSource).toContain('handleLiveRoomEvent(event);');
     expect(appSource).toContain('viewerId: comment.author.id');
     expect(appSource).not.toContain('viewerId: comment.author.name');

@@ -1,3 +1,5 @@
+import type { RoomInteractionSnapshot } from './roomInteractionTracker';
+
 export type OperatorQueueStatus =
   | 'pending'
   | 'preparing'
@@ -6,6 +8,30 @@ export type OperatorQueueStatus =
   | 'done'
   | 'skipped'
   | 'failed';
+
+/**
+ * Serializable SpeechPlan subset kept with a prepared queue item.  Keeping
+ * this alongside the display text prevents the operator queue from erasing
+ * beat-level voice and avatar direction before playback begins.
+ */
+export type PreparedSpeechBeat = {
+  text: string;
+  ttsText?: string;
+  emotion?: string;
+  delivery?: string;
+  emotionIntensity?: number;
+  prosody?: Record<string, number>;
+  pauseAfterMs?: number;
+  motion?: string;
+  gaze?: string;
+  gesture?: string;
+  interruptibleAfter?: boolean;
+};
+
+export type PreparedSpeechPlan = {
+  version: 2;
+  beats: PreparedSpeechBeat[];
+};
 
 export type OperatorQueueItem = {
   eventId: string;
@@ -27,6 +53,8 @@ export type OperatorQueueItem = {
   order: number;
   status: OperatorQueueStatus;
   preparedReply?: string;
+  /** Original structured output used by the TTS/animation execution path. */
+  preparedSpeechPlan?: PreparedSpeechPlan;
   preparedAt?: number;
   doneAt?: number;
   /** Why this message was deliberately kept out of the broadcast queue. */
@@ -59,6 +87,8 @@ export type OperatorQueueItem = {
   otherViewerRelationshipMutated?: boolean;
   /** Runtime owner selected for a stress run; other listener pages must not claim it. */
   assignedOwnerId?: string;
+  /** Bounded room-level evidence for persona planning; never displayed as chat. */
+  roomContext?: RoomInteractionSnapshot;
 };
 
 export const MAX_READY_REPLY_AGE_MS = 45_000;

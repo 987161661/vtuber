@@ -17,6 +17,7 @@ import type {
   InworldAudioEncoding,
   InworldDeliveryMode,
   UnrealSpeechCodec,
+  TalkStyle,
   XaiBitRate,
   XaiCodec,
   XaiSampleRate,
@@ -35,11 +36,14 @@ import {
   type ResponseFactGuard,
 } from '../lib/responseGuard';
 import { formatTtsSpeechScript } from '../lib/ttsSpeechScript';
+import type { PreparedSpeechPlan } from '../lib/operatorQueue';
 
 interface ScreenplayLike {
   emotion?: string;
   text?: string;
+  delivery?: string;
   emotionIntensity?: number;
+  prosody?: Record<string, number>;
   motion?: string;
   gaze?: string;
   gesture?: string;
@@ -119,6 +123,7 @@ interface UseAituberCoreOptions {
     },
   ) => void;
   speechPlanV2Enabled?: boolean;
+  personaPlannerEnabled?: boolean;
 }
 
 type ProcessChatOptions = {
@@ -140,7 +145,7 @@ type ProcessChatOptions = {
   persistInteraction?: boolean;
   /** Generate a moderator-visible draft without requesting TTS playback. */
   silent?: boolean;
-  onPrepared?: (reply: string) => void;
+  onPrepared?: (reply: string, speechPlan?: PreparedSpeechPlan) => void;
 };
 
 const GPT5_SAMPLE_PROVIDER_OPTIONS = { gpt5Preset: 'casual' as const };
@@ -152,6 +157,50 @@ function emitRuntimeTrace(event: Record<string, unknown>) {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(event),
   }).catch(() => undefined);
+}
+
+function inspectSpeechPlanEnvelope(raw: unknown) {
+  if (typeof raw !== 'string') return { kind: typeof raw, valid: false };
+  const trimmed = raw.trim();
+  if (!trimmed.startsWith('{') || !trimmed.endsWith('}')) {
+    return { kind: 'plain_text', valid: false };
+  }
+  try {
+    const value = JSON.parse(trimmed) as {
+      version?: unknown;
+      beats?: unknown;
+    };
+    const beats = Array.isArray(value.beats) ? value.beats : [];
+    const requiredFields = [
+      'text',
+      'emotion',
+      'delivery',
+      'emotion_intensity',
+      'prosody',
+      'motion',
+      'gaze',
+      'gesture',
+      'vocal_tags',
+      'pause_after_ms',
+      'interruptible_after',
+    ];
+    const missingFields = beats.flatMap((beat, index) =>
+      !beat || typeof beat !== 'object'
+        ? [`beats[${index}]`]
+        : requiredFields
+            .filter((field) => !(field in beat))
+            .map((field) => `beats[${index}].${field}`),
+    );
+    return {
+      kind: 'json_object',
+      valid: value.version === 2 && beats.length >= 1 && beats.length <= 3 && missingFields.length === 0,
+      version: value.version,
+      beatCount: beats.length,
+      missingFields,
+    };
+  } catch {
+    return { kind: 'invalid_json', valid: false };
+  }
 }
 
 function toManneriMessages(
@@ -437,7 +486,9 @@ function extractScreenplay(data: unknown): ScreenplayLike | null {
   const screenplay = source as {
     emotion?: unknown;
     text?: unknown;
+    delivery?: unknown;
     emotionIntensity?: unknown;
+    prosody?: unknown;
     motion?: unknown;
     gaze?: unknown;
     gesture?: unknown;
@@ -457,6 +508,35 @@ function extractScreenplay(data: unknown): ScreenplayLike | null {
     typeof screenplay.emotionIntensity === 'number'
       ? Math.min(1, Math.max(0, screenplay.emotionIntensity))
       : undefined;
+  const delivery =
+    typeof screenplay.delivery === 'string' ? screenplay.delivery : undefined;
+  const prosody =
+    screenplay.prosody &&
+    typeof screenplay.prosody === 'object' &&
+    !Array.isArray(screenplay.prosody)
+      ? Object.fromEntries(
+          Object.entries(screenplay.prosody as Record<string, unknown>)
+            .filter(
+              ([key, value]) =>
+                [
+                  'pace',
+                  'pitch',
+                  'volume',
+                  'warmth',
+                  'tension',
+                  'energy',
+                  'assertiveness',
+                  'breathiness',
+                ].includes(key) &&
+                typeof value === 'number' &&
+                Number.isFinite(value),
+            )
+            .map(([key, value]) => [
+              key,
+              Math.min(1, Math.max(-1, value as number)),
+            ]),
+        )
+      : undefined;
 
   const motion =
     typeof screenplay.motion === 'string' ? screenplay.motion : undefined;
@@ -465,7 +545,16 @@ function extractScreenplay(data: unknown): ScreenplayLike | null {
   const gesture =
     typeof screenplay.gesture === 'string' ? screenplay.gesture : undefined;
 
-  return { emotion, text, emotionIntensity, motion, gaze, gesture };
+  return {
+    emotion,
+    text,
+    delivery,
+    emotionIntensity,
+    prosody,
+    motion,
+    gaze,
+    gesture,
+  };
 }
 
 function extractViewerFacingText(
@@ -521,6 +610,7 @@ export function useAituberCore({
   onAssistantResponse,
   onChatError,
   speechPlanV2Enabled = true,
+  personaPlannerEnabled = true,
 }: UseAituberCoreOptions) {
   const coreRef = useRef<AITuberOnAirCore | null>(null);
   const manneriDetectorRef = useRef<ManneriDetector | null>(null);
@@ -565,7 +655,7 @@ export function useAituberCore({
     sourceLabel?: string;
     factGuard?: ResponseFactGuard;
     persistInteraction?: boolean;
-    onPrepared?: (reply: string) => void;
+    onPrepared?: (reply: string, speechPlan?: PreparedSpeechPlan) => void;
   } | null>(null);
   const lastGuardedResponseRef = useRef<{
     eventId?: string;
@@ -624,7 +714,29 @@ export function useAituberCore({
         }
       : undefined;
   const providerOptions = isOpenAICompatibleProvider
-    ? { endpoint: openAICompatibleEndpoint }
+    ? {
+        endpoint: openAICompatibleEndpoint,
+        // The screenplay contract is machine-consumed. Prompt-only JSON
+        // instructions are probabilistic, especially for empathetic replies;
+        // request the OpenAI-compatible provider's JSON mode as well.
+        responseFormat: { type: 'json_object' as const },
+        protocolAudit: (audit: {
+          phase: 'request' | 'response_headers';
+          provider: string;
+          model: string;
+          endpointHost: string;
+          stream: boolean;
+          responseFormatType?: string;
+          status?: number;
+          contentType?: string | null;
+        }) =>
+          emitRuntimeTrace({
+            stage: 'llm_protocol_transport_audit',
+            actor: { type: 'system', id: 'openai-compatible-transport' },
+            at: Date.now(),
+            ...audit,
+          }),
+      }
     : isOpenAIGPT5Model
       ? GPT5_SAMPLE_PROVIDER_OPTIONS
       : xaiProviderOptions;
@@ -658,13 +770,16 @@ export function useAituberCore({
     // for a later async core event: some provider/core combinations finish
     // processing before that event reaches the browser listener. Clearing the
     // callback makes the later ASSISTANT_RESPONSE event idempotent.
-    const deliverPreparedDraft = (text: string) => {
+    const deliverPreparedDraft = (
+      text: string,
+      speechPlan?: PreparedSpeechPlan,
+    ) => {
       const pending = pendingMemoryRef.current;
       const reply = text.trim();
       if (!pending?.onPrepared || !reply) return;
       const onPrepared = pending.onPrepared;
       pending.onPrepared = undefined;
-      onPrepared(reply);
+      onPrepared(reply, speechPlan);
     };
 
     const core = new AITuberOnAirCore({
@@ -675,6 +790,7 @@ export function useAituberCore({
       chatOptions: {
         systemPrompt: buildCharacterSystemPrompt(profile, {
           speechPlanV2Enabled,
+          personaPlannerEnabled,
         }),
         // The response contract controls speaking length.  The model still
         // needs enough headroom to close structured answers; a lower ceiling
@@ -721,29 +837,44 @@ export function useAituberCore({
               reasons: guarded.reasons,
               factGuard: pending?.factGuard,
             });
-            deliverPreparedDraft(guarded.text);
+            const preparedSpeechPlan: PreparedSpeechPlan =
+              guarded.rewritten || guarded.text !== combinedText
+                ? {
+                    version: 2,
+                    beats: [
+                      {
+                        ...speechPlan.beats[0],
+                        text: guarded.text,
+                        ttsText: formatTtsSpeechScript(guarded.text),
+                        prosody: speechPlan.beats[0].prosody
+                          ? Object.fromEntries(
+                              Object.entries(speechPlan.beats[0].prosody),
+                            )
+                          : undefined,
+                        pauseAfterMs: 0,
+                        interruptibleAfter: true,
+                      },
+                    ],
+                  }
+                : {
+                    version: 2,
+                    beats: speechPlan.beats.map((beat) => {
+                      const text = sanitizeSpeechText(beat.text);
+                      return {
+                        ...beat,
+                        text,
+                        ttsText: formatTtsSpeechScript(text),
+                        prosody: beat.prosody
+                          ? Object.fromEntries(Object.entries(beat.prosody))
+                          : undefined,
+                      };
+                    }),
+                  };
+            deliverPreparedDraft(guarded.text, preparedSpeechPlan);
             if (guarded.rewritten || guarded.text !== combinedText) {
-              return {
-                version: 2 as const,
-                beats: [
-                  {
-                    ...speechPlan.beats[0],
-                    text: guarded.text,
-                    ttsText: formatTtsSpeechScript(guarded.text),
-                    pauseAfterMs: 0,
-                    interruptibleAfter: true,
-                  },
-                ],
-              };
+              return preparedSpeechPlan;
             }
-            return {
-              version: 2 as const,
-              beats: speechPlan.beats.map((beat) => ({
-                ...beat,
-                text: sanitizeSpeechText(beat.text),
-                ttsText: formatTtsSpeechScript(sanitizeSpeechText(beat.text)),
-              })),
-            };
+            return preparedSpeechPlan;
           }
         : undefined,
       responseScreenplayTransform: (screenplay) => {
@@ -878,6 +1009,10 @@ export function useAituberCore({
         modelRawText:
           responseData?.modelRawText ??
           (typeof data === 'string' ? data : undefined),
+        speechPlanEnvelope: inspectSpeechPlanEnvelope(
+          responseData?.modelRawText ??
+            (typeof data === 'string' ? data : undefined),
+        ),
         parsedText:
           typeof responseData?.message === 'string'
             ? responseData.message
@@ -1006,6 +1141,7 @@ export function useAituberCore({
     profile,
     coreGeneration,
     speechPlanV2Enabled,
+    personaPlannerEnabled,
   ]);
 
   // Effect 2: Update voice service when TTS settings change (no core recreation)
@@ -1124,6 +1260,7 @@ export function useAituberCore({
           modelInput,
           systemPrompt: buildCharacterSystemPrompt(profile, {
             speechPlanV2Enabled,
+            personaPlannerEnabled,
           }),
           transientContext,
           factGuard: options?.factGuard,
@@ -1147,6 +1284,7 @@ export function useAituberCore({
       settings.llm.model,
       settings.llm.provider,
       speechPlanV2Enabled,
+      personaPlannerEnabled,
     ],
   );
 
@@ -1176,7 +1314,7 @@ export function useAituberCore({
   );
 
   const speakPrepared = useCallback(
-    async (text: string) => {
+    async (text: string, preparedSpeechPlan?: PreparedSpeechPlan) => {
       const spokenText = text.trim();
       if (!spokenText) return;
       // Operator playback reuses the package-level MiniMax SSE parser instead
@@ -1184,65 +1322,94 @@ export function useAituberCore({
       // keeps explicit error propagation while allowing audio playback before
       // the provider has synthesized the entire reply.
       if (settings.tts.engine === 'minimax') {
-        const startedAt = Date.now();
-        const chunk = {
-          index: 0,
-          count: 1,
-          text: spokenText,
-          startedAt,
-          bridge: 'minimax-stream',
-        };
+        const beats =
+          preparedSpeechPlan?.version === 2 &&
+          preparedSpeechPlan.beats.length > 0
+            ? preparedSpeechPlan.beats
+            : [{ text: spokenText, ttsText: spokenText }];
         let speechStarted = false;
+        let activeChunk: Record<string, unknown> | undefined;
         try {
-          const engine = new MinimaxEngine();
-          engine.setApiEndpoint('/api/minimax-tts');
-          engine.setModel('speech-2.8-turbo');
-          engine.setLanguageBoost(LINGLAN_PROFILE.voice.languageBoost);
-          engine.setAudioSettings({
-            sampleRate: 44100,
-            bitrate: 128000,
-            format: 'mp3',
-            channel: 1,
-          });
-          const audioStream = engine.fetchAudioStream(
-            { style: 'talk', message: spokenText },
-            settings.tts.speaker,
-            ttsApiKey,
-          );
-          const boundedAudioStream = closeAudioStreamAfterIdle(audioStream);
           onSpeechStartRef.current?.({ text: spokenText });
-          onSpeechChunkRef.current?.('start', chunk);
           speechStarted = true;
-          if (onAudioStreamRef.current) {
-            await onAudioStreamRef.current(boundedAudioStream);
-          } else {
-            const parts: Uint8Array[] = [];
-            let byteLength = 0;
-            for await (const part of boundedAudioStream) {
-              const bytes = new Uint8Array(part);
-              parts.push(bytes);
-              byteLength += bytes.byteLength;
+          for (const [index, beat] of beats.entries()) {
+            const text = beat.text.trim();
+            if (!text) continue;
+            const chunk = {
+              index,
+              count: beats.length,
+              text,
+              screenplay: beat,
+              interruptibleAfter: beat.interruptibleAfter,
+              startedAt: Date.now(),
+              bridge: 'minimax-stream',
+            };
+            activeChunk = chunk;
+            const engine = new MinimaxEngine();
+            engine.setApiEndpoint('/api/minimax-tts');
+            engine.setModel('speech-2.8-turbo');
+            engine.setLanguageBoost(LINGLAN_PROFILE.voice.languageBoost);
+            engine.setAudioSettings({
+              sampleRate: 44100,
+              bitrate: 128000,
+              format: 'mp3',
+              channel: 1,
+            });
+            const audioStream = engine.fetchAudioStream(
+              {
+                style: ([
+                  'talk', 'neutral', 'happy', 'sad', 'angry', 'surprised',
+                  'relaxed', 'bored', 'impatient', 'embarrassed', 'awkward', 'serious',
+                ].includes(beat.emotion || '')
+                  ? beat.emotion
+                  : 'talk') as TalkStyle,
+                message: beat.ttsText || text,
+                delivery: beat.delivery,
+                emotionIntensity: beat.emotionIntensity,
+                prosody: beat.prosody,
+              },
+              settings.tts.speaker,
+              ttsApiKey,
+            );
+            const boundedAudioStream = closeAudioStreamAfterIdle(audioStream);
+            onSpeechChunkRef.current?.('start', chunk);
+            if (onAudioStreamRef.current) {
+              await onAudioStreamRef.current(boundedAudioStream);
+            } else {
+              const parts: Uint8Array[] = [];
+              let byteLength = 0;
+              for await (const part of boundedAudioStream) {
+                const bytes = new Uint8Array(part);
+                parts.push(bytes);
+                byteLength += bytes.byteLength;
+              }
+              if (byteLength < 16) throw new Error('minimax_stream_empty');
+              const audio = new Uint8Array(byteLength);
+              let offset = 0;
+              for (const part of parts) {
+                audio.set(part, offset);
+                offset += part.byteLength;
+              }
+              await onAudioPlayRef.current(audio.buffer);
             }
-            if (byteLength < 16) throw new Error('minimax_stream_empty');
-            const audio = new Uint8Array(byteLength);
-            let offset = 0;
-            for (const part of parts) {
-              audio.set(part, offset);
-              offset += part.byteLength;
+            onSpeechChunkRef.current?.('end', { ...chunk, endedAt: Date.now() });
+            activeChunk = undefined;
+            const pauseAfterMs = beat.pauseAfterMs ?? 0;
+            if (index < beats.length - 1 && pauseAfterMs) {
+              await new Promise<void>((resolve) =>
+                window.setTimeout(resolve, Math.min(2_500, Math.max(0, pauseAfterMs))),
+              );
             }
-            await onAudioPlayRef.current(audio.buffer);
           }
-          onSpeechChunkRef.current?.('end', {
-            ...chunk,
-            endedAt: Date.now(),
-          });
           onSpeechEndRef.current?.();
         } catch (error) {
-          onSpeechChunkRef.current?.('error', {
-            ...chunk,
-            endedAt: Date.now(),
-            error: error instanceof Error ? error.message : String(error),
-          });
+          if (activeChunk) {
+            onSpeechChunkRef.current?.('error', {
+              ...activeChunk,
+              endedAt: Date.now(),
+              error: error instanceof Error ? error.message : String(error),
+            });
+          }
           // SPEECH_END is paired only with a real start. Calling it for a
           // provider failure can falsely complete a different queued item.
           if (speechStarted) onSpeechEndRef.current?.();

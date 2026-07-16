@@ -1,4 +1,9 @@
-import { ChatScreenplay, SpeechBeat, SpeechPlanV2 } from '../types/chat';
+import {
+  ChatScreenplay,
+  SpeechBeat,
+  SpeechPlanV2,
+  VoiceProsody,
+} from '../types/chat';
 import { EmotionParser } from './emotionParser';
 
 const ALLOWED_EMOTIONS = new Set([
@@ -8,6 +13,11 @@ const ALLOWED_EMOTIONS = new Set([
   'angry',
   'surprised',
   'relaxed',
+  'bored',
+  'impatient',
+  'embarrassed',
+  'awkward',
+  'serious',
 ]);
 const ALLOWED_DELIVERIES = new Set([
   'natural',
@@ -24,6 +34,7 @@ const ALLOWED_VOCAL_TAGS = new Set([
   'chuckle',
   'coughs',
   'clear-throat',
+  'groans',
   'breath',
   'pant',
   'inhale',
@@ -32,8 +43,12 @@ const ALLOWED_VOCAL_TAGS = new Set([
   'sniffs',
   'sighs',
   'snorts',
+  'burps',
+  'lip-smacking',
   'humming',
+  'hissing',
   'emm',
+  'sneezes',
 ]);
 const ALLOWED_MOTIONS = new Set([
   'idle_cold',
@@ -53,6 +68,7 @@ type StructuredScreenplay = {
   emotion?: unknown;
   delivery?: unknown;
   emotion_intensity?: unknown;
+  prosody?: unknown;
   vocal_tags?: unknown;
   pause_after_ms?: unknown;
   motion?: unknown;
@@ -60,6 +76,28 @@ type StructuredScreenplay = {
   gesture?: unknown;
   interruptible_after?: unknown;
 };
+
+function normalizeProsody(value: unknown): VoiceProsody | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const allowedKeys = [
+    'pace',
+    'pitch',
+    'volume',
+    'warmth',
+    'tension',
+    'energy',
+    'assertiveness',
+    'breathiness',
+  ] as const;
+  const result: VoiceProsody = {};
+  for (const key of allowedKeys) {
+    const candidate = (value as Record<string, unknown>)[key];
+    if (typeof candidate === 'number' && Number.isFinite(candidate)) {
+      result[key] = Math.min(1, Math.max(-1, candidate));
+    }
+  }
+  return Object.keys(result).length ? result : undefined;
+}
 
 function extractStructuredJson(input: string): string | null {
   const trimmed = input
@@ -116,6 +154,7 @@ function normalizeStructuredScreenplay(
     typeof value.emotion_intensity === 'number'
       ? Math.min(1, Math.max(0, value.emotion_intensity))
       : 0.5;
+  const prosody = normalizeProsody(value.prosody);
   const pauseAfterMs =
     typeof value.pause_after_ms === 'number'
       ? Math.min(2500, Math.max(0, Math.round(value.pause_after_ms)))
@@ -148,6 +187,7 @@ function normalizeStructuredScreenplay(
     emotion,
     delivery,
     emotionIntensity,
+    prosody,
     pauseAfterMs,
     motion,
     gaze,

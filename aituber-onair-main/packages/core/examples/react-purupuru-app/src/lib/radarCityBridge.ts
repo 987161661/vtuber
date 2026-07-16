@@ -1,8 +1,61 @@
 export const RADAR_CITY_EVENT_CHANNEL = 'aituber-radar-city-event-v1';
-const CITY_COMMAND = /^@[\u3400-\u9fff]{2,16}[\s,，。！？!？、:：;；#]?$/;
+const CITY_COMMAND = /^@([\u3400-\u9fff]{2,16})[\s,，。！？!？、:：;；#]?$/;
+
+function normalizeViewerName(name: string): string {
+  return name.normalize('NFKC').trim().toLocaleLowerCase('zh-CN');
+}
 
 export function isRadarCityCommand(text: string) {
   return CITY_COMMAND.test(text.trim());
+}
+
+/**
+ * Resolves the otherwise ambiguous whole-message `@中文名` syntax against the
+ * bounded set of viewers actually observed in the current room. A known
+ * viewer always wins over the legacy radar-city shorthand.
+ */
+export function createRadarCityCommandRouter(options?: {
+  now?: () => number;
+  ttlMs?: number;
+  maxViewers?: number;
+}) {
+  const now = options?.now ?? Date.now;
+  const ttlMs = Math.max(60_000, options?.ttlMs ?? 30 * 60_000);
+  const maxViewers = Math.max(1, options?.maxViewers ?? 2_000);
+  const viewers = new Map<string, { viewerId: string; observedAt: number }>();
+
+  const prune = (at: number) => {
+    for (const [name, viewer] of viewers) {
+      if (at - viewer.observedAt > ttlMs) viewers.delete(name);
+    }
+    while (viewers.size > maxViewers) {
+      const oldest = viewers.keys().next().value as string | undefined;
+      if (!oldest) break;
+      viewers.delete(oldest);
+    }
+  };
+
+  return {
+    observeViewer(viewer: { id: string; name: string }, observedAt = now()) {
+      const name = normalizeViewerName(viewer.name);
+      if (!name || !viewer.id.trim()) return;
+      // Refresh insertion order so the bounded map evicts the least-recently
+      // observed viewer first.
+      viewers.delete(name);
+      viewers.set(name, { viewerId: viewer.id.trim(), observedAt });
+      prune(observedAt);
+    },
+    shouldRoute(text: string, at = now()): boolean {
+      const match = CITY_COMMAND.exec(text.trim());
+      if (!match) return false;
+      prune(at);
+      return !viewers.has(normalizeViewerName(match[1]));
+    },
+    size(at = now()): number {
+      prune(at);
+      return viewers.size;
+    },
+  };
 }
 
 export type RadarCityCommentEvent = {

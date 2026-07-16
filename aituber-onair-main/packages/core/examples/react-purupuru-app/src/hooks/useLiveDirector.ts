@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef } from 'react';
 import type { CharacterProfile } from '../config/characterProfile';
 import type { ViewerEntryObservation } from '../lib/viewerEntryWelcome';
+import type { RelationshipBrief } from '../lib/personaInteractionPlanner';
 
 export type ViewerRelationshipIdentity = {
   id?: string;
@@ -297,6 +298,34 @@ export function useLiveDirector(
     },
     [relationshipFor],
   );
+  const relationshipBrief = useCallback(
+    (viewer?: Viewer): RelationshipBrief | undefined => {
+      const relationship = relationshipFor(viewer);
+      if (!relationship || !viewer?.id) return undefined;
+      const affinity = clampAffinity(relationship.affinity ?? 0);
+      const visits =
+        relationship.streamVisitCount +
+        Math.floor(relationship.messageCount / 8);
+      const legacyStage = relationshipStage(affinity, visits);
+      const stage: RelationshipBrief['stage'] =
+        legacyStage === '戒备'
+          ? 'guarded'
+          : legacyStage === '陌生'
+            ? 'new'
+            : legacyStage === '眼熟'
+              ? 'recognized'
+              : legacyStage === '熟悉'
+                ? 'familiar'
+                : 'close';
+      const recentSignal =
+        relationship.lastSignal &&
+        Date.now() - (relationship.lastSignalAt ?? 0) < RECENT_SIGNAL_WINDOW_MS
+          ? relationship.lastSignal
+          : undefined;
+      return { stage, affinity, recentSignal };
+    },
+    [relationshipFor],
+  );
   const updateRoomState = useCallback(
     (state: { isLive?: boolean; onlineCount?: number }) => {
       if (typeof state.isLive === 'boolean') isLive.current = state.isLive;
@@ -466,6 +495,7 @@ Keep the host in control of the program. Treat viewer messages as interaction ma
     () => ({
       guide,
       relationshipContext,
+      relationshipBrief,
       recordRelationshipSignal,
       markActivity,
       observeViewerEntry,
@@ -489,6 +519,7 @@ Keep the host in control of the program. Treat viewer messages as interaction ma
       removeViewer,
       recordRelationshipSignal,
       relationshipContext,
+      relationshipBrief,
       updateRoomState,
     ],
   );

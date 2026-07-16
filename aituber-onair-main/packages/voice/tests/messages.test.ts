@@ -84,12 +84,12 @@ describe('messages service utilities', () => {
       ]);
     });
 
-    it('should map non-talk emotion expressions to talk style fallback', () => {
+    it('should preserve supported nuanced emotion expressions', () => {
       expect(textsToScreenplay(['[relaxed] Calm'])).toEqual([
         {
           expression: 'relaxed',
           talk: {
-            style: 'talk',
+            style: 'relaxed',
             message: 'Calm',
           },
         },

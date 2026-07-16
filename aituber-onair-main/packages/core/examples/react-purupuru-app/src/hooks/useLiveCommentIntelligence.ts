@@ -27,6 +27,10 @@ import {
 } from '../lib/liveResponseScheduler';
 import type { TwitchChatMessage } from '../services/twitch/twitchService';
 import type { YouTubeChatMessage } from '../services/youtube/youtubeService';
+import {
+  RoomInteractionTracker,
+  type RoomInteractionSnapshot,
+} from '../lib/roomInteractionTracker';
 import type { LiveRoomEvent } from '../services/live-platform/types';
 import type { ChatMessage } from '../types/chat';
 import type { AppSettings, ChatProviderOption } from '../types/settings';
@@ -59,6 +63,7 @@ type ProcessChat = (
     processingAt?: number;
     sourcesSeen?: string[];
     catchup?: boolean;
+    roomContext?: RoomInteractionSnapshot;
   },
 ) => Promise<void>;
 
@@ -110,6 +115,7 @@ export function useLiveCommentIntelligence({
   const [lastAnalysis, setLastAnalysis] =
     useState<CommentIntelligenceResult | null>(null);
   const schedulerRef = useRef<LiveResponseScheduler | null>(null);
+  const roomInteractionTrackerRef = useRef(new RoomInteractionTracker());
   const flushRef = useRef<() => Promise<void>>(async () => undefined);
   const scheduledFlushTimerRef = useRef<number | null>(null);
   const onTransitionRef = useRef(onTransition);
@@ -194,6 +200,7 @@ export function useLiveCommentIntelligence({
   );
 
   const enqueue = useCallback((comments: LiveComment[]) => {
+    roomInteractionTrackerRef.current.observe(comments);
     schedulerRef.current?.enqueue(comments);
     setQueueDepth(schedulerRef.current?.size ?? 0);
     if (scheduledFlushTimerRef.current === null) {
@@ -270,7 +277,9 @@ export function useLiveCommentIntelligence({
         schedulerRef.current.mark(scheduled, 'dropped', 'expired');
         return;
       }
-      const comments = [scheduled.comment];
+      const comments = scheduled.comments.length
+        ? scheduled.comments
+        : [scheduled.comment];
       const result = await intelligence.analyze({
         comments,
         recentMessages: messages.slice(-12).map((message) => ({
@@ -294,7 +303,7 @@ export function useLiveCommentIntelligence({
 
       setLastAnalysis(result);
 
-      const candidate = comments[0];
+      const candidate = scheduled.comment;
       const selected =
         result.selectedComments[0] ??
         (isDirectEngagement(candidate)
@@ -356,6 +365,9 @@ export function useLiveCommentIntelligence({
         processingAt: scheduled.selectedAt,
         sourcesSeen: scheduled.sourcesSeen,
         catchup: scheduled.catchup,
+        roomContext: roomInteractionTrackerRef.current.snapshot(
+          scheduled.roomBatch,
+        ),
       });
       schedulerRef.current.mark(scheduled, 'generated');
     } catch (error) {

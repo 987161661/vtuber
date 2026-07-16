@@ -1,4 +1,8 @@
 import type { LiveComment } from '@aituber-onair/comment-intelligence';
+import {
+  roomBatchFromComments,
+  type RoomBatchContext,
+} from './roomInteractionTracker';
 
 export type LiveEventStage =
   | 'received'
@@ -42,6 +46,9 @@ export interface LiveLifecycleTransition {
 export interface ScheduledLiveComment {
   eventId: string;
   comment: LiveComment;
+  /** Bounded original samples retained for room-level planning and safety. */
+  comments: LiveComment[];
+  roomBatch: RoomBatchContext;
   commentAt: number;
   receivedAt: number;
   queuedAt: number;
@@ -468,13 +475,14 @@ export class LiveResponseScheduler {
         mergedCount: unique.length,
       },
     };
+    const combinedComments = unique.flatMap((group) => group.comments);
     const combined: QueueGroup = {
       ...first,
       eventId: comment.id,
-      comments: [comment],
+      comments: combinedComments,
       sourcesSeen: new Set(unique.flatMap((group) => [...group.sourcesSeen])),
     };
-    return this.toSelection(combined, now, true, unique.length);
+    return this.toSelection(combined, now, true, combinedComments.length);
   }
 
   private toSelection(
@@ -502,6 +510,12 @@ export class LiveResponseScheduler {
     const selection = {
       eventId: group.eventId,
       comment,
+      comments: group.comments.slice(0, 12),
+      roomBatch: roomBatchFromComments(
+        group.comments,
+        catchup,
+        mergedCount,
+      ),
       commentAt: group.commentAt,
       receivedAt: group.receivedAt,
       queuedAt: group.queuedAt,

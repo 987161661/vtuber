@@ -53,6 +53,17 @@ export type AvatarMotion =
 export type AvatarGaze = 'camera' | 'left' | 'right' | 'down';
 export type AvatarGesture = 'still' | 'subtle' | 'expressive';
 
+export interface VoiceProsody {
+  pace?: number;
+  pitch?: number;
+  volume?: number;
+  warmth?: number;
+  tension?: number;
+  energy?: number;
+  assertiveness?: number;
+  breathiness?: number;
+}
+
 /**
  * screenplay (text with emotion)
  */
@@ -62,6 +73,7 @@ export interface Screenplay {
   ttsText?: string;
   delivery?: string;
   emotionIntensity?: number;
+  prosody?: VoiceProsody;
   pauseAfterMs?: number;
   motion?: AvatarMotion;
   gaze?: AvatarGaze;

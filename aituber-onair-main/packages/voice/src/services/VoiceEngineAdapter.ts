@@ -203,6 +203,7 @@ export class VoiceEngineAdapter implements VoiceService {
       message,
       delivery: screenplay.delivery,
       emotionIntensity: screenplay.emotionIntensity,
+      prosody: screenplay.prosody,
     };
 
     const engine = await this.getEngine();

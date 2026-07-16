@@ -43,6 +43,7 @@ import {
   viewerFollowRegistry,
 } from './lib/viewerFollowRegistry';
 import {
+  createRadarCityCommandRouter,
   isRadarCityCommand,
   isRadarCityCommentEvent,
   readRelayedRadarCityComments,
@@ -53,6 +54,13 @@ import {
   getWeatherLocationClarification,
   routeTyphoonSkillWithAgent,
 } from './lib/skillRoutingAgent';
+import {
+  formatPersonaInteractionPlan,
+  planPersonaInteraction,
+  type PersonaPlannerInput,
+} from './lib/personaInteractionPlanner';
+import { refinePersonaPlanWithAgent } from './lib/personaPlanningAgent';
+import { LINGLAN_PERSONA_POLICY } from './lib/linglanPersonaPolicy';
 import {
   buildViewerEntryWelcomePrompt,
   shouldWelcomeViewerEntry,
@@ -101,9 +109,11 @@ import {
   mergeRecentLiveTurns,
 } from './lib/liveConversationContext';
 import type { LiveLifecycleTransition } from './lib/liveResponseScheduler';
+import type { RoomInteractionSnapshot } from './lib/roomInteractionTracker';
 import {
   isStaleReadyReply,
   type OperatorQueueItem,
+  type PreparedSpeechPlan,
   updateOperatorQueue,
 } from './lib/operatorQueue';
 import { STRESS_TEST_PLAN } from './lib/stressTestPlan';
@@ -330,6 +340,7 @@ export default function App() {
   const query = new URLSearchParams(window.location.search);
   const hostCoordinatorV2Enabled = query.get('hostCoordinatorV2') !== '0';
   const speechPlanV2Enabled = query.get('speechPlanV2') !== '0';
+  const personaPlannerEnabled = query.get('personaPlanner') !== '0';
   // Affine reactions are useful for renderer diagnostics, but they are not a
   // production motion system. Production only exposes renderer-backed output.
   const debugAffineAvatarMotion = query.get('debugAffineAvatarMotion') === '1';
@@ -386,6 +397,7 @@ export default function App() {
   const [stressRun, setStressRun] = useState<StressRunState>(EMPTY_STRESS_RUN);
   const recentLiveTurnsRef = useRef<RecentLiveTurn[]>([]);
   const processingLiveEventIdsRef = useRef(new Set<string>());
+  const radarCityCommandRouterRef = useRef(createRadarCityCommandRouter());
   const preparingOperatorTaskRef = useRef<string | null>(null);
   const speakingOperatorTaskRef = useRef<string | null>(null);
   const runtimeOwnerIdRef = useRef(`runtime-${crypto.randomUUID()}`);
@@ -1561,6 +1573,7 @@ export default function App() {
         });
       }
     },
+    personaPlannerEnabled,
     settings: settingsHook.settings,
     profile: runtimeProfile,
     speechPlanV2Enabled,
@@ -2000,12 +2013,17 @@ export default function App() {
         selectedAt?: number;
         processingAt?: number;
         sourcesSeen?: string[];
+        roomContext?: RoomInteractionSnapshot;
         sourceLabel?: string;
         catchup?: boolean;
         showInput?: boolean;
         persistInteraction?: boolean;
         silent?: boolean;
-        onPrepared?: (reply: string, skills: string[]) => void;
+        onPrepared?: (
+          reply: string,
+          skills: string[],
+          speechPlan?: PreparedSpeechPlan,
+        ) => void;
         createdAt?: number;
         testRunId?: string;
         stepId?: string;
@@ -2068,6 +2086,134 @@ export default function App() {
         sourceLabel: options?.sourceLabel,
         turns: routerTurns,
       });
+      emitRuntimeEvent({
+        eventId,
+        stage: 'program_decision',
+        at: Date.now(),
+        viewerId: options?.viewerId,
+        viewerName: options?.viewerName,
+        sourceLabel: options?.sourceLabel,
+        mode: routing.mode,
+        intent: routing.intent,
+        direction: routing.direction,
+        shouldSpeak: routing.shouldSpeak,
+        inheritTyphoon: routing.inheritTyphoon,
+        context: {
+          turns: routerTurns.length,
+          transcriptChars: shortTermLiveContext.length,
+          memoryChars: options?.memoryContext?.length ?? 0,
+        },
+      });
+      let personaContext = '';
+      if (personaPlannerEnabled) {
+        const personaStartedAt = performance.now();
+        emitRuntimeEvent({
+          eventId,
+          stage: 'persona_plan_started',
+          at: Date.now(),
+          source: options?.source ?? 'chat',
+        });
+        const personaInput: PersonaPlannerInput = {
+          eventId,
+          text: displayText,
+          viewerId: options?.viewerId,
+          viewerName: options?.viewerName,
+          sourceLabel: options?.sourceLabel,
+          routing,
+          relationship: liveDirector.relationshipBrief({
+            id: options?.viewerId,
+            name: options?.viewerName,
+            platform: options?.sourcesSeen?.[0],
+          }),
+          recentTurns: routerTurns,
+          memorySignals: streamerMemory.signalsFor(displayText, {
+            id: scopedViewerId(
+              options?.viewerId,
+              options?.sourcesSeen?.[0],
+            ),
+            name: options?.viewerName,
+          }),
+          room: options?.roomContext,
+        };
+        const localPlan = planPersonaInteraction(
+          personaInput,
+          LINGLAN_PERSONA_POLICY,
+        );
+        const personaPlan = await refinePersonaPlanWithAgent(
+          personaInput,
+          localPlan,
+          LINGLAN_PERSONA_POLICY,
+        );
+        const personaDurationMs = Math.round(performance.now() - personaStartedAt);
+        const personaAudit = {
+          eventId,
+          at: Date.now(),
+          scene: personaPlan.scene,
+          stance: personaPlan.stance,
+          primaryMove: personaPlan.primaryMove,
+          roomAction: personaPlan.roomAction,
+          confidence: personaPlan.confidence,
+          source: personaPlan.source,
+          reasonCode: personaPlan.reasonCode,
+          durationMs: personaDurationMs,
+        };
+        emitRuntimeEvent({
+          ...personaAudit,
+          stage:
+            personaPlan.source === 'agent'
+              ? 'persona_plan_agent'
+              : personaPlan.source === 'fallback'
+                ? 'persona_plan_fallback'
+                : 'persona_plan_completed',
+        });
+
+        if (personaPlan.localMuteViewerIds.length) {
+          await Promise.all(
+            personaPlan.localMuteViewerIds.map((viewerId) =>
+              fetch('/api/live-safety', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  eventId,
+                  viewerId,
+                  sourceLabel: options?.sourceLabel,
+                  moderation: 'local_mute',
+                  reason: personaPlan.reasonCode,
+                }),
+              }).catch(() => null),
+            ),
+          );
+        }
+        if (
+          personaPlan.roomAction === 'skip' ||
+          personaPlan.roomAction === 'local_mute'
+        ) {
+          emitRuntimeEvent({
+            ...personaAudit,
+            stage: 'persona_plan_skipped',
+          });
+          processingLiveEventIdsRef.current.delete(eventId);
+          dispatchLiveHostEvent({
+            type: 'generation',
+            at: Date.now(),
+            eventId,
+            stage: 'completed',
+            turn,
+          });
+          options?.onPrepared?.(NO_REPLY_TOKEN, []);
+          return true;
+        }
+        personaContext = formatPersonaInteractionPlan(
+          personaPlan,
+          options?.roomContext,
+        );
+        if (personaPlan.source !== 'rules') {
+          emitRuntimeEvent({
+            ...personaAudit,
+            stage: 'persona_plan_completed',
+          });
+        }
+      }
       const safety = options?.viewerId
         ? await fetch('/api/live-safety', {
             method: 'POST',
@@ -2120,26 +2266,9 @@ export default function App() {
           stage: 'completed',
           turn,
         });
-        return;
+        options?.onPrepared?.(NO_REPLY_TOKEN, []);
+        return true;
       }
-      emitRuntimeEvent({
-        eventId,
-        stage: 'program_decision',
-        at: Date.now(),
-        viewerId: options?.viewerId,
-        viewerName: options?.viewerName,
-        sourceLabel: options?.sourceLabel,
-        mode: routing.mode,
-        intent: routing.intent,
-        direction: routing.direction,
-        shouldSpeak: routing.shouldSpeak,
-        inheritTyphoon: routing.inheritTyphoon,
-        context: {
-          turns: routerTurns.length,
-          transcriptChars: shortTermLiveContext.length,
-          memoryChars: options?.memoryContext?.length ?? 0,
-        },
-      });
       const responseContract = isProactive
         ? {
             contract: '',
@@ -2246,7 +2375,7 @@ export default function App() {
           options?.sourceLabel
             ? `\n\n[内部投递上下文：本条信息来自${options.sourceLabel}。仅据此调整回应方式，不要向观众复述或解释该上下文。]`
             : ''
-        }${relationshipContext}${shortTermLiveContext}${responseContract.contract}${enrichment.context}`,
+        }${relationshipContext}${personaContext}${shortTermLiveContext}${responseContract.contract}${enrichment.context}`,
         factGuard: {
           // Structured facts support numeric validation. The local BOSS guide
           // fallback is policy/reference material, not a structured fact feed.
@@ -2262,7 +2391,7 @@ export default function App() {
           forceFallback: enrichment.forceFallback,
         },
         silent: options?.silent,
-        onPrepared: (reply) => {
+        onPrepared: (reply, speechPlan) => {
           processingLiveEventIdsRef.current.delete(eventId);
           dispatchLiveHostEvent({
             type: 'generation',
@@ -2271,7 +2400,7 @@ export default function App() {
             stage: 'completed',
             turn,
           });
-          options?.onPrepared?.(reply, enrichment.skills);
+          options?.onPrepared?.(reply, enrichment.skills, speechPlan);
         },
       });
     },
@@ -2283,6 +2412,8 @@ export default function App() {
       processChat,
       processVisionChat,
       hostExtensions,
+      personaPlannerEnabled,
+      streamerMemory,
     ],
   );
 
@@ -2537,6 +2668,7 @@ export default function App() {
       viewerId?: string;
       viewerName?: string;
       sourcesSeen?: string[];
+      roomContext?: RoomInteractionSnapshot;
       testRunId?: string;
       stepId?: string;
       scenarioId?: string;
@@ -2937,6 +3069,7 @@ export default function App() {
               viewerId: next.viewerId,
               viewerName: next.viewerName,
               sourcesSeen: next.sourcesSeen,
+              roomContext: next.roomContext,
               createdAt: next.createdAt,
               testRunId: next.testRunId,
               stepId: next.stepId,
@@ -2948,7 +3081,7 @@ export default function App() {
                 name: next.viewerName,
               }),
               silent: true,
-              onPrepared: (reply, skills) => {
+              onPrepared: (reply, skills, speechPlan) => {
                 prepared = true;
                 if (reply === NO_REPLY_TOKEN) {
                   emitRuntimeEvent({
@@ -2981,10 +3114,12 @@ export default function App() {
                   viewerName: next.viewerName,
                   sourcesSeen: next.sourcesSeen,
                   preparedReply: reply,
+                  speechPlan,
                   skills,
                 });
                 void updateOperatorQueue(next.eventId, 'ready', {
                   reply,
+                  speechPlan,
                   skills,
                 })
                   .then(() => refreshOperatorQueue())
@@ -3201,7 +3336,7 @@ export default function App() {
           OPERATOR_TTS_START_TIMEOUT_MS,
           'tts_first_audio_timeout',
         );
-        await speakPrepared(preparedReply);
+        await speakPrepared(preparedReply, next.preparedSpeechPlan);
       } catch (error) {
         if (operatorSpeechWatchdogRef.current !== null) {
           window.clearTimeout(operatorSpeechWatchdogRef.current);
@@ -3495,6 +3630,7 @@ export default function App() {
         processingAt?: number;
         sourcesSeen?: string[];
         catchup?: boolean;
+        roomContext?: RoomInteractionSnapshot;
       } = {},
     ) => {
       options.sourcesSeen = options.sourcesSeen ?? [];
@@ -3509,6 +3645,7 @@ export default function App() {
         viewerId: options?.viewerId,
         viewerName: options?.viewerName,
         sourcesSeen: options?.sourcesSeen,
+        roomContext: options?.roomContext,
       });
       return Promise.resolve();
     },
@@ -3691,6 +3828,10 @@ export default function App() {
             ? comment.metadata.platformId
             : 'live',
         ) || 'live';
+      radarCityCommandRouterRef.current.observeViewer(
+        comment.author,
+        comment.timestamp || Date.now(),
+      );
       const supportSignal =
         comment.type === 'gift'
           ? 'gift'
@@ -3825,34 +3966,37 @@ export default function App() {
         return;
       }
       // The radar is an optional parent display, never a second comment
-      // consumer. Forward only normalized real comments over the existing
-      // iframe bridge; the parent performs its own city parsing and cooldown.
+      // consumer. Only a whole-message city command (for example "@上海")
+      // may enter its bridge. Viewer mentions such as "@北辰 你闭嘴" remain
+      // ordinary room conversation for the persona/conflict pipeline.
       if (
         comment.type === 'comment' &&
         comment.text.trim()
       ) {
-        const isCityCommand = isRadarCityCommand(comment.text);
-        const followObservedAt = viewerFollowRegistry.observedAt({
-          platform,
-          viewerId: comment.author.id,
-        });
-        const radarCityComment = createLiveCommentEvent({
-          id: comment.id,
-          text: comment.text.trim(),
-          viewerId: comment.author.id,
-          viewerName: comment.author.name,
-          platform,
-          // Some live-platform adapters omit a timestamp on otherwise valid
-          // comments. The radar bridge requires a finite receive time, so
-          // use the arrival time just as the rest of this handler does.
-          receivedAt: comment.timestamp || Date.now(),
-          followObservedAt,
-        });
-        if (window.parent !== window) {
-          window.parent.postMessage(radarCityComment, '*');
-        }
-        void relayRadarCityComment(radarCityComment).catch(() => undefined);
+        const isCityCommand =
+          isRadarCityCommand(comment.text) &&
+          radarCityCommandRouterRef.current.shouldRoute(comment.text);
         if (isCityCommand) {
+          const followObservedAt = viewerFollowRegistry.observedAt({
+            platform,
+            viewerId: comment.author.id,
+          });
+          const radarCityComment = createLiveCommentEvent({
+            id: comment.id,
+            text: comment.text.trim(),
+            viewerId: comment.author.id,
+            viewerName: comment.author.name,
+            platform,
+            // Some live-platform adapters omit a timestamp on otherwise valid
+            // comments. The radar bridge requires a finite receive time, so
+            // use the arrival time just as the rest of this handler does.
+            receivedAt: comment.timestamp || Date.now(),
+            followObservedAt,
+          });
+          if (window.parent !== window) {
+            window.parent.postMessage(radarCityComment, '*');
+          }
+          void relayRadarCityComment(radarCityComment).catch(() => undefined);
           markLiveActivity(`${String(comment.metadata?.platformId || 'live')}-city-command`);
           // City commands are consumed by the radar bridge and do not create
           // a host reply. Only notify the host coordinator when there really

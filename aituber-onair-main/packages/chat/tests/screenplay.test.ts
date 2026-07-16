@@ -1,12 +1,33 @@
 import { describe, it, expect } from 'vitest';
 import {
   textToScreenplay,
+  textToSpeechPlan,
   textsToScreenplay,
   screenplayToText,
 } from '../src/utils/screenplay';
 
 describe('screenplay utilities', () => {
   describe('textToScreenplay', () => {
+    it('preserves planner emotions, prosody controls, and supported vocal tags', () => {
+      const plan = textToSpeechPlan(
+        JSON.stringify({
+          version: 2,
+          beats: [{
+            text: '我只是慢半拍，不是没听见。',
+            emotion: 'bored', delivery: 'teasing', emotion_intensity: 0.45,
+            prosody: { pace: -0.2, pitch: -0.1, volume: 0.12, warmth: 0.3, tension: -0.25, energy: -0.18, assertiveness: 0.2, breathiness: 0.1 },
+            vocal_tags: ['sighs', 'hissing', 'unsupported'], interruptible_after: true,
+          }],
+        }),
+      );
+
+      expect(plan.beats[0]).toMatchObject({
+        emotion: 'bored', delivery: 'teasing', emotionIntensity: 0.45,
+        prosody: { pace: -0.2, pitch: -0.1, volume: 0.12, warmth: 0.3, tension: -0.25, energy: -0.18, assertiveness: 0.2, breathiness: 0.1 },
+        ttsText: '我只是慢半拍，不是没听见。 (sighs) (hissing)',
+      });
+    });
+
     it('should convert text with emotion tag to screenplay', () => {
       const screenplay = textToScreenplay('[happy] Hello world!');
       expect(screenplay).toEqual({
