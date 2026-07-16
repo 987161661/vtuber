@@ -69,19 +69,19 @@ export function createCommentIntelligence(config?: CommentIntelligenceConfig) {
 
   return {
     async analyze(
-      input: AnalyzeCommentsInput
+      input: AnalyzeCommentsInput,
     ): Promise<CommentIntelligenceResult> {
       const mergedConfig = mergeConfig(baseConfig, input.options);
       return analyzeWithConfig(
         input,
         mergedConfig,
         viewerSafetyStates,
-        answeredStates
+        answeredStates,
       );
     },
     markAnswered(
       commentId: string | string[],
-      options?: { authorId?: string; at?: number }
+      options?: { authorId?: string; at?: number },
     ): void {
       const ids = Array.isArray(commentId) ? commentId : [commentId];
       const answeredAt = options?.at ?? Date.now();
@@ -124,14 +124,14 @@ export function createCommentIntelligence(config?: CommentIntelligenceConfig) {
 }
 
 export async function analyzeComments(
-  input: AnalyzeCommentsInput & { config?: CommentIntelligenceConfig }
+  input: AnalyzeCommentsInput & { config?: CommentIntelligenceConfig },
 ): Promise<CommentIntelligenceResult> {
   return createCommentIntelligence(input.config).analyze(input);
 }
 
 function mergeConfig(
   base: CommentIntelligenceConfig,
-  override?: Partial<CommentIntelligenceConfig>
+  override?: Partial<CommentIntelligenceConfig>,
 ): CommentIntelligenceConfig {
   return {
     analysis: {
@@ -165,14 +165,14 @@ async function analyzeWithConfig(
   input: AnalyzeCommentsInput,
   config: CommentIntelligenceConfig,
   viewerSafetyStates: Map<string, ViewerSafetyState>,
-  answeredStates: Map<string, AnsweredState>
+  answeredStates: Map<string, AnsweredState>,
 ): Promise<CommentIntelligenceResult> {
   const rulesResult = buildRulesResult(
     input,
     config,
     false,
     viewerSafetyStates,
-    answeredStates
+    answeredStates,
   );
   const llmProvider = config.analysis?.llmProvider;
   const mode = config.analysis?.mode ?? 'rules';
@@ -190,7 +190,7 @@ async function analyzeWithConfig(
   try {
     const llmComments = input.comments.slice(
       0,
-      config.analysis?.llmPolicy?.maxComments ?? input.comments.length
+      config.analysis?.llmPolicy?.maxComments ?? input.comments.length,
     );
     const llmResult = await withOptionalTimeout(
       llmProvider.analyze({
@@ -199,7 +199,7 @@ async function analyzeWithConfig(
         recentMessages: input.recentMessages ?? input.recentAiMessages,
         recentAiMessages: input.recentAiMessages ?? input.recentMessages,
       }),
-      config.analysis?.llmPolicy?.timeoutMs
+      config.analysis?.llmPolicy?.timeoutMs,
     );
     return applyLLMResult(
       rulesResult,
@@ -207,7 +207,7 @@ async function analyzeWithConfig(
       mode,
       new Set(llmComments.map((comment) => comment.id)),
       config.ranking,
-      input.streamState
+      input.streamState,
     );
   } catch (error) {
     if (config.analysis?.llmPolicy?.fallbackToRules === false) {
@@ -222,25 +222,25 @@ function buildRulesResult(
   config: CommentIntelligenceConfig,
   usedLLM: boolean,
   viewerSafetyStates: Map<string, ViewerSafetyState>,
-  answeredStates: Map<string, AnsweredState>
+  answeredStates: Map<string, AnsweredState>,
 ): CommentIntelligenceResult {
   pruneExpiredViewerBlocks(viewerSafetyStates);
   pruneExpiredAnsweredStates(answeredStates, config.ranking?.answeredMemory);
   const answeredInput = buildAnsweredRankingInput(
     input,
     answeredStates,
-    config.ranking?.answeredMemory
+    config.ranking?.answeredMemory,
   );
 
   let safetyReports = input.comments.map((comment) =>
-    ruleBasedSafetyProvider.check(comment, config.safety)
+    ruleBasedSafetyProvider.check(comment, config.safety),
   );
   updateViewerSafetyStates(input, safetyReports, config, viewerSafetyStates);
   safetyReports = addViewerBlockedReports(
     input,
     safetyReports,
     config,
-    viewerSafetyStates
+    viewerSafetyStates,
   );
   const { rankedComments, selectedComments } = rankComments({
     comments: input.comments,
@@ -254,7 +254,7 @@ function buildRulesResult(
   });
   const selectedIds = new Set(selectedComments.map((comment) => comment.id));
   const ignoredComments = input.comments.filter(
-    (comment) => !selectedIds.has(comment.id)
+    (comment) => !selectedIds.has(comment.id),
   );
   const language = input.streamState?.language ?? config.context?.language;
   const ignoredSummary =
@@ -302,20 +302,20 @@ function applyLLMResult(
   mode: CommentAnalysisMode,
   llmCommentIds: Set<string>,
   rankingConfig: CommentIntelligenceConfig['ranking'],
-  streamState: AnalyzeCommentsInput['streamState']
+  streamState: AnalyzeCommentsInput['streamState'],
 ): CommentIntelligenceResult {
   const safetyReports = mergeLLMSafetyFlags(
     rulesResult.safetyReports,
     llmResult,
-    llmCommentIds
+    llmCommentIds,
   );
   const rankedComments = applyLLMTopicRelatedReasons(
     rulesResult.rankedComments,
     llmResult,
-    llmCommentIds
+    llmCommentIds,
   );
   const rankedById = new Map(
-    rankedComments.map((comment) => [comment.id, comment])
+    rankedComments.map((comment) => [comment.id, comment]),
   );
   const topicFilter = rankingConfig?.topicFilter ?? 'prefer';
   const hasTopic = Boolean(streamState?.topic?.trim());
@@ -325,7 +325,7 @@ function applyLLMResult(
   ]);
   const llmUnmatchedIds = llmReturnedIds.filter((id) => !llmCommentIds.has(id));
   const safetyReportByCommentId = new Map(
-    safetyReports.map((report) => [report.commentId, report])
+    safetyReports.map((report) => [report.commentId, report]),
   );
   const isSafeComment = (comment: RankedComment) => {
     const report = safetyReportByCommentId.get(comment.id);
@@ -359,7 +359,7 @@ function applyLLMResult(
   });
   const selectedIds = new Set(selectedComments.map((comment) => comment.id));
   const ignoredComments = rankedComments.filter(
-    (comment) => !selectedIds.has(comment.id)
+    (comment) => !selectedIds.has(comment.id),
   );
   const contextForLLM = [
     ...rulesResult.contextForLLM,
@@ -397,7 +397,7 @@ function applyLLMResult(
 function buildAnsweredRankingInput(
   input: AnalyzeCommentsInput,
   answeredStates: Map<string, AnsweredState>,
-  config?: NonNullable<CommentIntelligenceConfig['ranking']>['answeredMemory']
+  config?: NonNullable<CommentIntelligenceConfig['ranking']>['answeredMemory'],
 ): {
   states: AnsweredState[];
   viewerIds: string[];
@@ -408,7 +408,7 @@ function buildAnsweredRankingInput(
   }
 
   const commentsById = new Map(
-    input.comments.map((comment) => [comment.id, comment])
+    input.comments.map((comment) => [comment.id, comment]),
   );
   const states = [...answeredStates.values()].map((state) => ({ ...state }));
 
@@ -436,7 +436,7 @@ function buildAnsweredRankingInput(
     .filter(
       (comment) =>
         answeredCommentIds.has(comment.id) ||
-        answeredViewerIds.has(comment.author.id)
+        answeredViewerIds.has(comment.author.id),
     )
     .map((comment) => comment.id);
 
@@ -474,7 +474,7 @@ function selectLLMAwareComments({
 
   if (topicFilter === 'require') {
     const selectedTopicMatches = selectedFromLLM.filter((comment) =>
-      comment.reasons.includes('topic_related')
+      comment.reasons.includes('topic_related'),
     );
     return uniqueRankedComments([
       ...selectedTopicMatches,
@@ -512,12 +512,12 @@ function uniqueStrings(values: string[]): string[] {
 function applyLLMTopicRelatedReasons(
   rankedComments: RankedComment[],
   llmResult: LLMCommentAnalysisResult,
-  llmCommentIds: Set<string>
+  llmCommentIds: Set<string>,
 ): RankedComment[] {
   const topicRelatedIds = new Set(
     (llmResult.topicRelatedCommentIds ?? []).filter((id) =>
-      llmCommentIds.has(id)
-    )
+      llmCommentIds.has(id),
+    ),
   );
   if (topicRelatedIds.size === 0) {
     return rankedComments;
@@ -548,10 +548,10 @@ function applyLLMTopicRelatedReasons(
 function mergeLLMSafetyFlags(
   safetyReports: SafetyReport[],
   llmResult: LLMCommentAnalysisResult,
-  llmCommentIds: Set<string>
+  llmCommentIds: Set<string>,
 ): SafetyReport[] {
   const byId = new Map(
-    safetyReports.map((report) => [report.commentId, report])
+    safetyReports.map((report) => [report.commentId, report]),
   );
 
   for (const flag of llmResult.safetyFlags ?? []) {
@@ -599,14 +599,14 @@ function updateViewerSafetyStates(
   input: AnalyzeCommentsInput,
   safetyReports: SafetyReport[],
   config: CommentIntelligenceConfig,
-  viewerSafetyStates: Map<string, ViewerSafetyState>
+  viewerSafetyStates: Map<string, ViewerSafetyState>,
 ): void {
   if (config.viewerSafety?.enabled === false) {
     return;
   }
 
   const commentsById = new Map(
-    input.comments.map((comment) => [comment.id, comment])
+    input.comments.map((comment) => [comment.id, comment]),
   );
   const violationThreshold = config.viewerSafety?.violationThreshold ?? 1;
   const shouldBlockOnHighRisk = config.viewerSafety?.blockOnHighRisk !== false;
@@ -644,14 +644,14 @@ function addViewerBlockedReports(
   input: AnalyzeCommentsInput,
   safetyReports: SafetyReport[],
   config: CommentIntelligenceConfig,
-  viewerSafetyStates: Map<string, ViewerSafetyState>
+  viewerSafetyStates: Map<string, ViewerSafetyState>,
 ): SafetyReport[] {
   if (config.viewerSafety?.enabled === false) {
     return safetyReports;
   }
 
   const byCommentId = new Map(
-    safetyReports.map((report) => [report.commentId, report])
+    safetyReports.map((report) => [report.commentId, report]),
   );
 
   for (const comment of input.comments) {
@@ -678,7 +678,7 @@ function addViewerBlockedReports(
 }
 
 function pruneExpiredViewerBlocks(
-  viewerSafetyStates: Map<string, ViewerSafetyState>
+  viewerSafetyStates: Map<string, ViewerSafetyState>,
 ): void {
   for (const [viewerId, state] of viewerSafetyStates.entries()) {
     if (state.blockedUntil !== undefined && state.blockedUntil <= Date.now()) {
@@ -689,7 +689,7 @@ function pruneExpiredViewerBlocks(
 
 function pruneExpiredAnsweredStates(
   answeredStates: Map<string, AnsweredState>,
-  config?: NonNullable<CommentIntelligenceConfig['ranking']>['answeredMemory']
+  config?: NonNullable<CommentIntelligenceConfig['ranking']>['answeredMemory'],
 ): void {
   if (config?.enabled === false) {
     return;
@@ -710,7 +710,7 @@ function pruneExpiredAnsweredStates(
 }
 
 function getBlockedViewerIds(
-  viewerSafetyStates: Map<string, ViewerSafetyState>
+  viewerSafetyStates: Map<string, ViewerSafetyState>,
 ): string[] {
   return [...viewerSafetyStates.values()]
     .filter((state) => isViewerBlocked(state))
@@ -720,29 +720,36 @@ function getBlockedViewerIds(
 function isViewerBlocked(state?: ViewerSafetyState): boolean {
   return Boolean(
     state &&
-      (state.blockedUntil === undefined || state.blockedUntil > Date.now())
+      (state.blockedUntil === undefined || state.blockedUntil > Date.now()),
   );
 }
 
 function buildDefaultInstruction(
   result: CommentIntelligenceResult,
-  language?: 'ja' | 'en' | 'auto'
+  language?: 'zh-CN' | 'ja' | 'en' | 'auto',
 ): string {
   const selected = result.selectedComments[0];
   if (!selected) {
     return buildInstruction(result, language);
   }
 
-  const resolvedLanguage = language === 'en' ? 'en' : 'ja';
+  const resolvedLanguage =
+    language === 'en' || language === 'ja' ? language : 'zh-CN';
   const hasFirstTimeViewer = result.ignoredSummary.clusters.some(
-    (cluster) => cluster.label === 'first_time_viewer'
+    (cluster) => cluster.label === 'first_time_viewer',
   );
   if (hasFirstTimeViewer) {
+    if (resolvedLanguage === 'zh-CN') {
+      return '自然欢迎新观众，并简短说明当前直播内容。';
+    }
     return resolvedLanguage === 'ja'
       ? '初見の視聴者にも分かるように、歓迎しつつ今日の配信内容を短く説明してください。'
       : "Welcome first-time viewers and briefly explain today's stream so they can follow along.";
   }
 
+  if (resolvedLanguage === 'zh-CN') {
+    return '自然回应选中的弹幕，并保持直播节奏。';
+  }
   return resolvedLanguage === 'ja'
     ? '選ばれたコメントに短く自然に返答し、配信のテンポを保ってください。'
     : 'Reply briefly and naturally to the selected comment, and keep the stream moving.';
@@ -750,7 +757,7 @@ function buildDefaultInstruction(
 
 async function withOptionalTimeout<T>(
   promise: Promise<T>,
-  timeoutMs?: number
+  timeoutMs?: number,
 ): Promise<T> {
   if (!timeoutMs || timeoutMs <= 0) {
     return promise;
@@ -761,7 +768,7 @@ async function withOptionalTimeout<T>(
     new Promise<T>((_, reject) => {
       setTimeout(
         () => reject(new Error('Comment analysis timed out')),
-        timeoutMs
+        timeoutMs,
       );
     }),
   ]);

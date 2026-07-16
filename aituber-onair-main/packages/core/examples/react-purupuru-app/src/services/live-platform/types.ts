@@ -11,6 +11,24 @@ export interface LivePlatformEventAdapter<TEvent, TStatus> {
   createEventUrl(clientKey: string, lastEventId?: string): string;
 }
 
+export interface LivePlatformReply {
+  message: string;
+  idempotencyKey: string;
+}
+
+export interface LivePlatformReplyResult {
+  ok: boolean;
+  duplicate: boolean;
+  chunksTotal: number;
+  chunksSent: number;
+  state?: 'delivered' | 'accepted' | 'skipped' | 'failed';
+}
+
+export interface LivePlatformReplyAdapter {
+  id: string;
+  send(reply: LivePlatformReply): Promise<LivePlatformReplyResult>;
+}
+
 export interface LiveRoomEvent {
   id: string;
   type: LiveRoomEventType;
@@ -44,6 +62,43 @@ export interface LiveRoomStatus {
   error?: string;
   isLive?: boolean;
   onlineCount?: number;
+  roomId?: number;
+  bridgeEngine?: string;
+  ordinaryroadVersion?: string;
+  connectedClients?: number;
+  outbound?: {
+    configured?: boolean;
+    authenticated?: boolean;
+  };
+  connectorId?: string;
+  platformId?: string;
+  platforms?: Record<string, LivePlatformConnectionStatus>;
+}
+
+export interface LivePlatformConnectionStatus {
+  platformId: string;
+  roomId: string;
+  state: string;
+  error?: string;
+  isLive?: boolean;
+  onlineCount?: number;
+  credentialState?: 'missing' | 'configured' | 'valid' | 'invalid' | 'unknown';
+  inbound?: boolean;
+  outbound?: boolean;
+  normalizedEvents?: number;
+  sentCount?: number;
+  lastEventAt?: number | null;
+  lastSentAt?: number | null;
+}
+
+export interface LiveConnectorDriver {
+  id: string;
+  discoverPlatforms?(): Promise<string[]>;
+  getStatus(): Promise<LiveRoomStatus>;
+  send(
+    platformId: string,
+    reply: LivePlatformReply,
+  ): Promise<LivePlatformReplyResult>;
 }
 
 export function isLiveRoomEvent(payload: unknown): payload is LiveRoomEvent {

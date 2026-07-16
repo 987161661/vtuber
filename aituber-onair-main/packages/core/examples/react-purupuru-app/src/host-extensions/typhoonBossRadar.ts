@@ -8,12 +8,13 @@ const LEGACY_TYPHOON_SKILL_ID = 'linglan-typhoon-radar';
 // weather regexes may be overly broad after encoding changes; a virtual host
 // must not turn every Chinese sentence into a weather lookup.
 const EXPLICIT_TYPHOON_TOPIC = /(?:\u53f0\u98ce|\u70ed\u5e26\u98ce\u66b4|\u70ed\u5e26\u4f4e\u538b|\u98ce\u66b4|\u98ce\u5708|\u8def\u5f84|\u767b\u9646|\u6c14\u538b|\u9884\u8b66|\u66b4\u96e8|\u96f7\u8fbe|\u536b\u661f|GFS|ECMWF|CWA|BOSS)/iu;
-const EXPLICIT_PLACE_WEATHER_TOPIC = /(?:\u5929\u6c14|\u98ce\u529b|\u4e0b\u96e8|\u6709\u5f71\u54cd\u5417|\u4ec0\u4e48\u60c5\u51b5)/u;
+const NAMED_TYPHOON_STATUS_QUESTION =
+  /^\s*[\u4e00-\u9fff]{2,4}(?:\u554a|\u5440|\u5462)?(?:[\s\uff0c\u3001\uff1f?]*(?:\u4ed6|\u5b83|\u5979))?(?:\u73b0\u5728|\u76ee\u524d|\u540e\u6765)?(?:\u600e\u4e48\u6837|\u5982\u4f55|\u53bb\u54ea|\u5230\u54ea|\u5728\u54ea|\u8fd8\u5728|\u767b\u9646|\u6d88\u6563|\u964d\u7ea7|\u51cf\u5f31)/u;
 
 function shouldUseTyphoonSkill(query: string, inherited: boolean) {
   if (inherited) return true;
   return EXPLICIT_TYPHOON_TOPIC.test(query) ||
-    (/[\u4e00-\u9fff]{2,}/u.test(query) && EXPLICIT_PLACE_WEATHER_TOPIC.test(query));
+    NAMED_TYPHOON_STATUS_QUESTION.test(query);
 }
 
 const TYPHOON_DATA_UNAVAILABLE_REPLY =

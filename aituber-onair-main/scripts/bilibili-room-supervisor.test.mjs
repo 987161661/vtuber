@@ -1,11 +1,14 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
+  BilibiliDanmuSender,
   decodePackets,
   encodePacket,
   EventHub,
   normalizeHistoryComment,
   normalizeRoomEvent,
+  parseJsonBody,
+  splitDanmuText,
 } from './bilibili-room-supervisor.mjs';
 
 test('encodes and decodes protocol packets', () => {
@@ -14,6 +17,17 @@ test('encodes and decodes protocol packets', () => {
   );
   assert.equal(decoded.operation, 5);
   assert.deepEqual(JSON.parse(decoded.body.toString()), { cmd: 'TEST' });
+});
+
+test('falls back to GB18030 when a danmaku JSON body is not UTF-8', () => {
+  const body = Buffer.concat([
+    Buffer.from('{"cmd":"DANMU_MSG","info":[[0,0,0,0,1],"@'),
+    Buffer.from([0xc9, 0xcf, 0xba, 0xa3]),
+    Buffer.from('",[1,"viewer"],[]]}'),
+  ]);
+  const payload = parseJsonBody({ body });
+  assert.equal(payload.info[1], '@上海');
+  assert.equal(normalizeRoomEvent(payload).text, '@上海');
 });
 
 test('normalizes danmaku messages', () => {
@@ -166,4 +180,104 @@ test('replays recent restart-gap events when a returning client has an old curso
     writes.some((value) => value.includes(event.id)),
     true,
   );
+});
+
+test('splits outbound danmu on Unicode code points and punctuation', () => {
+  assert.deepEqual(splitDanmuText('第一句话，第二句话。', 6), [
+    '第一句话，',
+    '第二句话。',
+  ]);
+  assert.deepEqual(splitDanmuText('😀😀😀', 2), ['😀😀', '😀']);
+});
+
+test('sends authenticated danmu once for an idempotency key', async () => {
+  const requests = [];
+  const sender = new BilibiliDanmuSender({
+    intervalMs: 0,
+    maxLength: 20,
+    authProvider: () => ({
+      configured: true,
+      cookie: 'SESSDATA=session; bili_jct=csrf-value',
+      csrf: 'csrf-value',
+    }),
+    fetchImpl: async (url, options = {}) => {
+      requests.push({ url, options });
+      if (url.includes('/x/web-interface/nav')) {
+        return new Response(
+          JSON.stringify({ code: 0, data: { isLogin: true, mid: 123 } }),
+          { status: 200 },
+        );
+      }
+      return new Response(JSON.stringify({ code: 0, data: {} }), {
+        status: 200,
+      });
+    },
+  });
+
+  const first = await sender.send({
+    roomId: 456,
+    message: '测试自动回复',
+    idempotencyKey: 'event-1',
+  });
+  const second = await sender.send({
+    roomId: 456,
+    message: '测试自动回复',
+    idempotencyKey: 'event-1',
+  });
+
+  assert.equal(first.duplicate, false);
+  assert.equal(second.duplicate, true);
+  assert.equal(
+    requests.filter(({ url }) => url.endsWith('/msg/send')).length,
+    1,
+  );
+  const sendRequest = requests.find(({ url }) => url.endsWith('/msg/send'));
+  assert.equal(sendRequest.options.body.get('roomid'), '456');
+  assert.equal(sendRequest.options.body.get('csrf'), 'csrf-value');
+  assert.equal(sendRequest.options.body.get('msg'), '测试自动回复');
+  assert.equal(sendRequest.options.headers.Cookie.includes('SESSDATA='), true);
+});
+
+test('rejects outbound danmu when local authentication is missing', async () => {
+  const sender = new BilibiliDanmuSender({
+    authProvider: () => ({ configured: false, cookie: '', csrf: '' }),
+  });
+  await assert.rejects(
+    sender.send({ roomId: 1, message: 'test', idempotencyKey: 'event-2' }),
+    /bilibili_outbound_auth_missing/,
+  );
+});
+
+test('coalesces concurrent sends with the same idempotency key', async () => {
+  let sendRequests = 0;
+  const sender = new BilibiliDanmuSender({
+    intervalMs: 0,
+    authProvider: () => ({
+      configured: true,
+      cookie: 'SESSDATA=session; bili_jct=csrf-value',
+      csrf: 'csrf-value',
+    }),
+    fetchImpl: async (url) => {
+      if (url.includes('/x/web-interface/nav')) {
+        return new Response(
+          JSON.stringify({ code: 0, data: { isLogin: true, mid: 123 } }),
+          { status: 200 },
+        );
+      }
+      sendRequests += 1;
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      return new Response(JSON.stringify({ code: 0, data: {} }), {
+        status: 200,
+      });
+    },
+  });
+
+  const [first, second] = await Promise.all([
+    sender.send({ roomId: 456, message: '同一条回复', idempotencyKey: 'same' }),
+    sender.send({ roomId: 456, message: '同一条回复', idempotencyKey: 'same' }),
+  ]);
+
+  assert.equal(sendRequests, 1);
+  assert.equal(first.duplicate, false);
+  assert.equal(second.duplicate, true);
 });

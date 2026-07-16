@@ -6,6 +6,7 @@ import {
 import { MinimaxEngine, type MinimaxModel } from '../src/engines/MinimaxEngine';
 
 afterEach(() => {
+  vi.useRealTimers();
   vi.restoreAllMocks();
 });
 
@@ -36,7 +37,7 @@ describe('MinimaxEngine', () => {
       }
 
       expect(chunks.map((chunk) => chunk.byteLength)).toEqual([
-        32_768, 32_768, 4_464,
+        16_384, 32_768, 20_848,
       ]);
       expect(
         new Uint8Array(chunks.flatMap((chunk) => Array.from(chunk))),
@@ -71,6 +72,95 @@ describe('MinimaxEngine', () => {
 
       expect(chunks).toHaveLength(1);
       expect(chunks[0]).toEqual(new Uint8Array([1, 2, 3, 4]));
+    });
+
+    it('stops at terminal status even when the SSE transport stays open', async () => {
+      const engine = new MinimaxEngine();
+      const encoder = new TextEncoder();
+      const cancelled = vi.fn();
+      const body = new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(
+            encoder.encode(
+              `data: ${JSON.stringify({ data: { audio: '01020304', status: 1 } })}\n\n` +
+                `data: ${JSON.stringify({ data: { audio: '01020304', status: 2 } })}\n\n`,
+            ),
+          );
+        },
+        cancel: cancelled,
+      });
+      vi.stubGlobal(
+        'fetch',
+        vi.fn().mockResolvedValue(
+          new Response(body, {
+            status: 200,
+            headers: { 'Content-Type': 'text/event-stream' },
+          }),
+        ),
+      );
+
+      const chunks: Uint8Array[] = [];
+      for await (const chunk of engine.fetchAudioStream(
+        { style: 'talk', message: 'test' },
+        'voice-id',
+        'api-key',
+      )) {
+        chunks.push(new Uint8Array(chunk));
+      }
+
+      expect(cancelled).toHaveBeenCalledOnce();
+      expect(chunks).toEqual([new Uint8Array([1, 2, 3, 4])]);
+    });
+
+    it('aborts a status=1 stream that stops making audio progress', async () => {
+      vi.useFakeTimers();
+      const engine = new MinimaxEngine();
+      const encoder = new TextEncoder();
+      const cancelled = vi.fn();
+      const audio = new Uint8Array(17_000).fill(7);
+      const hex = Array.from(audio, (value) =>
+        value.toString(16).padStart(2, '0'),
+      ).join('');
+      const body = new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(
+            encoder.encode(
+              `data: ${JSON.stringify({ data: { audio: hex, status: 1 } })}\n\n`,
+            ),
+          );
+        },
+        cancel: cancelled,
+      });
+      let requestSignal: AbortSignal | null = null;
+      vi.stubGlobal(
+        'fetch',
+        vi.fn().mockImplementation((_input, init: RequestInit) => {
+          requestSignal = init.signal as AbortSignal;
+          return Promise.resolve(
+            new Response(body, {
+              status: 200,
+              headers: { 'Content-Type': 'text/event-stream' },
+            }),
+          );
+        }),
+      );
+
+      const iterator = engine.fetchAudioStream(
+        { style: 'talk', message: 'test' },
+        'voice-id',
+        'api-key',
+      );
+      const first = await iterator.next();
+      expect(first.value?.byteLength).toBe(16_384);
+
+      const tailPromise = iterator.next();
+      await vi.advanceTimersByTimeAsync(8_001);
+      const tail = await tailPromise;
+
+      expect(tail.value?.byteLength).toBe(616);
+      expect(requestSignal?.aborted).toBe(true);
+      expect(cancelled).toHaveBeenCalledOnce();
+      await expect(iterator.next()).resolves.toMatchObject({ done: true });
     });
 
     it('keeps status=2 audio when it is the only audio response', async () => {
@@ -216,7 +306,7 @@ describe('MinimaxEngine', () => {
 
         const body = JSON.parse(fetchMock.mock.calls[0][1].body);
         expect(body.voice_setting.speed).toBe(1.0);
-        expect(body.audio_setting.sample_rate).toBe(32000);
+        expect(body.audio_setting.sample_rate).toBe(44100);
       } finally {
         globalThis.fetch = originalFetch;
       }
@@ -260,7 +350,7 @@ describe('MinimaxEngine', () => {
           pitch: 0,
         },
         audio_setting: {
-          sample_rate: 32000,
+          sample_rate: 44100,
           bitrate: 128000,
           format: 'mp3',
           channel: 1,
@@ -374,9 +464,10 @@ describe('MinimaxEngine', () => {
         text: 'hello',
         voice_setting: {
           voice_id: 'voice-id',
-          speed: 1.06,
+          speed: 1,
           vol: 1,
-          pitch: 1,
+          pitch: 0,
+          emotion: 'happy',
         },
       });
     });
@@ -406,7 +497,7 @@ describe('MinimaxEngine', () => {
       );
       await engine.fetchAudio(
         {
-          style: 'talk',
+          style: 'bored',
           delivery: 'serious',
           emotionIntensity: 0.7,
           message: 'serious answer',
@@ -423,13 +514,102 @@ describe('MinimaxEngine', () => {
         vol: 0.96,
         pitch: 0,
       });
-      expect(serious).toMatchObject({
-        emotion: 'neutral',
-        speed: 0.9,
-        vol: 0.94,
-        pitch: -2,
-      });
+      expect(serious).toMatchObject({ emotion: 'neutral', pitch: -3 });
+      expect(serious.speed).toBeCloseTo(0.85825, 5);
+      expect(serious.vol).toBeCloseTo(0.8899, 5);
       expect(warm).not.toEqual(serious);
+    });
+
+    it('maps nuanced host emotions to MiniMax-supported emotion controls', async () => {
+      const engine = new MinimaxEngine();
+      const fetchMock = vi.fn().mockResolvedValue({
+        ok: true,
+        json: async () => ({
+          base_resp: { status_code: 0 },
+          data: { audio: '0a0b' },
+        }),
+      });
+      vi.stubGlobal('fetch', fetchMock);
+
+      await engine.fetchAudio(
+        {
+          style: 'bored',
+          delivery: 'calm',
+          emotionIntensity: 0.42,
+          message: '我听见了。',
+        },
+        'voice-id',
+        'api-key',
+      );
+      await engine.fetchAudio(
+        {
+          style: 'impatient',
+          delivery: 'serious',
+          emotionIntensity: 0.55,
+          message: '先别催。',
+        },
+        'voice-id',
+        'api-key',
+      );
+      await engine.fetchAudio(
+        {
+          style: 'awkward',
+          delivery: 'soft',
+          emotionIntensity: 0.38,
+          message: '你这么说，我有点不知道怎么接。',
+        },
+        'voice-id',
+        'api-key',
+      );
+
+      const [bored, impatient, awkward] = fetchMock.mock.calls.map((call) =>
+        JSON.parse(call[1].body).voice_setting,
+      );
+      expect(bored).toMatchObject({ emotion: 'neutral', pitch: -2 });
+      expect(bored.speed).toBeCloseTo(0.90595, 5);
+      expect(impatient).toMatchObject({ emotion: 'angry', pitch: -2 });
+      expect(impatient.speed).toBeCloseTo(0.937625, 5);
+      expect(awkward).toMatchObject({ emotion: 'surprised', pitch: -2 });
+      expect(awkward.speed).toBeCloseTo(0.90364, 5);
+      expect(bored).not.toEqual(impatient);
+      expect(impatient).not.toEqual(awkward);
+    });
+
+    it('applies composable prosody controls without changing the selected voice', async () => {
+      const engine = new MinimaxEngine();
+      const fetchMock = vi.fn().mockResolvedValue({
+        ok: true,
+        json: async () => ({
+          base_resp: { status_code: 0 },
+          data: { audio: '0a0b' },
+        }),
+      });
+      vi.stubGlobal('fetch', fetchMock);
+
+      await engine.fetchAudio(
+        {
+          style: 'embarrassed',
+          delivery: 'soft',
+          emotionIntensity: 0.4,
+          prosody: {
+            pace: -0.5,
+            pitch: -0.3,
+            volume: -0.4,
+            warmth: 0.7,
+            breathiness: 0.4,
+          },
+          message: '这个……先不说。',
+        },
+        'voice-id',
+        'api-key',
+      );
+
+      const setting = JSON.parse(fetchMock.mock.calls[0][1].body).voice_setting;
+      expect(setting.voice_id).toBe('voice-id');
+      expect(setting.emotion).toBe('surprised');
+      expect(setting.speed).toBeLessThan(0.9);
+      expect(setting.vol).toBeLessThan(0.9);
+      expect(setting.pitch).toBeLessThan(-1);
     });
 
     it('should validate production synthesis inputs', async () => {

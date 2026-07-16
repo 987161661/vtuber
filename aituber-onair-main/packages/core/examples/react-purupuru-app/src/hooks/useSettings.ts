@@ -19,11 +19,21 @@ import type {
   DigitalHumanPersona,
   AvatarViewTransform,
   ChatProviderOption,
+  EmptyRoomBehaviorStrategy,
   StreamingPlatformOption,
   SocialStreamSettings,
+  LiveConnectorSettings,
   TTSEngineOption,
   VisualSettings,
 } from '../types/settings';
+import { createPlatformConnection } from '../services/live-platform/connectors';
+import {
+  discardRuntimeCredentialsForBrowser,
+  mergeBrowserOnlyCredentialsAfterPublish,
+  resolveBrowserCredential,
+  sanitizeRuntimeSettingsForBrowser,
+  sanitizeRuntimeSettingsForBrowserStorage,
+} from '../lib/runtimeSettingsSecurity';
 
 type ApiKeyProvider = Exclude<ChatProviderOption, 'gemini-nano'>;
 
@@ -69,58 +79,70 @@ const AVATAR_VIEW_MIN_SCALE = 0.2;
 const AVATAR_VIEW_MAX_SCALE = 3;
 const AVATAR_VIEW_MAX_OFFSET = 100_000;
 
-function preferLocalCredential(
-  localValue: string | undefined,
-  remoteValue: string | undefined,
-): string {
-  // A listener can safely inherit non-secret runtime settings, but an empty
-  // producer snapshot must never erase a working credential stored by the
-  // browser actually responsible for playback.
-  return localValue?.trim() ? localValue : remoteValue || '';
+const DEFAULT_EMPTY_ROOM_BEHAVIOR_STRATEGIES: EmptyRoomBehaviorStrategy[] = [
+  {
+    id: 'talk-to-viewer',
+    name: '向个人观众搭话',
+    prompt:
+      '若现场有可安全识别且近期未被反复追问的观众，可自然地向对方或全体在场的人搭一句话。邀请分享、表达共情即可；不催回复，不虚构对方经历，也不连续点名施压。',
+    probability: 35,
+    enabled: true,
+  },
+  {
+    id: 'present-thought',
+    name: '当下独白',
+    prompt:
+      '从此刻的细微感受、偏好、半截念头或小小自嘲出发，说一句生活化的话。不要播报天气、专业信息或把话说成结论与建议。',
+    probability: 35,
+    enabled: true,
+  },
+  {
+    id: 'memory-association',
+    name: '记忆联想',
+    prompt:
+      '可借用提供的近期记忆产生当下联想，但不能朗读档案、不能编造经历；让它像忽然想起的一点生活感受。',
+    probability: 20,
+    enabled: true,
+  },
+  {
+    id: 'quiet-presence',
+    name: '安静陪伴',
+    prompt:
+      '不要求任何人回应，只留下一句让空间显得有人在的自然表达。可以不完整，可以没有结论。',
+    probability: 10,
+    enabled: true,
+  },
+];
+
+function normalizeEmptyRoomBehaviorStrategies(
+  value: unknown,
+): EmptyRoomBehaviorStrategy[] {
+  if (!Array.isArray(value)) return DEFAULT_EMPTY_ROOM_BEHAVIOR_STRATEGIES;
+  const usedIds = new Set<string>();
+  const strategies = value.flatMap((candidate, index) => {
+    if (!candidate || typeof candidate !== 'object') return [];
+    const raw = candidate as Partial<EmptyRoomBehaviorStrategy>;
+    const name = typeof raw.name === 'string' ? raw.name.trim().slice(0, 80) : '';
+    const prompt = typeof raw.prompt === 'string' ? raw.prompt.trim().slice(0, 1600) : '';
+    if (!name || !prompt) return [];
+    const baseId = typeof raw.id === 'string' && raw.id.trim() ? raw.id.trim().slice(0, 80) : `strategy-${index + 1}`;
+    const id = usedIds.has(baseId) ? `${baseId}-${index + 1}` : baseId;
+    usedIds.add(id);
+    return [{
+      id,
+      name,
+      prompt,
+      probability: clampNumber(Number(raw.probability), 0, 100),
+      enabled: raw.enabled !== false,
+    }];
+  });
+  return strategies.slice(0, 12);
 }
 
-function retainLocalTtsCredentials(
-  remote: AppSettings,
-  local: AppSettings,
-): AppSettings {
-  return {
-    ...remote,
-    tts: {
-      ...remote.tts,
-      openAiCompatibleApiKey: preferLocalCredential(
-        local.tts.openAiCompatibleApiKey,
-        remote.tts.openAiCompatibleApiKey,
-      ),
-      aivisCloudApiKey: preferLocalCredential(
-        local.tts.aivisCloudApiKey,
-        remote.tts.aivisCloudApiKey,
-      ),
-      minimaxApiKey: preferLocalCredential(
-        local.tts.minimaxApiKey,
-        remote.tts.minimaxApiKey,
-      ),
-      minimaxGroupId: preferLocalCredential(
-        local.tts.minimaxGroupId,
-        remote.tts.minimaxGroupId,
-      ),
-      unrealSpeechApiKey: preferLocalCredential(
-        local.tts.unrealSpeechApiKey,
-        remote.tts.unrealSpeechApiKey,
-      ),
-      elevenLabsApiKey: preferLocalCredential(
-        local.tts.elevenLabsApiKey,
-        remote.tts.elevenLabsApiKey,
-      ),
-      inworldApiKey: preferLocalCredential(
-        local.tts.inworldApiKey,
-        remote.tts.inworldApiKey,
-      ),
-      gradiumApiKey: preferLocalCredential(
-        local.tts.gradiumApiKey,
-        remote.tts.gradiumApiKey,
-      ),
-    },
-  };
+function browserRuntimeOrigin(): string {
+  return typeof window !== 'undefined' && window.location?.origin
+    ? window.location.origin
+    : 'http://127.0.0.1';
 }
 const LEGACY_LINGLAN_DESCRIPTION =
   '台风监测主播 · MiniMax · SoulX-FlashHead Lite';
@@ -321,6 +343,11 @@ function getDefaultSettings(): AppSettings {
         },
       ],
     },
+    soul: {
+      // New cognition starts as an observer. Public behaviour changes only
+      // after the shadow acceptance ledger is explicitly promoted.
+      runtimeMode: 'shadow',
+    },
     llm: {
       provider: 'openai',
       model: 'gpt-4.1-nano',
@@ -436,6 +463,8 @@ function getDefaultSettings(): AppSettings {
       twitchEnabled: false,
       twitchCommentIntervalMs: 20_000,
       bilibiliEnabled: false,
+      bilibiliReplyEnabled: false,
+      bilibiliGatewayUrl: '/api/bilibili',
       customSseEndpoint: '',
       customSseEnabled: false,
     },
@@ -444,6 +473,26 @@ function getDefaultSettings(): AppSettings {
       sessionId: '',
       serverUrl: 'wss://io.socialstream.ninja',
       platforms: [],
+    },
+    liveConnectors: {
+      schemaVersion: 1,
+      ordinaryRoad: {
+        enabled: false,
+        gatewayUrl: '/api/live-connectors/ordinaryroad',
+        platforms: {
+          bilibili: createPlatformConnection('', false),
+          douyu: createPlatformConnection(),
+          huya: createPlatformConnection(),
+          douyin: createPlatformConnection(),
+          kuaishou: createPlatformConnection(),
+        },
+      },
+      socialStreamNinja: {
+        enabled: false,
+        sessionId: '',
+        serverUrl: 'wss://io.socialstream.ninja',
+        platforms: {},
+      },
     },
     commentIntelligence: {
       enabled: true,
@@ -467,20 +516,41 @@ function getDefaultSettings(): AppSettings {
     },
     emptyRoomAwareness: {
       enabled: true,
-      minIntervalMs: 60_000,
-      maxIntervalMs: 10 * 60_000,
+      audiencePolicy: 'any',
+      scheduleEnabled: false,
+      scheduleStartHour: 0,
+      scheduleEndHour: 0,
+      minIntervalMs: 2 * 60_000,
+      maxIntervalMs: 2 * 60_000,
+      proactiveCooldownMs: 2 * 60_000,
+      maxProactiveTurns: 12,
+      maxSentences: 2,
+      behaviorStrategies: DEFAULT_EMPTY_ROOM_BEHAVIOR_STRATEGIES,
       interfaceWeight: 40,
       memoryWeight: 35,
       inspirationWeight: 25,
+      audienceWeight: 30,
     },
   };
 }
 
-function loadSettings(): AppSettings {
+function loadSettings(allowTransientCredentialMigration = false): AppSettings {
   try {
     const raw = localStorage.getItem(STORAGE_KEY);
     if (raw) {
-      const saved = JSON.parse(raw) as Partial<AppSettings>;
+      const parsed = JSON.parse(raw) as Partial<AppSettings>;
+      const browserSafe = sanitizeRuntimeSettingsForBrowserStorage(
+        parsed,
+        browserRuntimeOrigin(),
+      );
+      const browserSafeSerialized = JSON.stringify(browserSafe);
+      if (browserSafeSerialized !== raw) {
+        // Synchronous migration: a legacy raw credential is removed before
+        // React mounts. A producer may retain the parsed value only long
+        // enough to hand it to the local server once.
+        localStorage.setItem(STORAGE_KEY, browserSafeSerialized);
+      }
+      const saved = allowTransientCredentialMigration ? parsed : browserSafe;
       const defaults = getDefaultSettings();
       const tts = { ...defaults.tts, ...saved.tts };
       if (
@@ -546,8 +616,96 @@ function loadSettings(): AppSettings {
       if (activeProfile?.voiceSpeaker) {
         tts.speaker = activeProfile.voiceSpeaker;
       }
+      const savedConnectors = saved.liveConnectors;
+      const legacyBilibiliEnabled = Boolean(saved.stream?.bilibiliEnabled);
+      const legacyBilibiliReplyEnabled = Boolean(
+        saved.stream?.bilibiliReplyEnabled,
+      );
+      const normalizeConnectionMap = (
+        current: Record<string, Partial<ReturnType<typeof createPlatformConnection>>> | undefined,
+        fallback: Record<string, ReturnType<typeof createPlatformConnection>>,
+      ) =>
+        Object.fromEntries(
+          Object.entries({ ...fallback, ...(current ?? {}) }).map(
+            ([platformId, value]) => [
+              platformId,
+              createPlatformConnection(value.roomId, value.enabled, value.outbound),
+            ],
+          ),
+        );
+      const needsLegacyConnectorMigration = savedConnectors?.schemaVersion !== 1;
+      const liveConnectors: LiveConnectorSettings = {
+        schemaVersion: 1,
+        ordinaryRoad: {
+          ...defaults.liveConnectors.ordinaryRoad,
+          ...savedConnectors?.ordinaryRoad,
+          enabled:
+            savedConnectors?.ordinaryRoad?.enabled ?? legacyBilibiliEnabled,
+          gatewayUrl:
+            savedConnectors?.ordinaryRoad?.gatewayUrl ||
+            (saved.stream?.bilibiliGatewayUrl === '/api/bilibili'
+              ? defaults.liveConnectors.ordinaryRoad.gatewayUrl
+              : saved.stream?.bilibiliGatewayUrl) ||
+            defaults.liveConnectors.ordinaryRoad.gatewayUrl,
+          platforms: normalizeConnectionMap(
+            savedConnectors?.ordinaryRoad?.platforms,
+            {
+              ...defaults.liveConnectors.ordinaryRoad.platforms,
+              bilibili: createPlatformConnection('', legacyBilibiliEnabled, {
+                viewerReplies: legacyBilibiliReplyEnabled,
+                proactiveSpeech: legacyBilibiliReplyEnabled,
+                operatorBroadcasts: legacyBilibiliReplyEnabled,
+              }),
+            },
+          ),
+        },
+        socialStreamNinja: {
+          ...defaults.liveConnectors.socialStreamNinja,
+          ...savedConnectors?.socialStreamNinja,
+          enabled:
+            savedConnectors?.socialStreamNinja?.enabled ??
+            Boolean(saved.socialStream?.enabled),
+          sessionId:
+            savedConnectors?.socialStreamNinja?.sessionId ||
+            saved.socialStream?.sessionId ||
+            '',
+          serverUrl:
+            savedConnectors?.socialStreamNinja?.serverUrl ||
+            saved.socialStream?.serverUrl ||
+            defaults.liveConnectors.socialStreamNinja.serverUrl,
+          platforms: normalizeConnectionMap(
+            savedConnectors?.socialStreamNinja?.platforms,
+            Object.fromEntries(
+              (saved.socialStream?.platforms ?? []).map((platformId) => [
+                platformId,
+                createPlatformConnection('', true),
+              ]),
+            ),
+          ),
+        },
+      };
+      if (needsLegacyConnectorMigration) {
+        const bilibili = liveConnectors.ordinaryRoad.platforms.bilibili;
+        bilibili.enabled = bilibili.enabled || legacyBilibiliEnabled;
+        liveConnectors.ordinaryRoad.enabled =
+          liveConnectors.ordinaryRoad.enabled || legacyBilibiliEnabled;
+        if (legacyBilibiliReplyEnabled) {
+          bilibili.outbound = {
+            viewerReplies: true,
+            proactiveSpeech: true,
+            operatorBroadcasts: true,
+          };
+        }
+      }
       return {
         digitalHumans,
+        soul: {
+          runtimeMode: ['legacy', 'shadow', 'canary', 'primary'].includes(
+            String(saved.soul?.runtimeMode),
+          )
+            ? saved.soul!.runtimeMode
+            : defaults.soul.runtimeMode,
+        },
         llm: {
           ...defaults.llm,
           ...saved.llm,
@@ -569,15 +727,65 @@ function loadSettings(): AppSettings {
               )
             : defaults.socialStream.platforms,
         },
+        liveConnectors,
         commentIntelligence: {
           ...defaults.commentIntelligence,
           ...saved.commentIntelligence,
         },
         manneri: { ...defaults.manneri, ...saved.manneri },
-        emptyRoomAwareness: {
-          ...defaults.emptyRoomAwareness,
-          ...saved.emptyRoomAwareness,
-        },
+        emptyRoomAwareness: (() => {
+          const merged = {
+            ...defaults.emptyRoomAwareness,
+            ...saved.emptyRoomAwareness,
+          };
+          const minIntervalMs = Math.max(
+            2 * 60_000,
+            normalizePositiveInteger(merged.minIntervalMs, 2 * 60_000),
+          );
+          return {
+            ...merged,
+            minIntervalMs,
+            maxIntervalMs: Math.max(
+              minIntervalMs,
+              normalizePositiveInteger(merged.maxIntervalMs, 2 * 60_000),
+            ),
+            proactiveCooldownMs: clampNumber(
+              normalizePositiveInteger(merged.proactiveCooldownMs, 2 * 60_000),
+              30_000,
+              60 * 60_000,
+            ),
+            maxProactiveTurns: clampNumber(
+              normalizePositiveInteger(merged.maxProactiveTurns, 12),
+              1,
+              100,
+            ),
+            audiencePolicy: ['any', 'empty_only', 'audience_only'].includes(
+              merged.audiencePolicy,
+            )
+              ? merged.audiencePolicy
+              : 'any',
+            scheduleEnabled: Boolean(merged.scheduleEnabled),
+            scheduleStartHour: clampNumber(
+              Math.round(Number(merged.scheduleStartHour) || 0),
+              0,
+              23,
+            ),
+            scheduleEndHour: clampNumber(
+              Math.round(Number(merged.scheduleEndHour) || 0),
+              0,
+              23,
+            ),
+            maxSentences: clampNumber(
+              Math.round(Number(merged.maxSentences) || 2),
+              1,
+              3,
+            ) as 1 | 2 | 3,
+            behaviorStrategies: normalizeEmptyRoomBehaviorStrategies(
+              saved.emptyRoomAwareness?.behaviorStrategies,
+            ),
+            audienceWeight: clampNumber(merged.audienceWeight, 0, 100),
+          };
+        })(),
       };
     }
   } catch {
@@ -587,13 +795,41 @@ function loadSettings(): AppSettings {
 }
 
 function saveSettings(settings: AppSettings) {
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(settings));
+  localStorage.setItem(
+    STORAGE_KEY,
+    JSON.stringify(
+      sanitizeRuntimeSettingsForBrowserStorage(
+        settings,
+        browserRuntimeOrigin(),
+      ),
+    ),
+  );
 }
 
 type RuntimeSettingsRole = 'producer' | 'consumer' | 'standalone';
 
+interface RuntimeSettingsEnvelope {
+  version: 1;
+  revision: number;
+  publishedAt: number;
+  settings: AppSettings;
+}
+
+function isRuntimeSettingsEnvelope(value: unknown): value is RuntimeSettingsEnvelope {
+  if (!value || typeof value !== 'object') return false;
+  const envelope = value as Partial<RuntimeSettingsEnvelope>;
+  return (
+    envelope.version === 1 &&
+    typeof envelope.revision === 'number' &&
+    typeof envelope.publishedAt === 'number' &&
+    Boolean(envelope.settings)
+  );
+}
+
 export function useSettings(runtimeRole: RuntimeSettingsRole = 'standalone') {
-  const [settings, setSettings] = useState<AppSettings>(loadSettings);
+  const [settings, setSettings] = useState<AppSettings>(() =>
+    loadSettings(runtimeRole === 'producer'),
+  );
   const [openRouterRefreshError, setOpenRouterRefreshError] = useState('');
   const [
     isRefreshingOpenRouterFreeModels,
@@ -618,55 +854,125 @@ export function useSettings(runtimeRole: RuntimeSettingsRole = 'standalone') {
     return [DEFAULT_OPENAI_COMPATIBLE_MODEL];
   }, [settings.llm.provider, settings.llm.model, openRouterDynamicModels]);
 
-  // Persist settings on change
+  // Browser persistence is always public. A producer can transiently hold a
+  // newly entered credential only until this same-origin handoff completes.
   useEffect(() => {
     saveSettings(settings);
-    if (runtimeRole === 'producer') {
-      void fetch('/api/runtime-settings', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(settings),
-      }).catch(() => undefined);
-    }
+    if (runtimeRole !== 'producer') return;
+
+    let cancelled = false;
+    const publish = async () => {
+      let publishedSettings: AppSettings | null = null;
+      let accepted = false;
+      try {
+        const response = await fetch('/api/runtime-settings', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'X-Runtime-Settings-Role': 'producer',
+          },
+          body: JSON.stringify(settings),
+        });
+        accepted = response.ok;
+        if (response.ok && response.status !== 204) {
+          const payload: unknown = await response.json();
+          if (isRuntimeSettingsEnvelope(payload)) {
+            publishedSettings = payload.settings;
+          }
+        }
+        if (response.ok && !publishedSettings) {
+          const snapshotResponse = await fetch('/api/runtime-settings', {
+            cache: 'no-store',
+          });
+          if (snapshotResponse.ok) {
+            const payload: unknown = await snapshotResponse.json();
+            if (isRuntimeSettingsEnvelope(payload)) {
+              publishedSettings = payload.settings;
+            }
+          }
+        }
+      } catch {
+        // Fail closed below: a key that was not accepted by the local server
+        // is discarded from browser state and must be entered again.
+      }
+
+      if (cancelled) return;
+      const publicSettings = accepted
+        ? (sanitizeRuntimeSettingsForBrowser(
+            publishedSettings ?? settings,
+            browserRuntimeOrigin(),
+          ) as AppSettings)
+        : discardRuntimeCredentialsForBrowser(settings);
+      const browserState = accepted
+        ? mergeBrowserOnlyCredentialsAfterPublish(publicSettings, settings)
+        : publicSettings;
+      setSettings((current) =>
+        JSON.stringify(current) === JSON.stringify(browserState)
+          ? current
+          : browserState,
+      );
+    };
+
+    // Avoid publishing every partial character while an operator types or
+    // pastes a replacement credential.
+    const timer = window.setTimeout(() => {
+      void publish();
+    }, 500);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
   }, [runtimeRole, settings]);
 
   useEffect(() => {
+    if (runtimeRole !== 'consumer') return;
     let cancelled = false;
+    let source: EventSource | null = null;
+    let latestRevision = -1;
+    const applySnapshot = (envelope: RuntimeSettingsEnvelope) => {
+      if (cancelled || envelope.revision <= latestRevision) return;
+      latestRevision = envelope.revision;
+      const runtimeSettings = envelope.settings;
+      const normalizedRuntimeSettings: AppSettings = {
+        ...runtimeSettings,
+        visual: {
+          ...runtimeSettings.visual,
+          avatarViewX: 0,
+          avatarViewY: 0,
+          avatarViewScale: 1,
+        },
+      };
+      saveSettings(normalizedRuntimeSettings);
+      setSettings(loadSettings());
+    };
     const sync = async () => {
       try {
         const response = await fetch('/api/runtime-settings', {
           cache: 'no-store',
         });
         if (!response.ok) return;
-        const remote = (await response.json()) as AppSettings;
-        if (cancelled) return;
-        const local = loadSettings();
-        const runtimeSettings: AppSettings = retainLocalTtsCredentials(remote, local);
-        const normalizedRuntimeSettings: AppSettings = {
-          ...runtimeSettings,
-          visual: {
-            ...runtimeSettings.visual,
-            avatarViewX: 0,
-            avatarViewY: 0,
-            avatarViewScale: 1,
-          },
-          stream: runtimeSettings.stream,
-        };
-        localStorage.setItem(STORAGE_KEY, JSON.stringify(normalizedRuntimeSettings));
-        setSettings(loadSettings());
+        const payload: unknown = await response.json();
+        if (isRuntimeSettingsEnvelope(payload)) applySnapshot(payload);
       } catch {
-        // Keep the last settings cached by the OBS browser source.
+        // Keep the last published snapshot while the local coordinator reloads.
       }
     };
     void sync();
-    const syncOnSettingsChange = (event: StorageEvent) => {
-      if (event.key === STORAGE_KEY) void sync();
-    };
-    window.addEventListener('storage', syncOnSettingsChange);
-    const timer = window.setInterval(sync, 10_000);
+    source = new EventSource('/api/runtime-settings/events');
+    source.addEventListener('settings', (event: MessageEvent<string>) => {
+      try {
+        const payload: unknown = JSON.parse(event.data);
+        if (isRuntimeSettingsEnvelope(payload)) applySnapshot(payload);
+      } catch {
+        // Ignore a malformed event and wait for the next published revision.
+      }
+    });
+    // EventSource is the delivery path. This slow reconciliation only covers
+    // a local Vite restart between opening the page and attaching the stream.
+    const timer = window.setInterval(sync, 60_000);
     return () => {
       cancelled = true;
-      window.removeEventListener('storage', syncOnSettingsChange);
+      source?.close();
       window.clearInterval(timer);
     };
   }, [runtimeRole]);
@@ -1385,7 +1691,30 @@ export function useSettings(runtimeRole: RuntimeSettingsRole = 'standalone') {
   const updateBilibiliEnabled = useCallback((bilibiliEnabled: boolean) => {
     setSettings((prev) => ({
       ...prev,
-      stream: { ...prev.stream, bilibiliEnabled },
+      stream: {
+        ...prev.stream,
+        bilibiliEnabled,
+        bilibiliReplyEnabled: bilibiliEnabled
+          ? prev.stream.bilibiliReplyEnabled
+          : false,
+      },
+    }));
+  }, []);
+
+  const updateBilibiliReplyEnabled = useCallback(
+    (bilibiliReplyEnabled: boolean) => {
+      setSettings((prev) => ({
+        ...prev,
+        stream: { ...prev.stream, bilibiliReplyEnabled },
+      }));
+    },
+    [],
+  );
+
+  const updateBilibiliGatewayUrl = useCallback((bilibiliGatewayUrl: string) => {
+    setSettings((prev) => ({
+      ...prev,
+      stream: { ...prev.stream, bilibiliGatewayUrl },
     }));
   }, []);
 
@@ -1408,6 +1737,16 @@ export function useSettings(runtimeRole: RuntimeSettingsRole = 'standalone') {
       setSettings((prev) => ({
         ...prev,
         socialStream: { ...prev.socialStream, ...update },
+      }));
+    },
+    [],
+  );
+
+  const updateLiveConnectors = useCallback(
+    (update: (current: LiveConnectorSettings) => LiveConnectorSettings) => {
+      setSettings((prev) => ({
+        ...prev,
+        liveConnectors: update(prev.liveConnectors),
       }));
     },
     [],
@@ -1745,14 +2084,14 @@ export function useSettings(runtimeRole: RuntimeSettingsRole = 'standalone') {
       setSettings((prev) => {
         const merged = { ...prev.emptyRoomAwareness, ...update };
         const minIntervalMs = clampNumber(
-          normalizePositiveInteger(merged.minIntervalMs, 60_000),
-          60_000,
+          normalizePositiveInteger(merged.minIntervalMs, 2 * 60_000),
+          2 * 60_000,
           60 * 60_000,
         );
         const maxIntervalMs = Math.max(
           minIntervalMs,
           clampNumber(
-            normalizePositiveInteger(merged.maxIntervalMs, 10 * 60_000),
+            normalizePositiveInteger(merged.maxIntervalMs, 2 * 60_000),
             60_000,
             60 * 60_000,
           ),
@@ -1763,12 +2102,57 @@ export function useSettings(runtimeRole: RuntimeSettingsRole = 'standalone') {
             ...merged,
             minIntervalMs,
             maxIntervalMs,
+            proactiveCooldownMs: clampNumber(
+              normalizePositiveInteger(merged.proactiveCooldownMs, 2 * 60_000),
+              30_000,
+              60 * 60_000,
+            ),
+            maxProactiveTurns: clampNumber(
+              normalizePositiveInteger(merged.maxProactiveTurns, 12),
+              1,
+              100,
+            ),
+            audiencePolicy: ['any', 'empty_only', 'audience_only'].includes(
+              merged.audiencePolicy,
+            )
+              ? merged.audiencePolicy
+              : 'any',
+            scheduleEnabled: Boolean(merged.scheduleEnabled),
+            scheduleStartHour: clampNumber(
+              Math.round(Number(merged.scheduleStartHour) || 0),
+              0,
+              23,
+            ),
+            scheduleEndHour: clampNumber(
+              Math.round(Number(merged.scheduleEndHour) || 0),
+              0,
+              23,
+            ),
+            maxSentences: clampNumber(
+              Math.round(Number(merged.maxSentences) || 2),
+              1,
+              3,
+            ) as 1 | 2 | 3,
+            behaviorStrategies: normalizeEmptyRoomBehaviorStrategies(
+              merged.behaviorStrategies,
+            ),
             interfaceWeight: clampNumber(merged.interfaceWeight, 0, 100),
             memoryWeight: clampNumber(merged.memoryWeight, 0, 100),
             inspirationWeight: clampNumber(merged.inspirationWeight, 0, 100),
+            audienceWeight: clampNumber(merged.audienceWeight, 0, 100),
           },
         };
       });
+    },
+    [],
+  );
+
+  const updateSoulRuntimeMode = useCallback(
+    (runtimeMode: AppSettings['soul']['runtimeMode']) => {
+      setSettings((prev) => ({
+        ...prev,
+        soul: { runtimeMode },
+      }));
     },
     [],
   );
@@ -1778,7 +2162,9 @@ export function useSettings(runtimeRole: RuntimeSettingsRole = 'standalone') {
       if (provider === 'gemini-nano') {
         return '';
       }
-      return settings.llm.apiKeys[provider as ApiKeyProvider] || '';
+      return resolveBrowserCredential(
+        settings.llm.apiKeys[provider as ApiKeyProvider],
+      );
     },
     [settings.llm.apiKeys],
   );
@@ -1845,9 +2231,12 @@ export function useSettings(runtimeRole: RuntimeSettingsRole = 'standalone') {
     updateTwitchEnabled,
     updateTwitchCommentIntervalMs,
     updateBilibiliEnabled,
+    updateBilibiliReplyEnabled,
+    updateBilibiliGatewayUrl,
     updateCustomSseEndpoint,
     updateCustomSseEnabled,
     updateSocialStream,
+    updateLiveConnectors,
     selectDigitalHuman,
     addDigitalHuman,
     updateDigitalHuman,
@@ -1869,6 +2258,7 @@ export function useSettings(runtimeRole: RuntimeSettingsRole = 'standalone') {
     updateManneriInterventionCooldownMs,
     updateManneriMinMessageLength,
     updateEmptyRoomAwareness,
+    updateSoulRuntimeMode,
     getApiKeyForProvider,
   };
 }

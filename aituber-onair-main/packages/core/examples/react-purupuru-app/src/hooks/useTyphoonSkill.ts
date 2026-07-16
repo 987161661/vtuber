@@ -7,6 +7,8 @@ import {
 
 const TYPHOON_QUESTION =
   /台风|热带风暴|热带低压|风圈|路径|登陆|风速|风力|几级|有风|风大|气压|预警|暴雨|影响|怎么样|严重|危险|历史.*风|风暴|信息来源|数据来源|哪里查|哪查|查出来/i;
+const NAMED_TYPHOON_STATUS_QUESTION =
+  /^\s*[\u4e00-\u9fff]{2,4}(?:啊|呀|呢)?(?:[\s，、？?]*(?:他|它|她))?(?:现在|目前|后来)?(?:怎么样|如何|去哪|到哪|在哪|还在|登陆|消散|降级|减弱)/u;
 
 type TyphoonContextResponse = {
   content?: string;
@@ -47,6 +49,7 @@ export function useTyphoonSkill(enabled: boolean) {
         !enabled ||
         (!options.force &&
           !TYPHOON_QUESTION.test(question) &&
+          !NAMED_TYPHOON_STATUS_QUESTION.test(question) &&
           !PLACE_STATUS_QUESTION.test(question) &&
           !LIVE_TYPHOON_SHORTHAND_QUESTION.test(question) &&
           !/boss|BOSS|GFS|ECMWF|CWA|radar|雷达界面|台风雷达|卫星|风场/.test(

@@ -36,7 +36,9 @@ describe('EmotionParser', () => {
   it('should map emotions to talk styles with configurable fallback', () => {
     expect(emotionToTalkStyle('happy')).toBe('happy');
     expect(emotionToTalkStyle('surprised')).toBe('surprised');
-    expect(emotionToTalkStyle('relaxed')).toBe('talk');
+    expect(emotionToTalkStyle('relaxed')).toBe('relaxed');
+    expect(emotionToTalkStyle('bored')).toBe('bored');
+    expect(emotionToTalkStyle('serious')).toBe('serious');
     expect(emotionToTalkStyle('unknown')).toBe('neutral');
     expect(emotionToTalkStyle('unknown', 'talk')).toBe('talk');
   });

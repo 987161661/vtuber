@@ -5,6 +5,18 @@
 /**
  * screenplay (text with emotion)
  */
+export interface VoiceProsody {
+  /** All values are normalized from -1 (less) to 1 (more). */
+  pace?: number;
+  pitch?: number;
+  volume?: number;
+  warmth?: number;
+  tension?: number;
+  energy?: number;
+  assertiveness?: number;
+  breathiness?: number;
+}
+
 export interface ChatScreenplay {
   text: string;
   emotion?: string;
@@ -17,6 +29,11 @@ export interface ChatScreenplay {
   delivery?: string;
   /** 0-1 strength for the selected emotion. */
   emotionIntensity?: number;
+  /**
+   * Composable delivery controls. Engines use the controls they support and
+   * ignore the rest, so a screenplay is portable across providers.
+   */
+  prosody?: VoiceProsody;
   /** Optional pause after the line, in milliseconds. */
   pauseAfterMs?: number;
   motion?:
@@ -30,6 +47,15 @@ export interface ChatScreenplay {
     | 'dismissive';
   gaze?: 'camera' | 'left' | 'right' | 'down';
   gesture?: 'still' | 'subtle' | 'expressive';
+}
+
+export interface SpeechBeat extends ChatScreenplay {
+  interruptibleAfter: boolean;
+}
+
+export interface SpeechPlanV2 {
+  version: 2;
+  beats: SpeechBeat[];
 }
 
 /**

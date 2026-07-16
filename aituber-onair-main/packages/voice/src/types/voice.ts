@@ -9,6 +9,12 @@ export const talkStyles = [
   'sad',
   'angry',
   'surprised',
+  'relaxed',
+  'bored',
+  'impatient',
+  'embarrassed',
+  'awkward',
+  'serious',
 ] as const;
 
 /**
@@ -24,6 +30,7 @@ export type Talk = {
   message: string;
   delivery?: string;
   emotionIntensity?: number;
+  prosody?: import('./chat').VoiceProsody;
 };
 
 /**
@@ -36,6 +43,11 @@ export const emotions = [
   'sad',
   'surprised',
   'relaxed',
+  'bored',
+  'impatient',
+  'embarrassed',
+  'awkward',
+  'serious',
 ] as const;
 export type EmotionType = (typeof emotions)[number];
 

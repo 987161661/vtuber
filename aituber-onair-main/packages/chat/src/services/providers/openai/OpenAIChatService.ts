@@ -51,6 +51,9 @@ export class OpenAIChatService implements ChatService {
   private reasoning_effort?: OpenAIReasoningEffort;
   private enableReasoningSummary?: boolean;
   private responseFormat?: OpenAIResponseFormat;
+  private protocolAudit?: NonNullable<
+    BaseChatServiceOptions['protocolAudit']
+  >;
 
   /**
    * Constructor
@@ -72,6 +75,7 @@ export class OpenAIChatService implements ChatService {
     provider: string = 'openai',
     validateVisionModel: boolean = true,
     responseFormat?: OpenAIResponseFormat,
+    protocolAudit?: NonNullable<BaseChatServiceOptions['protocolAudit']>,
   ) {
     this.provider = provider;
     this.apiKey = apiKey;
@@ -85,6 +89,7 @@ export class OpenAIChatService implements ChatService {
     this.reasoning_effort = reasoning_effort;
     this.enableReasoningSummary = enableReasoningSummary;
     this.responseFormat = responseFormat;
+    this.protocolAudit = protocolAudit;
 
     // Official OpenAI validates vision model names strictly.
     // Compatible providers can skip this to support arbitrary local IDs.
@@ -287,6 +292,16 @@ export class OpenAIChatService implements ChatService {
     });
     const headers: Record<string, string> = {};
 
+    const endpointHost = new URL(this.endpoint).hostname;
+    this.protocolAudit?.({
+      phase: 'request',
+      provider: this.provider,
+      model,
+      endpointHost,
+      stream,
+      responseFormatType: body.response_format?.type,
+    });
+
     const shouldSendAuthorization =
       this.provider !== 'openai-compatible' || this.apiKey.trim() !== '';
     if (shouldSendAuthorization) {
@@ -294,6 +309,17 @@ export class OpenAIChatService implements ChatService {
     }
 
     const res = await ChatServiceHttpClient.post(this.endpoint, body, headers);
+
+    this.protocolAudit?.({
+      phase: 'response_headers',
+      provider: this.provider,
+      model,
+      endpointHost,
+      stream,
+      responseFormatType: body.response_format?.type,
+      status: res.status,
+      contentType: res.headers.get('content-type'),
+    });
 
     return res;
   }

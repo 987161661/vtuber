@@ -12,7 +12,9 @@
   "dependencies": {
     "@aituber-onair/comment-intelligence": "../../../comment-intelligence",
     "@aituber-onair/core": "../..",
+    "@aituber-onair/live-companion": "../../../live-companion",
     "@aituber-onair/manneri": "../../../manneri",
+    "@aituber-onair/soul": "../../../soul",
     "react": "^19.2.0",
     "react-dom": "^19.2.0"
   },

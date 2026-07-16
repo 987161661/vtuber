@@ -33,8 +33,15 @@ export class OpenAICompatibleChatServiceProvider
       false,
     ];
 
-    if (options.responseFormat !== undefined) {
+    if (
+      options.responseFormat !== undefined ||
+      options.protocolAudit !== undefined
+    ) {
       serviceArgs.push(options.responseFormat);
+    }
+
+    if (options.protocolAudit !== undefined) {
+      serviceArgs.push(options.protocolAudit);
     }
 
     return new OpenAIChatService(...serviceArgs);

@@ -13,4 +13,8 @@ export {
   AvatarBehaviorBus,
   createAvatarBehaviorEvent,
 } from './avatar.js';
+export {
+  DEFAULT_LIVE_HOST_POLICY,
+  LiveHostCoordinator,
+} from './coordinator.js';
 export * from './types.js';

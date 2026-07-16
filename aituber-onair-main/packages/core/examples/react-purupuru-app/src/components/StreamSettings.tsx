@@ -50,6 +50,8 @@ interface StreamSettingsProps {
   updateTwitchEnabled: (value: boolean) => void;
   updateTwitchCommentIntervalMs: (value: number) => void;
   updateBilibiliEnabled: (value: boolean) => void;
+  updateBilibiliReplyEnabled: (value: boolean) => void;
+  updateBilibiliGatewayUrl: (value: string) => void;
   updateCustomSseEndpoint: (value: string) => void;
   updateCustomSseEnabled: (value: boolean) => void;
   updateCommentIntelligenceEnabled: (value: boolean) => void;
@@ -103,7 +105,6 @@ export function StreamSettings({
   updateTwitchChannel,
   updateTwitchEnabled,
   updateTwitchCommentIntervalMs,
-  updateBilibiliEnabled,
   updateCustomSseEndpoint,
   updateCustomSseEnabled,
   updateCommentIntelligenceEnabled,
@@ -197,7 +198,9 @@ export function StreamSettings({
             {isYoutubeSelected && (
               <>
                 <div className="settings-field">
-                  <label htmlFor="stream-youtube-apikey">YouTube API 密钥</label>
+                  <label htmlFor="stream-youtube-apikey">
+                    YouTube API 密钥
+                  </label>
                   <input
                     id="stream-youtube-apikey"
                     type="password"
@@ -230,9 +233,7 @@ export function StreamSettings({
                 </div>
 
                 <div className="settings-field">
-                  <label htmlFor="stream-youtube-interval">
-                    轮询间隔
-                  </label>
+                  <label htmlFor="stream-youtube-interval">轮询间隔</label>
                   <select
                     id="stream-youtube-interval"
                     value={stream.youtubeCommentIntervalMs}
@@ -313,8 +314,7 @@ export function StreamSettings({
                     </button>
                   )}
                   <p className="settings-field-hint">
-                    请在 Twitch 开发者后台将下方地址注册为 OAuth
-                    重定向地址。
+                    请在 Twitch 开发者后台将下方地址注册为 OAuth 重定向地址。
                   </p>
                   <p className="settings-field-hint">{twitchRedirectUri}</p>
                 </div>
@@ -336,9 +336,7 @@ export function StreamSettings({
                 </div>
 
                 <div className="settings-field">
-                  <label htmlFor="stream-twitch-interval">
-                    消息取出间隔
-                  </label>
+                  <label htmlFor="stream-twitch-interval">消息取出间隔</label>
                   <select
                     id="stream-twitch-interval"
                     value={stream.twitchCommentIntervalMs}
@@ -377,35 +375,20 @@ export function StreamSettings({
             )}
 
             {isBilibiliSelected && (
-              <>
-                <div className="settings-field">
-                  <p className="settings-field-hint">
-                    直播间号由启动脚本读取，凭据不会保存在浏览器。
-                    本模式使用公开直播间匿名弹幕长链，不需要开放平台审核。
-                  </p>
-                </div>
-                <div className="settings-field">
-                  <label htmlFor="stream-bilibili-enabled">
-                    <input
-                      id="stream-bilibili-enabled"
-                      type="checkbox"
-                      checked={stream.bilibiliEnabled}
-                      onChange={(event) =>
-                        updateBilibiliEnabled(event.target.checked)
-                      }
-                      disabled={disabled}
-                      style={{ marginRight: 8 }}
-                    />
-                    启用 B 站直播间监听
-                  </label>
-                </div>
-              </>
+              <div className="settings-field">
+                <p className="settings-field-hint">
+                  哔哩哔哩及其他直播平台现在统一在总控的“直播信号路由台”中配置。
+                  此处不再提供平台专用连接开关。
+                </p>
+              </div>
             )}
 
             {isCustomSseSelected && (
               <>
                 <div className="settings-field">
-                  <label htmlFor="stream-custom-sse-endpoint">SSE 事件地址</label>
+                  <label htmlFor="stream-custom-sse-endpoint">
+                    SSE 事件地址
+                  </label>
                   <input
                     id="stream-custom-sse-endpoint"
                     type="url"
@@ -417,7 +400,9 @@ export function StreamSettings({
                     disabled={disabled}
                   />
                   <p className="settings-field-hint">
-                    桥接服务须发送 <code>room-event</code> 与 <code>status</code> SSE 事件；评论事件使用与 B站桥相同的标准字段，并允许本控制台来源跨域访问。
+                    桥接服务须发送 <code>room-event</code> 与{' '}
+                    <code>status</code> SSE 事件；评论事件使用与
+                    B站桥相同的标准字段，并允许本控制台来源跨域访问。
                   </p>
                 </div>
                 <div className="settings-field">
@@ -498,12 +483,14 @@ export function StreamSettings({
                 <option value="llm-assisted">LLM 辅助模式</option>
               </select>
               <p className="settings-field-hint">
-                规则模式不会额外调用 LLM。混合和 LLM 辅助模式使用上方 LLM 设置，不可用时自动回退到规则模式。
+                规则模式不会额外调用 LLM。混合和 LLM 辅助模式使用上方 LLM
+                设置，不可用时自动回退到规则模式。
               </p>
               <div className="settings-mode-help">
                 <p>
                   <strong>规则模式：</strong>
-                  使用固定规则完成安全判断、优先级排序和摘要，不产生额外 LLM 费用。
+                  使用固定规则完成安全判断、优先级排序和摘要，不产生额外 LLM
+                  费用。
                 </p>
                 <p>
                   <strong>混合模式：</strong>
@@ -511,7 +498,8 @@ export function StreamSettings({
                 </p>
                 <p>
                   <strong>LLM 辅助模式：</strong>
-                  每次都用 LLM 分析评论组。上下文理解更强，但会增加 API 费用和延迟。
+                  每次都用 LLM 分析评论组。上下文理解更强，但会增加 API
+                  费用和延迟。
                 </p>
               </div>
             </div>
@@ -721,9 +709,7 @@ export function StreamSettings({
             </div>
 
             <div className="settings-field">
-              <label htmlFor="manneri-similarity-threshold">
-                相似度阈值
-              </label>
+              <label htmlFor="manneri-similarity-threshold">相似度阈值</label>
               <select
                 id="manneri-similarity-threshold"
                 value={manneri.similarityThreshold}
@@ -782,9 +768,7 @@ export function StreamSettings({
             </div>
 
             <div className="settings-field">
-              <label htmlFor="manneri-min-message-length">
-                最小消息长度
-              </label>
+              <label htmlFor="manneri-min-message-length">最小消息长度</label>
               <select
                 id="manneri-min-message-length"
                 value={manneri.minMessageLength}

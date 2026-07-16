@@ -20,15 +20,29 @@ import type {
   StreamerMemoryRecord,
 } from '../types/memory';
 import type { AppSettings } from '../types/settings';
+import type { PersonaMemorySignal } from '../lib/personaInteractionPlanner';
 
 type Viewer = { id?: string; name?: string };
 const MICRO_SLEEP_INTERVAL = 15 * 60_000;
+
+function emitMemoryAudit(event: Record<string, unknown>) {
+  void fetch('/api/live-runtime-events', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      actor: { type: 'system', id: 'streamer-memory' },
+      at: Date.now(),
+      ...event,
+    }),
+  }).catch(() => undefined);
+}
 
 export interface StreamerMemoryApi {
   records: StreamerMemoryRecord[];
   lastConsolidatedAt: number;
   lastSleepReport?: SleepReport;
   contextFor: (input: string, viewer?: Viewer) => string;
+  signalsFor: (input: string, viewer?: Viewer) => PersonaMemorySignal[];
   addInteraction: (
     input: string,
     reply: string,
@@ -64,6 +78,10 @@ export function useStreamerMemory(
   profile: CharacterProfile,
 ): StreamerMemoryApi {
   const [records, setRecords] = useState<StreamerMemoryRecord[]>([]);
+  // `addInteraction` finishes outside React's render cycle. Keep the latest
+  // committed snapshot in a ref so the immediately following viewer turn can
+  // retrieve it instead of waiting for a state render to publish it.
+  const recordsRef = useRef<StreamerMemoryRecord[]>([]);
   const [lastConsolidatedAt, setLastConsolidatedAt] = useState(0);
   const [lastSleepReport, setLastSleepReport] = useState<SleepReport>();
   const running = useRef(false);
@@ -72,7 +90,9 @@ export function useStreamerMemory(
   );
 
   const refresh = useCallback(async () => {
-    setRecords(await streamerMemoryStore.list());
+    const nextRecords = await streamerMemoryStore.list();
+    recordsRef.current = nextRecords;
+    setRecords(nextRecords);
   }, []);
 
   useEffect(() => {
@@ -168,19 +188,79 @@ export function useStreamerMemory(
   const contextFor = useCallback(
     (input: string, viewer?: Viewer) =>
       buildMemoryContext(
-        records,
+        recordsRef.current,
         input,
         viewer?.id,
         1500,
         profile.memory.coreRecordId,
         profile.id,
       ),
-    [profile.id, profile.memory.coreRecordId, records],
+    [profile.id, profile.memory.coreRecordId],
+  );
+  const signalsFor = useCallback(
+    (input: string, viewer?: Viewer): PersonaMemorySignal[] => {
+      const now = Date.now();
+      const terms = input
+        .normalize('NFKC')
+        .toLowerCase()
+        .split(/[\s，。！？、]+/u)
+        .filter((term) => term.length >= 2);
+      return recordsRef.current
+        .filter(
+          (record) =>
+            record.digitalHumanId === profile.id &&
+            record.phase !== 'forgotten' &&
+            !['suppressed', 'archived'].includes(record.status) &&
+            (!record.expiresAt || record.expiresAt > now) &&
+            (!record.subjectId || record.subjectId === viewer?.id) &&
+            (record.visibility !== 'private' ||
+              Boolean(viewer?.id && record.subjectId === viewer.id)),
+        )
+        .map((record) => ({
+          record,
+          relevance:
+            (record.subjectId === viewer?.id ? 3 : 0) +
+            terms.filter((term) =>
+              `${record.title} ${record.content}`.toLowerCase().includes(term),
+            ).length +
+            record.activation,
+        }))
+        .filter(({ relevance }) => relevance >= 1)
+        .sort((left, right) => right.relevance - left.relevance)
+        .slice(0, 6)
+        .map(({ record }) => ({
+          topic: `${record.title}：${sanitizeSpeechText(record.content)}`.slice(
+            0,
+            120,
+          ),
+          confidence: Math.max(0, Math.min(1, record.confidence)),
+          sourceKind:
+            record.kind === 'commitment'
+              ? 'host_commitment'
+              : record.subjectType === 'viewer' &&
+                  ['user_observation', 'live_event'].includes(record.sourceType)
+                ? 'viewer_claim'
+                : 'verified',
+        }));
+    },
+    [profile.id],
   );
 
   const persist = useCallback(
     async (record: StreamerMemoryRecord) => {
+      const before = await streamerMemoryStore.get(record.id);
       await streamerMemoryStore.put(record);
+      recordsRef.current = [
+        ...recordsRef.current.filter((item) => item.id !== record.id),
+        record,
+      ];
+      setRecords(recordsRef.current);
+      emitMemoryAudit({
+        eventId: `memory:${record.id}`,
+        stage: 'memory_record_upserted',
+        before: before ?? null,
+        after: record,
+      });
       await refresh();
     },
     [refresh],
@@ -206,6 +286,15 @@ export function useStreamerMemory(
         ]);
         setLastConsolidatedAt(Date.now());
         setLastSleepReport(result.report);
+        emitMemoryAudit({
+          eventId: `memory-sleep:${profile.id}:${result.report.completedAt}`,
+          stage: 'memory_sleep_completed',
+          digitalHumanId: profile.id,
+          mode,
+          beforeCount: current.length,
+          afterCount: result.records.length,
+          result: result.report,
+        });
         await refresh();
         return result.report;
       } finally {
@@ -223,11 +312,16 @@ export function useStreamerMemory(
     return () => window.clearInterval(timer);
   }, [sleep]);
 
+  // This cleanup must run only when the memory owner unmounts. Depending on
+  // `sleep` reran it whenever `isBusy` changed, causing repeated post-stream
+  // consolidation during ordinary conversations.
+  const sleepRef = useRef(sleep);
+  sleepRef.current = sleep;
   useEffect(
     () => () => {
-      void sleep('post_stream');
+      void sleepRef.current('post_stream');
     },
-    [sleep],
+    [],
   );
 
   const addInteraction = useCallback(
@@ -371,6 +465,7 @@ export function useStreamerMemory(
       lastConsolidatedAt,
       lastSleepReport,
       contextFor,
+      signalsFor,
       addInteraction,
       sleep,
       consolidate: async (reason: 'timer' | 'end' = 'timer') => {
@@ -399,41 +494,74 @@ export function useStreamerMemory(
       remove: async (id: string) => {
         const record = await streamerMemoryStore.get(id);
         if (!record?.protected) await streamerMemoryStore.remove(id);
+        emitMemoryAudit({
+          eventId: `memory:${id}`,
+          stage: record?.protected
+            ? 'memory_record_remove_rejected'
+            : 'memory_record_removed',
+          before: record ?? null,
+          reason: record?.protected ? 'protected' : undefined,
+        });
         await refresh();
       },
       removeDigitalHuman: async (digitalHumanId: string) => {
         const current = await streamerMemoryStore.list();
-        await Promise.all(
-          current
-            .filter((record) => record.digitalHumanId === digitalHumanId)
-            .map((record) => streamerMemoryStore.remove(record.id)),
+        const removed = current.filter(
+          (record) => record.digitalHumanId === digitalHumanId,
         );
+        await Promise.all(
+          removed.map((record) => streamerMemoryStore.remove(record.id)),
+        );
+        emitMemoryAudit({
+          eventId: `memory-digital-human:${digitalHumanId}`,
+          stage: 'memory_digital_human_removed',
+          digitalHumanId,
+          removed,
+        });
         await refresh();
       },
       removeViewer: async (viewerId: string) => {
         const current = await streamerMemoryStore.list();
-        await Promise.all(
-          current
-            .filter((record) => !record.protected && record.subjectId === viewerId)
-            .map((record) => streamerMemoryStore.remove(record.id)),
+        const removed = current.filter(
+          (record) => !record.protected && record.subjectId === viewerId,
         );
+        await Promise.all(
+          removed.map((record) => streamerMemoryStore.remove(record.id)),
+        );
+        emitMemoryAudit({
+          eventId: `memory-viewer:${viewerId}`,
+          stage: 'memory_viewer_removed',
+          viewerId,
+          removed,
+        });
         await refresh();
       },
       clear: async (scope?: StreamerMemoryRecord['scope']) => {
         const current = await streamerMemoryStore.list();
-        await Promise.all(
-          current
-            .filter(
-              (record) =>
-                !record.protected && (!scope || record.scope === scope),
-            )
-            .map((record) => streamerMemoryStore.remove(record.id)),
+        const removed = current.filter(
+          (record) => !record.protected && (!scope || record.scope === scope),
         );
+        await Promise.all(
+          removed.map((record) => streamerMemoryStore.remove(record.id)),
+        );
+        emitMemoryAudit({
+          eventId: `memory-clear:${scope ?? 'all'}:${Date.now()}`,
+          stage: 'memory_scope_cleared',
+          scope: scope ?? 'all',
+          removed,
+        });
         await refresh();
       },
       export: () => streamerMemoryStore.export(),
       import: async (imported: StreamerMemoryRecord[]) => {
+        const before = await streamerMemoryStore.list();
         await streamerMemoryStore.import(imported);
+        emitMemoryAudit({
+          eventId: `memory-import:${Date.now()}`,
+          stage: 'memory_archive_imported',
+          beforeCount: before.length,
+          imported,
+        });
         await refresh();
       },
     }),
@@ -442,6 +570,7 @@ export function useStreamerMemory(
       lastConsolidatedAt,
       lastSleepReport,
       contextFor,
+      signalsFor,
       addInteraction,
       sleep,
       reflect,

@@ -2,11 +2,14 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import {
   AITuberOnAirCore,
   AITuberOnAirCoreEvent,
+  buildSpeechPlanV2,
   getDefaultXaiReasoningEffort,
   hasUnsafeSpeechArtifacts,
   isGPT5Model,
   isXaiReasoningEffortModel,
+  MinimaxEngine,
   sanitizeSpeechText,
+  type SpeechPlanV2BuilderHints,
 } from '@aituber-onair/core';
 import { ManneriDetector } from '@aituber-onair/manneri';
 import type {
@@ -16,6 +19,7 @@ import type {
   InworldAudioEncoding,
   InworldDeliveryMode,
   UnrealSpeechCodec,
+  TalkStyle,
   XaiBitRate,
   XaiCodec,
   XaiSampleRate,
@@ -34,14 +38,53 @@ import {
   type ResponseFactGuard,
 } from '../lib/responseGuard';
 import { formatTtsSpeechScript } from '../lib/ttsSpeechScript';
+import type { PreparedSpeechPlan } from '../lib/operatorQueue';
 
 interface ScreenplayLike {
   emotion?: string;
   text?: string;
+  delivery?: string;
   emotionIntensity?: number;
+  prosody?: Record<string, number>;
   motion?: string;
   gaze?: string;
   gesture?: string;
+}
+
+async function* closeAudioStreamAfterIdle(
+  source: AsyncGenerator<ArrayBuffer>,
+  idleTimeoutMs = 5_000,
+): AsyncGenerator<ArrayBuffer> {
+  const iterator = source[Symbol.asyncIterator]();
+  let receivedAudio = false;
+  while (true) {
+    let idleTimer: ReturnType<typeof setTimeout> | undefined;
+    const nextPromise = iterator
+      .next()
+      .then((result) => ({ kind: 'next' as const, result }));
+    const outcome = receivedAudio
+      ? await Promise.race([
+          nextPromise,
+          new Promise<{ kind: 'idle' }>((resolve) => {
+            idleTimer = setTimeout(
+              () => resolve({ kind: 'idle' }),
+              idleTimeoutMs,
+            );
+          }),
+        ]).finally(() => {
+          if (idleTimer) clearTimeout(idleTimer);
+        })
+      : await nextPromise;
+    if (outcome.kind === 'idle') {
+      // Do not let a provider/proxy connection that stays open after its last
+      // useful chunk hold the operator queue until the global watchdog fires.
+      void iterator.return?.(new ArrayBuffer(0)).catch(() => undefined);
+      return;
+    }
+    if (outcome.result.done) return;
+    receivedAudio = true;
+    yield outcome.result.value;
+  }
 }
 
 interface UseAituberCoreOptions {
@@ -50,7 +93,11 @@ interface UseAituberCoreOptions {
   onAudioStream?: (audioStream: AsyncGenerator<ArrayBuffer>) => Promise<void>;
   onSpeechStart?: (screenplay: ScreenplayLike) => void;
   onSpeechEnd?: () => void;
-  onSpeechChunk?: (stage: 'start' | 'end' | 'error', data: Record<string, unknown>) => void;
+  onSpeechInterrupted?: () => void;
+  onSpeechChunk?: (
+    stage: 'start' | 'end' | 'error',
+    data: Record<string, unknown>,
+  ) => void;
   settings: AppSettings;
   getApiKeyForProvider: (provider: ChatProviderOption) => string;
   onAssistantResponse?: (
@@ -77,6 +124,8 @@ interface UseAituberCoreOptions {
       eventId?: string;
     },
   ) => void;
+  speechPlanV2Enabled?: boolean;
+  personaPlannerEnabled?: boolean;
 }
 
 type ProcessChatOptions = {
@@ -94,15 +143,68 @@ type ProcessChatOptions = {
   sourcesSeen?: string[];
   sourceLabel?: string;
   factGuard?: ResponseFactGuard;
+  speechPlanHints?: SpeechPlanV2BuilderHints;
   showInput?: boolean;
   persistInteraction?: boolean;
   /** Generate a moderator-visible draft without requesting TTS playback. */
   silent?: boolean;
-  onPrepared?: (reply: string) => void;
+  onPrepared?: (reply: string, speechPlan?: PreparedSpeechPlan) => void;
 };
 
 const GPT5_SAMPLE_PROVIDER_OPTIONS = { gpt5Preset: 'casual' as const };
 const NO_REPLY_TOKEN = '[[NO_REPLY]]';
+
+function emitRuntimeTrace(event: Record<string, unknown>) {
+  void fetch('/api/live-runtime-events', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(event),
+  }).catch(() => undefined);
+}
+
+function inspectSpeechPlanEnvelope(raw: unknown) {
+  if (typeof raw !== 'string') return { kind: typeof raw, valid: false };
+  const trimmed = raw.trim();
+  if (!trimmed.startsWith('{') || !trimmed.endsWith('}')) {
+    return { kind: 'plain_text', valid: false };
+  }
+  try {
+    const value = JSON.parse(trimmed) as {
+      version?: unknown;
+      beats?: unknown;
+    };
+    const beats = Array.isArray(value.beats) ? value.beats : [];
+    const requiredFields = [
+      'text',
+      'emotion',
+      'delivery',
+      'emotion_intensity',
+      'prosody',
+      'motion',
+      'gaze',
+      'gesture',
+      'vocal_tags',
+      'pause_after_ms',
+      'interruptible_after',
+    ];
+    const missingFields = beats.flatMap((beat, index) =>
+      !beat || typeof beat !== 'object'
+        ? [`beats[${index}]`]
+        : requiredFields
+            .filter((field) => !(field in beat))
+            .map((field) => `beats[${index}].${field}`),
+    );
+    return {
+      kind: 'json_object',
+      valid: value.version === 2 && beats.length >= 1 && beats.length <= 3 && missingFields.length === 0,
+      version: value.version,
+      beatCount: beats.length,
+      missingFields,
+    };
+  } catch {
+    return { kind: 'invalid_json', valid: false };
+  }
+}
 
 function toManneriMessages(
   messages: ChatMessage[],
@@ -263,11 +365,10 @@ function buildVoiceOptions(
       tts.engine === 'minimax'
         ? LINGLAN_PROFILE.voice.languageBoost
         : undefined,
-    // MiniMax's browser SSE response can remain open without yielding a first
-    // playable chunk, leaving the chat busy forever and never reaching the
-    // lip-sync renderer. The complete-response path is slightly slower but
-    // reliably returns a valid MP3 and still uses the normal playback queue.
-    minimaxStream: false,
+    // MiniMax streaming is parsed by MinimaxEngine and delivered through the
+    // existing audio queue. The local same-origin gateway was live-probed
+    // before enabling this path so the browser receives incremental SSE data.
+    minimaxStream: true,
     aivisCloudModelUuid: tts.aivisCloudModelUuid,
     aivisCloudSpeakerUuid: tts.aivisCloudSpeakerUuid,
     aivisCloudStyleId: Number.isNaN(parsedAivisCloudStyleId)
@@ -388,7 +489,9 @@ function extractScreenplay(data: unknown): ScreenplayLike | null {
   const screenplay = source as {
     emotion?: unknown;
     text?: unknown;
+    delivery?: unknown;
     emotionIntensity?: unknown;
+    prosody?: unknown;
     motion?: unknown;
     gaze?: unknown;
     gesture?: unknown;
@@ -408,6 +511,35 @@ function extractScreenplay(data: unknown): ScreenplayLike | null {
     typeof screenplay.emotionIntensity === 'number'
       ? Math.min(1, Math.max(0, screenplay.emotionIntensity))
       : undefined;
+  const delivery =
+    typeof screenplay.delivery === 'string' ? screenplay.delivery : undefined;
+  const prosody =
+    screenplay.prosody &&
+    typeof screenplay.prosody === 'object' &&
+    !Array.isArray(screenplay.prosody)
+      ? Object.fromEntries(
+          Object.entries(screenplay.prosody as Record<string, unknown>)
+            .filter(
+              ([key, value]) =>
+                [
+                  'pace',
+                  'pitch',
+                  'volume',
+                  'warmth',
+                  'tension',
+                  'energy',
+                  'assertiveness',
+                  'breathiness',
+                ].includes(key) &&
+                typeof value === 'number' &&
+                Number.isFinite(value),
+            )
+            .map(([key, value]) => [
+              key,
+              Math.min(1, Math.max(-1, value as number)),
+            ]),
+        )
+      : undefined;
 
   const motion =
     typeof screenplay.motion === 'string' ? screenplay.motion : undefined;
@@ -416,7 +548,16 @@ function extractScreenplay(data: unknown): ScreenplayLike | null {
   const gesture =
     typeof screenplay.gesture === 'string' ? screenplay.gesture : undefined;
 
-  return { emotion, text, emotionIntensity, motion, gaze, gesture };
+  return {
+    emotion,
+    text,
+    delivery,
+    emotionIntensity,
+    prosody,
+    motion,
+    gaze,
+    gesture,
+  };
 }
 
 function extractViewerFacingText(
@@ -464,12 +605,15 @@ export function useAituberCore({
   onAudioStream,
   onSpeechStart,
   onSpeechEnd,
+  onSpeechInterrupted,
   onSpeechChunk,
   settings,
   profile,
   getApiKeyForProvider,
   onAssistantResponse,
   onChatError,
+  speechPlanV2Enabled = true,
+  personaPlannerEnabled = true,
 }: UseAituberCoreOptions) {
   const coreRef = useRef<AITuberOnAirCore | null>(null);
   const manneriDetectorRef = useRef<ManneriDetector | null>(null);
@@ -477,6 +621,7 @@ export function useAituberCore({
   const messageIdSequenceRef = useRef(0);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [isProcessing, setIsProcessing] = useState(false);
+  const processingRef = useRef(false);
   const [partialResponse, setPartialResponse] = useState('');
   const [coreGeneration, setCoreGeneration] = useState(0);
   const [isCoreReady, setIsCoreReady] = useState(false);
@@ -490,6 +635,8 @@ export function useAituberCore({
   onSpeechStartRef.current = onSpeechStart;
   const onSpeechEndRef = useRef(onSpeechEnd);
   onSpeechEndRef.current = onSpeechEnd;
+  const onSpeechInterruptedRef = useRef(onSpeechInterrupted);
+  onSpeechInterruptedRef.current = onSpeechInterrupted;
   const onSpeechChunkRef = useRef(onSpeechChunk);
   onSpeechChunkRef.current = onSpeechChunk;
   const onAssistantResponseRef = useRef(onAssistantResponse);
@@ -510,8 +657,13 @@ export function useAituberCore({
     sourcesSeen?: string[];
     sourceLabel?: string;
     factGuard?: ResponseFactGuard;
+    speechPlanHints?: SpeechPlanV2BuilderHints;
     persistInteraction?: boolean;
-    onPrepared?: (reply: string) => void;
+    onPrepared?: (reply: string, speechPlan?: PreparedSpeechPlan) => void;
+  } | null>(null);
+  const lastGuardedResponseRef = useRef<{
+    eventId?: string;
+    text: string;
   } | null>(null);
 
   useEffect(() => {
@@ -566,7 +718,29 @@ export function useAituberCore({
         }
       : undefined;
   const providerOptions = isOpenAICompatibleProvider
-    ? { endpoint: openAICompatibleEndpoint }
+    ? {
+        endpoint: openAICompatibleEndpoint,
+        // The screenplay contract is machine-consumed. Prompt-only JSON
+        // instructions are probabilistic, especially for empathetic replies;
+        // request the OpenAI-compatible provider's JSON mode as well.
+        responseFormat: { type: 'json_object' as const },
+        protocolAudit: (audit: {
+          phase: 'request' | 'response_headers';
+          provider: string;
+          model: string;
+          endpointHost: string;
+          stream: boolean;
+          responseFormatType?: string;
+          status?: number;
+          contentType?: string | null;
+        }) =>
+          emitRuntimeTrace({
+            stage: 'llm_protocol_transport_audit',
+            actor: { type: 'system', id: 'openai-compatible-transport' },
+            at: Date.now(),
+            ...audit,
+          }),
+      }
     : isOpenAIGPT5Model
       ? GPT5_SAMPLE_PROVIDER_OPTIONS
       : xaiProviderOptions;
@@ -595,18 +769,36 @@ export function useAituberCore({
       return;
     }
 
+    // ChatProcessor has already produced a validated structured response by
+    // the time this transform runs. Deliver its draft here instead of waiting
+    // for a later async core event: some provider/core combinations finish
+    // processing before that event reaches the browser listener. Clearing the
+    // callback makes the later ASSISTANT_RESPONSE event idempotent.
+    const deliverPreparedDraft = (
+      text: string,
+      speechPlan?: PreparedSpeechPlan,
+    ) => {
+      const pending = pendingMemoryRef.current;
+      const reply = text.trim();
+      if (!pending?.onPrepared || !reply) return;
+      const onPrepared = pending.onPrepared;
+      pending.onPrepared = undefined;
+      onPrepared(reply, speechPlan);
+    };
+
     const core = new AITuberOnAirCore({
       apiKey: llmApiKey.trim(),
       chatProvider: settings.llm.provider,
       model: resolvedModel,
       providerOptions,
       chatOptions: {
-        systemPrompt: buildCharacterSystemPrompt(profile),
-        // The response contract controls speaking length.  The model still
-        // needs enough headroom to close structured answers; a lower ceiling
-        // causes continuation retries while TTS has already begun, which
-        // presents as a false playback stall.
-        maxTokens: 700,
+        systemPrompt: buildCharacterSystemPrompt(profile, {
+          speechPlanV2Enabled,
+          personaPlannerEnabled,
+        }),
+        // M3 writes only the short spoken draft. SpeechPlanV2 is constructed
+        // locally, so the model no longer needs hundreds of tokens for JSON.
+        maxTokens: 320,
       },
       voiceOptions: buildVoiceOptions(
         settings.tts,
@@ -620,29 +812,127 @@ export function useAituberCore({
             }
           : undefined,
       ),
+      responseSpeechPlanTransform: speechPlanV2Enabled
+        ? (speechPlan) => {
+            const pending = pendingMemoryRef.current;
+            const combinedText = speechPlan.beats
+              .map((beat) => beat.text.trim())
+              .filter(Boolean)
+              .join(' ');
+            const localSpeechPlan = buildSpeechPlanV2(
+              combinedText,
+              pending?.speechPlanHints,
+            );
+            const guarded = guardViewerResponse(
+              localSpeechPlan.beats.map((beat) => beat.text).join(' '),
+              pending?.factGuard,
+            );
+            lastGuardedResponseRef.current = {
+              eventId: pending?.eventId,
+              text: guarded.text,
+            };
+            emitRuntimeTrace({
+              eventId: pending?.eventId,
+              stage: 'speech_plan_transform',
+              actor: { type: 'system', id: 'response-guard' },
+              at: Date.now(),
+              input: {
+                version: localSpeechPlan.version,
+                beats: localSpeechPlan.beats,
+              },
+              sanitizedText: guarded.sanitizedText,
+              output: { text: guarded.text },
+              rewritten: guarded.rewritten,
+              reasons: guarded.reasons,
+              factGuard: pending?.factGuard,
+            });
+            const preparedSpeechPlan: PreparedSpeechPlan =
+              guarded.rewritten || guarded.text !== combinedText
+                ? {
+                    version: 2,
+                    beats: [
+                      {
+                        ...localSpeechPlan.beats[0],
+                        text: guarded.text,
+                        ttsText: formatTtsSpeechScript(guarded.text),
+                        prosody: localSpeechPlan.beats[0].prosody
+                          ? Object.fromEntries(
+                              Object.entries(localSpeechPlan.beats[0].prosody),
+                            )
+                          : undefined,
+                        pauseAfterMs: 0,
+                        interruptibleAfter: true,
+                      },
+                    ],
+                  }
+                : {
+                    version: 2,
+                    beats: localSpeechPlan.beats.map((beat) => {
+                      const text = sanitizeSpeechText(beat.text);
+                      return {
+                        ...beat,
+                        text,
+                        ttsText: formatTtsSpeechScript(text),
+                        prosody: beat.prosody
+                          ? Object.fromEntries(Object.entries(beat.prosody))
+                          : undefined,
+                      };
+                    }),
+                  };
+            deliverPreparedDraft(guarded.text, preparedSpeechPlan);
+            if (guarded.rewritten || guarded.text !== combinedText) {
+              return preparedSpeechPlan;
+            }
+            return preparedSpeechPlan;
+          }
+        : undefined,
       responseScreenplayTransform: (screenplay) => {
+        const pending = pendingMemoryRef.current;
         const guarded = guardViewerResponse(
           screenplay.ttsText || screenplay.text,
-          pendingMemoryRef.current?.factGuard,
+          pending?.factGuard,
         );
+        const ttsText = formatTtsSpeechScript(guarded.text);
+        lastGuardedResponseRef.current = {
+          eventId: pending?.eventId,
+          text: guarded.text,
+        };
+        emitRuntimeTrace({
+          eventId: pending?.eventId,
+          stage: 'response_transform',
+          actor: { type: 'system', id: 'response-guard' },
+          at: Date.now(),
+          input: {
+            screenplayText: screenplay.text,
+            screenplayTtsText: screenplay.ttsText,
+          },
+          sanitizedText: guarded.sanitizedText,
+          output: {
+            text: guarded.text,
+            ttsText,
+          },
+          rewritten: guarded.rewritten,
+          reasons: guarded.reasons,
+          factGuard: pending?.factGuard,
+        });
+        deliverPreparedDraft(guarded.text);
         if (guarded.rewritten) {
-          void fetch('/api/live-runtime-events', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              eventId: pendingMemoryRef.current?.eventId,
-              stage: guarded.unsafeArtifacts
-                ? 'sanitizer_failure'
-                : 'fact_validation_rewrite',
-              at: Date.now(),
-              reasons: guarded.reasons,
-            }),
-          }).catch(() => undefined);
+          emitRuntimeTrace({
+            eventId: pending?.eventId,
+            stage: guarded.unsafeArtifacts
+              ? 'sanitizer_failure'
+              : 'fact_validation_rewrite',
+            actor: { type: 'system', id: 'response-guard' },
+            at: Date.now(),
+            before: screenplay.ttsText || screenplay.text,
+            after: guarded.text,
+            reasons: guarded.reasons,
+          });
         }
         return {
           ...screenplay,
           text: guarded.text,
-          ttsText: formatTtsSpeechScript(guarded.text),
+          ttsText,
         };
       },
       speechChunking: {
@@ -658,11 +948,13 @@ export function useAituberCore({
 
     // Subscribe to core events
     core.on(AITuberOnAirCoreEvent.PROCESSING_START, () => {
+      processingRef.current = true;
       setIsProcessing(true);
       setPartialResponse('');
     });
 
     core.on(AITuberOnAirCoreEvent.PROCESSING_END, () => {
+      processingRef.current = false;
       setIsProcessing(false);
       setPartialResponse('');
     });
@@ -687,6 +979,11 @@ export function useAituberCore({
           message?: { content?: string } | string;
           screenplay?: { text?: string };
           rawText?: string;
+          modelRawText?: string;
+          finishReason?: unknown;
+          responseStatus?: unknown;
+          incompleteDetails?: unknown;
+          usage?: unknown;
         };
         const msg = d?.message;
         const cleanText = d?.screenplay?.text?.trim();
@@ -697,7 +994,57 @@ export function useAituberCore({
             String(data));
       }
       const noReply = content.trim() === NO_REPLY_TOKEN;
-      const viewerContent = noReply ? '' : extractViewerFacingText(content);
+      const pending = pendingMemoryRef.current;
+      const responseData =
+        data && typeof data === 'object'
+          ? (data as {
+              message?: { content?: string } | string;
+              screenplay?: { text?: string; ttsText?: string };
+              rawText?: string;
+              modelRawText?: string;
+              finishReason?: unknown;
+              responseStatus?: unknown;
+              incompleteDetails?: unknown;
+              usage?: unknown;
+            })
+          : null;
+      emitRuntimeTrace({
+        eventId: pending?.eventId,
+        stage: 'model_output',
+        actor: { type: 'system', id: 'chat-model' },
+        at: Date.now(),
+        provider: settings.llm.provider,
+        model: settings.llm.model,
+        modelRawText:
+          responseData?.modelRawText ??
+          (typeof data === 'string' ? data : undefined),
+        speechPlanEnvelope: inspectSpeechPlanEnvelope(
+          responseData?.modelRawText ??
+            (typeof data === 'string' ? data : undefined),
+        ),
+        parsedText:
+          typeof responseData?.message === 'string'
+            ? responseData.message
+            : responseData?.message?.content,
+        transformedScreenplay: responseData?.screenplay,
+        finalText: content,
+        finishReason: responseData?.finishReason,
+        responseStatus: responseData?.responseStatus,
+        incompleteDetails: responseData?.incompleteDetails,
+        usage: responseData?.usage,
+      });
+      const lastGuardedResponse = lastGuardedResponseRef.current;
+      let guardedFallback = '';
+      if (
+        pending &&
+        lastGuardedResponse &&
+        lastGuardedResponse.eventId === pending.eventId
+      ) {
+        guardedFallback = lastGuardedResponse.text;
+      }
+      const viewerContent = noReply
+        ? ''
+        : extractViewerFacingText(content) || guardedFallback;
       if (viewerContent) {
         setMessages((prev) => [
           ...prev,
@@ -709,12 +1056,15 @@ export function useAituberCore({
           },
         ]);
       }
-      const pending = pendingMemoryRef.current;
-      pendingMemoryRef.current = null;
       if (pending && viewerContent && pending.persistInteraction !== false) {
         onAssistantResponseRef.current?.(pending.input, viewerContent, pending);
       }
-      pending?.onPrepared?.(noReply ? NO_REPLY_TOKEN : viewerContent);
+      // Consume the prepared-draft callback before clearing its correlation
+      // record. Some providers reach this event without running the response
+      // transform, so this is the final authoritative delivery path.
+      deliverPreparedDraft(noReply ? NO_REPLY_TOKEN : viewerContent);
+      pendingMemoryRef.current = null;
+      lastGuardedResponseRef.current = null;
       setPartialResponse('');
     });
 
@@ -728,8 +1078,14 @@ export function useAituberCore({
     core.on(AITuberOnAirCoreEvent.SPEECH_END, () => {
       onSpeechEndRef.current?.();
     });
+    core.on(AITuberOnAirCoreEvent.SPEECH_INTERRUPTED, () => {
+      onSpeechInterruptedRef.current?.();
+    });
 
-    const forwardSpeechChunk = (stage: 'start' | 'end' | 'error', data: unknown) => {
+    const forwardSpeechChunk = (
+      stage: 'start' | 'end' | 'error',
+      data: unknown,
+    ) => {
       const value = (data || {}) as Record<string, unknown>;
       const rawError = value.error;
       const error =
@@ -742,14 +1098,17 @@ export function useAituberCore({
               : String(rawError);
       // Error instances serialize as `{}` in the runtime event JSONL. Convert
       // them at the boundary so a failed TTS beat stays diagnosable.
-      onSpeechChunkRef.current?.(
-        stage,
-        error ? { ...value, error } : value,
-      );
+      onSpeechChunkRef.current?.(stage, error ? { ...value, error } : value);
     };
-    core.on('speechChunkStart' as AITuberOnAirCoreEvent, (data: unknown) => forwardSpeechChunk('start', data));
-    core.on('speechChunkEnd' as AITuberOnAirCoreEvent, (data: unknown) => forwardSpeechChunk('end', data));
-    core.on('speechChunkError' as AITuberOnAirCoreEvent, (data: unknown) => forwardSpeechChunk('error', data));
+    core.on('speechChunkStart' as AITuberOnAirCoreEvent, (data: unknown) =>
+      forwardSpeechChunk('start', data),
+    );
+    core.on('speechChunkEnd' as AITuberOnAirCoreEvent, (data: unknown) =>
+      forwardSpeechChunk('end', data),
+    );
+    core.on('speechChunkError' as AITuberOnAirCoreEvent, (data: unknown) =>
+      forwardSpeechChunk('error', data),
+    );
 
     core.on(AITuberOnAirCoreEvent.ERROR, (error: unknown) => {
       console.error('AITuberOnAirCore error:', error);
@@ -793,6 +1152,8 @@ export function useAituberCore({
     createMessageId,
     profile,
     coreGeneration,
+    speechPlanV2Enabled,
+    personaPlannerEnabled,
   ]);
 
   // Effect 2: Update voice service when TTS settings change (no core recreation)
@@ -835,9 +1196,11 @@ export function useAituberCore({
 
   const processChat = useCallback(
     async (text: string, options?: ProcessChatOptions): Promise<boolean> => {
-      if (!coreRef.current || !text.trim()) return false;
+      if (!coreRef.current || processingRef.current || !text.trim())
+        return false;
 
       const displayText = (options?.displayText ?? text).trim();
+      lastGuardedResponseRef.current = null;
       pendingMemoryRef.current = {
         input: displayText,
         viewerId: options?.viewerId,
@@ -852,6 +1215,7 @@ export function useAituberCore({
         sourcesSeen: options?.sourcesSeen,
         sourceLabel: options?.sourceLabel,
         factGuard: options?.factGuard,
+        speechPlanHints: options?.speechPlanHints,
         persistInteraction: options?.persistInteraction,
         onPrepared: options?.onPrepared,
       };
@@ -892,7 +1256,31 @@ export function useAituberCore({
       }
 
       try {
-        return await coreRef.current.processChat(displayText, {
+        // `displayText` is deliberately the short, operator-facing label for
+        // system-originated turns (for example, "空场自语（inspiration）").
+        // The actual `text` may instead be a bounded internal prompt carrying
+        // the current clock and the quiet-room cue. Sending the label here
+        // discards that context and makes the model invent a plausible time.
+        const modelInput = text.trim();
+        emitRuntimeTrace({
+          eventId: options?.eventId,
+          stage: 'model_request',
+          actor: { type: 'system', id: 'chat-runtime' },
+          at: Date.now(),
+          provider: settings.llm.provider,
+          model: settings.llm.model,
+          viewerInput: displayText,
+          modelInput,
+          systemPrompt: buildCharacterSystemPrompt(profile, {
+            speechPlanV2Enabled,
+            personaPlannerEnabled,
+          }),
+          transientContext,
+          factGuard: options?.factGuard,
+          source: options?.source ?? 'chat',
+          sourceLabel: options?.sourceLabel,
+        });
+        return await coreRef.current.processChat(modelInput, {
           speak: !options?.silent,
           transientContext,
         });
@@ -903,7 +1291,14 @@ export function useAituberCore({
         return false;
       }
     },
-    [createMessageId],
+    [
+      createMessageId,
+      profile,
+      settings.llm.model,
+      settings.llm.provider,
+      speechPlanV2Enabled,
+      personaPlannerEnabled,
+    ],
   );
 
   const processVisionChat = useCallback(
@@ -931,64 +1326,120 @@ export function useAituberCore({
     [createMessageId],
   );
 
-  const speakPrepared = useCallback(async (text: string) => {
-    const spokenText = text.trim();
-    if (!spokenText) return;
-    // Operator-queue playback must not inherit a provider adapter request
-    // that can remain pending after MiniMax has completed upstream.  This
-    // same-origin bridge returns one verified, finite MP3 response and keeps
-    // the existing avatar/audio callbacks as the single playback surface.
-    if (settings.tts.engine === 'minimax') {
-      const startedAt = Date.now();
-      const chunk = {
-        index: 0,
-        count: 1,
-        text: spokenText,
-        startedAt,
-        bridge: 'minimax-audio',
-      };
-      onSpeechStartRef.current?.({ text: spokenText });
-      onSpeechChunkRef.current?.('start', chunk);
-      try {
-        const response = await fetch('/api/minimax-audio', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ text: spokenText }),
-        });
-        if (!response.ok) {
-          const detail = await response.text().catch(() => '');
-          throw new Error(`minimax_audio_bridge_failed:${response.status}:${detail.slice(0, 120)}`);
+  const speakPrepared = useCallback(
+    async (text: string, preparedSpeechPlan?: PreparedSpeechPlan) => {
+      const spokenText = text.trim();
+      if (!spokenText) return;
+      // Operator playback reuses the package-level MiniMax SSE parser instead
+      // of maintaining a second response protocol in the example app. This
+      // keeps explicit error propagation while allowing audio playback before
+      // the provider has synthesized the entire reply.
+      if (settings.tts.engine === 'minimax') {
+        const beats =
+          preparedSpeechPlan?.version === 2 &&
+          preparedSpeechPlan.beats.length > 0
+            ? preparedSpeechPlan.beats
+            : [{ text: spokenText, ttsText: spokenText }];
+        let activeChunk: Record<string, unknown> | undefined;
+        try {
+          onSpeechStartRef.current?.({ text: spokenText });
+          for (const [index, beat] of beats.entries()) {
+            const text = beat.text.trim();
+            if (!text) continue;
+            const chunk = {
+              index,
+              count: beats.length,
+              text,
+              screenplay: beat,
+              interruptibleAfter: beat.interruptibleAfter,
+              startedAt: Date.now(),
+              bridge: 'minimax-stream',
+            };
+            activeChunk = chunk;
+            const engine = new MinimaxEngine();
+            engine.setApiEndpoint('/api/minimax-tts');
+            engine.setModel('speech-2.8-turbo');
+            engine.setLanguageBoost(LINGLAN_PROFILE.voice.languageBoost);
+            engine.setAudioSettings({
+              sampleRate: 44100,
+              bitrate: 128000,
+              format: 'mp3',
+              channel: 1,
+            });
+            const audioStream = engine.fetchAudioStream(
+              {
+                style: ([
+                  'talk', 'neutral', 'happy', 'sad', 'angry', 'surprised',
+                  'relaxed', 'bored', 'impatient', 'embarrassed', 'awkward', 'serious',
+                ].includes(beat.emotion || '')
+                  ? beat.emotion
+                  : 'talk') as TalkStyle,
+                message: beat.ttsText || text,
+                delivery: beat.delivery,
+                emotionIntensity: beat.emotionIntensity,
+                prosody: beat.prosody,
+              },
+              settings.tts.speaker,
+              ttsApiKey,
+            );
+            const boundedAudioStream = closeAudioStreamAfterIdle(audioStream);
+            onSpeechChunkRef.current?.('start', chunk);
+            if (onAudioStreamRef.current) {
+              await onAudioStreamRef.current(boundedAudioStream);
+            } else {
+              const parts: Uint8Array[] = [];
+              let byteLength = 0;
+              for await (const part of boundedAudioStream) {
+                const bytes = new Uint8Array(part);
+                parts.push(bytes);
+                byteLength += bytes.byteLength;
+              }
+              if (byteLength < 16) throw new Error('minimax_stream_empty');
+              const audio = new Uint8Array(byteLength);
+              let offset = 0;
+              for (const part of parts) {
+                audio.set(part, offset);
+                offset += part.byteLength;
+              }
+              await onAudioPlayRef.current(audio.buffer);
+            }
+            onSpeechChunkRef.current?.('end', { ...chunk, endedAt: Date.now() });
+            activeChunk = undefined;
+            const pauseAfterMs = beat.pauseAfterMs ?? 0;
+            if (index < beats.length - 1 && pauseAfterMs) {
+              await new Promise<void>((resolve) =>
+                window.setTimeout(resolve, Math.min(2_500, Math.max(0, pauseAfterMs))),
+              );
+            }
+          }
+          onSpeechEndRef.current?.();
+        } catch (error) {
+          if (activeChunk) {
+            onSpeechChunkRef.current?.('error', {
+              ...activeChunk,
+              endedAt: Date.now(),
+              error: error instanceof Error ? error.message : String(error),
+            });
+          }
+          throw error;
         }
-        const audio = await response.arrayBuffer();
-        if (audio.byteLength < 16) throw new Error('minimax_audio_bridge_empty');
-        await onAudioPlayRef.current(audio);
-        onSpeechChunkRef.current?.('end', {
-          ...chunk,
-          endedAt: Date.now(),
-        });
-        onSpeechEndRef.current?.();
-      } catch (error) {
-        onSpeechChunkRef.current?.('error', {
-          ...chunk,
-          endedAt: Date.now(),
-          error: error instanceof Error ? error.message : String(error),
-        });
-        onSpeechEndRef.current?.();
-        throw error;
+        return;
       }
-      return;
-    }
-    if (!coreRef.current) return;
-    await coreRef.current.speakTextWithOptions(spokenText, {
-      enableAnimation: true,
-    });
-  }, [settings.tts.engine]);
+      if (!coreRef.current) return;
+      await coreRef.current.speakTextWithOptions(spokenText, {
+        enableAnimation: true,
+      });
+    },
+    [settings.tts.engine, settings.tts.speaker, ttsApiKey],
+  );
 
   // A provider request can outlive its transport timeout.  Retire that core
   // instance so its private processing lock cannot reject every later queue
   // item while the React-facing state looks idle.
   const recoverChatRuntime = useCallback(() => {
     pendingMemoryRef.current = null;
+    lastGuardedResponseRef.current = null;
+    processingRef.current = false;
     coreRef.current?.offAll();
     coreRef.current = null;
     setIsProcessing(false);
@@ -996,6 +1447,13 @@ export function useAituberCore({
     setIsCoreReady(false);
     setCoreGeneration((generation) => generation + 1);
   }, []);
+
+  const interruptSpeech = useCallback(
+    (mode: 'immediate' | 'beat-boundary' = 'beat-boundary') => {
+      coreRef.current?.interruptSpeech(mode);
+    },
+    [],
+  );
 
   return {
     messages,
@@ -1006,5 +1464,6 @@ export function useAituberCore({
     processVisionChat,
     isCoreReady,
     recoverChatRuntime,
+    interruptSpeech,
   };
 }

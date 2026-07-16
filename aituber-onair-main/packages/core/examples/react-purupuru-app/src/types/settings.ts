@@ -144,6 +144,8 @@ export interface StreamSettings {
   twitchEnabled: boolean;
   twitchCommentIntervalMs: number;
   bilibiliEnabled: boolean;
+  bilibiliReplyEnabled: boolean;
+  bilibiliGatewayUrl: string;
   customSseEndpoint: string;
   customSseEnabled: boolean;
 }
@@ -154,6 +156,46 @@ export interface SocialStreamSettings {
   serverUrl: string;
   /** Platforms handled by SSN must not also run through a native adapter. */
   platforms: string[];
+}
+
+export type LiveConnectorId = 'ordinaryroad' | 'social-stream-ninja';
+export type LivePlatformId =
+  | 'bilibili'
+  | 'douyu'
+  | 'huya'
+  | 'douyin'
+  | 'kuaishou'
+  | string;
+
+export interface PlatformOutboundPolicy {
+  viewerReplies: boolean;
+  proactiveSpeech: boolean;
+  operatorBroadcasts: boolean;
+}
+
+export interface PlatformConnectionSettings {
+  enabled: boolean;
+  roomId: string;
+  outbound: PlatformOutboundPolicy;
+}
+
+export interface OrdinaryRoadConnectorSettings {
+  enabled: boolean;
+  gatewayUrl: string;
+  platforms: Record<string, PlatformConnectionSettings>;
+}
+
+export interface SocialStreamNinjaConnectorSettings {
+  enabled: boolean;
+  sessionId: string;
+  serverUrl: string;
+  platforms: Record<string, PlatformConnectionSettings>;
+}
+
+export interface LiveConnectorSettings {
+  schemaVersion: 1;
+  ordinaryRoad: OrdinaryRoadConnectorSettings;
+  socialStreamNinja: SocialStreamNinjaConnectorSettings;
 }
 
 export interface CommentIntelligenceSettings {
@@ -178,13 +220,35 @@ export interface ManneriSettings {
   minMessageLength: number;
 }
 
+/** A selectable, user-authored module inserted into the quiet-room prompt. */
+export interface EmptyRoomBehaviorStrategy {
+  id: string;
+  name: string;
+  prompt: string;
+  /** Relative chance among enabled strategies. Zero keeps the draft without scheduling it. */
+  probability: number;
+  enabled: boolean;
+}
+
 export interface EmptyRoomAwarenessSettings {
   enabled: boolean;
+  /** Which audience state permits a proactive turn. */
+  audiencePolicy: 'any' | 'empty_only' | 'audience_only';
+  /** Optional local-time window; equal start/end means the whole day. */
+  scheduleEnabled: boolean;
+  scheduleStartHour: number;
+  scheduleEndHour: number;
   minIntervalMs: number;
   maxIntervalMs: number;
+  proactiveCooldownMs: number;
+  maxProactiveTurns: number;
+  maxSentences: 1 | 2 | 3;
+  behaviorStrategies: EmptyRoomBehaviorStrategy[];
+  /** @deprecated Replaced by behaviorStrategies; retained to migrate existing settings. */
   interfaceWeight: number;
   memoryWeight: number;
   inspirationWeight: number;
+  audienceWeight: number;
 }
 
 export interface VisualSettings {
@@ -247,14 +311,22 @@ export interface DigitalHumanSettings {
   profiles: DigitalHumanProfile[];
 }
 
+export type SoulRuntimeMode = 'legacy' | 'shadow' | 'canary' | 'primary';
+
+export interface SoulSettings {
+  runtimeMode: SoulRuntimeMode;
+}
+
 export interface AppSettings {
   digitalHumans: DigitalHumanSettings;
+  soul: SoulSettings;
   llm: LLMSettings;
   tts: TTSSettings;
   visual: VisualSettings;
   screenVision: ScreenVisionSettings;
   stream: StreamSettings;
   socialStream: SocialStreamSettings;
+  liveConnectors: LiveConnectorSettings;
   commentIntelligence: CommentIntelligenceSettings;
   manneri: ManneriSettings;
   emptyRoomAwareness: EmptyRoomAwarenessSettings;

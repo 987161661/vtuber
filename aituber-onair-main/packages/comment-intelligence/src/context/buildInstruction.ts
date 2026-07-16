@@ -3,7 +3,7 @@ import { resolveLanguage } from '../utils/language.js';
 
 export function buildInstruction(
   result: CommentIntelligenceResult,
-  language?: 'ja' | 'en' | 'auto'
+  language?: 'zh-CN' | 'ja' | 'en' | 'auto',
 ): string {
   if (result.instructionForLLM) {
     return result.instructionForLLM;
@@ -12,11 +12,17 @@ export function buildInstruction(
   const resolvedLanguage = resolveLanguage(language);
 
   if (result.selectedComments.length === 0) {
+    if (resolvedLanguage === 'zh-CN') {
+      return '当前没有适合安全回应的弹幕，请自然地保持直播节奏。';
+    }
     return resolvedLanguage === 'ja'
       ? '安全に拾うべきコメントがないため、自然な雑談を短く続けてください。'
       : 'No safe comment is ready to answer. Continue with brief, natural stream chatter.';
   }
 
+  if (resolvedLanguage === 'zh-CN') {
+    return '自然回应选中的弹幕，并保持直播节奏。';
+  }
   return resolvedLanguage === 'ja'
     ? '選ばれたコメントに短く自然に返答し、配信のテンポを保ってください。'
     : 'Reply briefly and naturally to the selected comment, and keep the stream moving.';

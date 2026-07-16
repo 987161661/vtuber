@@ -56,7 +56,7 @@ export const ANALYZE_LIVE_COMMENTS_TOOL: AgentToolDefinition = {
         properties: {
           topic: { type: 'string' },
           title: { type: 'string' },
-          language: { type: 'string', enum: ['ja', 'en', 'auto'] },
+          language: { type: 'string', enum: ['zh-CN', 'ja', 'en', 'auto'] },
         },
       },
       answeredCommentIds: {

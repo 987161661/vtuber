@@ -132,7 +132,9 @@ export function createInteractionTrace(
       isNoise: signals.isNoise,
     },
     importance: Math.max(1, Math.round(signals.salience * 10)),
-    confidence: 1,
+    // A viewer statement is durable interaction context, not independent
+    // verification of external people or events.
+    confidence: interaction.viewerId ? 0.65 : 0.8,
     temporalScope: 'episode',
     visibility: interaction.viewerId ? 'private' : 'internal',
     memoryTier: 'short_term',

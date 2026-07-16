@@ -8,14 +8,26 @@ import {
 } from '../../examples/react-purupuru-app/src/config/characterProfile';
 
 describe('Linglan companion persona', () => {
+  it('delegates dynamic social decisions only when the persona planner is enabled', () => {
+    const planned = buildCharacterSystemPrompt(LINGLAN_PROFILE, {
+      personaPlannerEnabled: true,
+    });
+    const legacy = buildCharacterSystemPrompt(LINGLAN_PROFILE, {
+      personaPlannerEnabled: false,
+    });
+    expect(planned).toContain('<persona_interaction>');
+    expect(planned).not.toContain('无聊、反复刷同一件小事');
+    expect(legacy).toContain('无聊、反复刷同一件小事');
+    expect(planned).not.toContain('vocal_tags 永远输出空数组');
+  });
   it('treats typhoon monitoring as an expertise instead of every conversation', () => {
     const prompt = buildCharacterSystemPrompt(LINGLAN_PROFILE);
 
     expect(prompt).toContain(LINGLAN_PROFILE.fullName);
-    expect(prompt).toContain('不要强行转回台风');
-    expect(prompt).toContain('日常陪伴、事业心与关系曲线');
-    expect(prompt).toContain('陪伴不是解决问题');
-    expect(prompt).toContain('不要抱怨没人或乞求弹幕');
+    expect(prompt).toContain('禁止主动提及台风');
+    expect(prompt).toContain('人格互动执行边界');
+    expect(prompt).toContain('高冷但不冷漠');
+    expect(prompt).toContain('不得编造事实、观众经历或官方身份');
   });
 
   it('preserves the full character arc when runtime persona fields are applied', () => {

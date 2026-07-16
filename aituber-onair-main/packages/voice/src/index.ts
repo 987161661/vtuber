@@ -44,7 +44,9 @@ export * from './types/chat';
 
 // Utils
 export {
+  speechPlanToScreenplay,
   textToScreenplay,
+  textToSpeechPlan,
   textsToScreenplay,
   screenplayToText,
 } from './utils/screenplay';

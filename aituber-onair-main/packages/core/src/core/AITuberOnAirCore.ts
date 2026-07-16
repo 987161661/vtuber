@@ -37,10 +37,13 @@ import {
   ToolDefinition,
   ToolUseBlock,
   ToolResultBlock,
-  textToScreenplay,
+  textToSpeechPlan,
+  speechPlanToScreenplay,
   screenplayToText,
   MCPServerConfig,
   Screenplay,
+  SpeechBeat,
+  SpeechPlanV2,
 } from '@aituber-onair/chat';
 import { MemoryStorage } from '../types';
 import { ToolExecutor } from './ToolExecutor';
@@ -106,6 +109,8 @@ export interface AITuberOnAirCoreOptions {
    * closed and prevents the unvalidated response from being spoken.
    */
   responseScreenplayTransform?: (screenplay: Screenplay) => Screenplay;
+  /** Optional beat-aware gate. Prefer this for SpeechPlanV2 integrations. */
+  responseSpeechPlanTransform?: (speechPlan: SpeechPlanV2) => SpeechPlanV2;
   /** Debug mode */
   debug?: boolean;
   /** ChatService provider-specific options (optional) */
@@ -146,6 +151,8 @@ export enum AITuberOnAirCoreEvent {
   SPEECH_CHUNK_START = 'speechChunkStart',
   SPEECH_CHUNK_END = 'speechChunkEnd',
   SPEECH_CHUNK_ERROR = 'speechChunkError',
+  /** Speech stopped at an explicit host-coordinator boundary. */
+  SPEECH_INTERRUPTED = 'speechInterrupted',
   /** Speech ended */
   SPEECH_END = 'speechEnd',
   /** Error occurred */
@@ -191,6 +198,10 @@ export class AITuberOnAirCore extends EventEmitter {
   private speechChunkLocale: SpeechChunkLocale;
   private speechChunkSeparators?: string[];
   private responseScreenplayTransform?: (screenplay: Screenplay) => Screenplay;
+  private responseSpeechPlanTransform?: (
+    speechPlan: SpeechPlanV2,
+  ) => SpeechPlanV2;
+  private speechInterruptRequested: 'immediate' | 'beat-boundary' | null = null;
   /**
    * Constructor
    * @param options Configuration options
@@ -204,6 +215,7 @@ export class AITuberOnAirCore extends EventEmitter {
     this.speechChunkLocale = speechChunkingOptions.locale ?? 'ja';
     this.speechChunkSeparators = speechChunkingOptions.separators;
     this.responseScreenplayTransform = options.responseScreenplayTransform;
+    this.responseSpeechPlanTransform = options.responseSpeechPlanTransform;
 
     // Determine provider name (default is 'openai')
     const providerName: ChatProviderName = options.chatProvider || 'openai';
@@ -418,17 +430,22 @@ export class AITuberOnAirCore extends EventEmitter {
     options: { speak?: boolean; transientContext?: string } = {},
   ): Promise<boolean> {
     this.responseSpeechQueue.push(options.speak !== false);
-    return this.withProcessing(
+    const completed = await this.withProcessing(
       { text },
-      async () => {
-        await this.chatProcessor.processTextChat(
+      () =>
+        this.chatProcessor.processTextChat(
           text,
           'chatForm',
           options.transientContext,
-        );
-      },
+        ),
       'Error in processChat:',
     );
+    if (!completed) {
+      // No assistant response will consume this entry. Leaving it queued would
+      // apply the failed turn's speech policy to the next viewer response.
+      this.responseSpeechQueue.pop();
+    }
+    return completed;
   }
 
   /**
@@ -450,7 +467,7 @@ export class AITuberOnAirCore extends EventEmitter {
         }
 
         // Process image in ChatProcessor
-        await this.chatProcessor.processVisionChat(imageDataUrl);
+        return this.chatProcessor.processVisionChat(imageDataUrl);
       },
       'Error in processVisionChat:',
     );
@@ -458,7 +475,7 @@ export class AITuberOnAirCore extends EventEmitter {
 
   private async withProcessing(
     startPayload: Record<string, unknown>,
-    action: () => Promise<void>,
+    action: () => Promise<boolean | void>,
     errorMessage: string,
   ): Promise<boolean> {
     if (this.isProcessing) {
@@ -469,8 +486,8 @@ export class AITuberOnAirCore extends EventEmitter {
     try {
       this.isProcessing = true;
       this.emit(AITuberOnAirCoreEvent.PROCESSING_START, startPayload);
-      await action();
-      return true;
+      const completed = await action();
+      return completed !== false;
     } catch (error) {
       this.log(errorMessage, error);
       this.emit(AITuberOnAirCoreEvent.ERROR, error);
@@ -552,6 +569,11 @@ export class AITuberOnAirCore extends EventEmitter {
     }
   }
 
+  /** Ask the active speech plan to stop without replaying completed beats. */
+  interruptSpeech(mode: 'immediate' | 'beat-boundary' = 'beat-boundary'): void {
+    this.speechInterruptRequested = mode;
+  }
+
   /**
    * Speak text with custom voice options
    * @param text Text to speak
@@ -608,40 +630,26 @@ export class AITuberOnAirCore extends EventEmitter {
         audioElementId: options?.audioElementId,
       };
 
-      const generatedScreenplay = textToScreenplay(text);
-      const screenplay = this.responseScreenplayTransform
-        ? this.responseScreenplayTransform(generatedScreenplay)
-        : generatedScreenplay;
+      const speechPlan = this.prepareSpeechPlan(textToSpeechPlan(text));
+      const screenplay = speechPlanToScreenplay(speechPlan);
 
       // generate raw text(text with emotion tags)
       const rawText = screenplayToText(screenplay);
 
       // pass screenplay object as event data
-      this.emit(AITuberOnAirCoreEvent.SPEECH_START, { screenplay, rawText });
+      this.emit(AITuberOnAirCoreEvent.SPEECH_START, {
+        screenplay,
+        speechPlan,
+        rawText,
+      });
 
-      // Prepared operator replies can contain several natural beats. Keep one
-      // SPEECH_START/SPEECH_END lifecycle for the whole reply while sending
-      // each sentence to TTS sequentially; the queue must not mark the item
-      // done after only the first short answer.
-      const chunks = this.splitTextForSpeech(screenplay.text);
-      const spokenChunks = chunks.filter((value) => value);
-      for (const [index, chunk] of spokenChunks.entries()) {
-        const startedAt = Date.now();
-        this.emit(AITuberOnAirCoreEvent.SPEECH_CHUNK_START, { index, count: spokenChunks.length, text: chunk, startedAt });
-        try {
-          await this.voiceService.speak(
-            { ...screenplay, text: chunk, ttsText: chunk },
-            audioOptions,
-          );
-          this.emit(AITuberOnAirCoreEvent.SPEECH_CHUNK_END, { index, count: spokenChunks.length, text: chunk, startedAt, endedAt: Date.now() });
-        } catch (error) {
-          this.emit(AITuberOnAirCoreEvent.SPEECH_CHUNK_ERROR, { index, count: spokenChunks.length, text: chunk, startedAt, endedAt: Date.now(), error });
-          throw error;
-        }
-      }
-
-      // Speech end event
-      this.emit(AITuberOnAirCoreEvent.SPEECH_END);
+      const completed = await this.speakSpeechPlan(speechPlan, audioOptions);
+      this.emit(
+        completed
+          ? AITuberOnAirCoreEvent.SPEECH_END
+          : AITuberOnAirCoreEvent.SPEECH_INTERRUPTED,
+        { speechPlan },
+      );
     } catch (error) {
       this.log('Error in speakTextWithOptions:', error);
       this.emit(AITuberOnAirCoreEvent.ERROR, error);
@@ -663,6 +671,151 @@ export class AITuberOnAirCore extends EventEmitter {
     }
   }
 
+  private prepareSpeechPlan(generatedPlan: SpeechPlanV2): SpeechPlanV2 {
+    if (
+      generatedPlan.version !== 2 ||
+      generatedPlan.beats.length < 1 ||
+      generatedPlan.beats.length > 3 ||
+      generatedPlan.beats.some((beat) => !beat.text.trim())
+    ) {
+      throw new Error('Invalid SpeechPlanV2');
+    }
+
+    const plan: SpeechPlanV2 = {
+      version: 2,
+      beats: generatedPlan.beats.map((beat) => ({
+        ...beat,
+        text: beat.text.trim(),
+        ttsText: beat.ttsText?.trim() || beat.text.trim(),
+        pauseAfterMs:
+          beat.pauseAfterMs === undefined
+            ? undefined
+            : Math.min(2500, Math.max(0, Math.round(beat.pauseAfterMs))),
+        interruptibleAfter: beat.interruptibleAfter !== false,
+      })),
+    };
+
+    if (this.responseSpeechPlanTransform) {
+      return this.responseSpeechPlanTransform(plan);
+    }
+    if (!this.responseScreenplayTransform) return plan;
+
+    const aggregate = speechPlanToScreenplay(plan);
+    const transformed = this.responseScreenplayTransform(aggregate);
+    if (
+      plan.beats.length === 1 ||
+      transformed.text.trim() !== aggregate.text.trim()
+    ) {
+      return {
+        version: 2,
+        beats: [
+          {
+            ...plan.beats[0],
+            ...transformed,
+            interruptibleAfter: true,
+          },
+        ],
+      };
+    }
+    return plan;
+  }
+
+  private async speakSpeechPlan(
+    speechPlan: SpeechPlanV2,
+    audioOptions: AudioPlayOptions,
+  ): Promise<boolean> {
+    if (!this.voiceService) return true;
+    this.speechInterruptRequested = null;
+
+    const units: Array<{
+      screenplay: SpeechBeat;
+      beatIndex: number;
+      interruptibleAfter: boolean;
+      pauseAfterMs: number;
+    }> = [];
+    for (const [beatIndex, beat] of speechPlan.beats.entries()) {
+      const chunks = this.splitTextForSpeech(beat.text).filter(Boolean);
+      chunks.forEach((chunk, chunkIndex) => {
+        const lastChunkInBeat = chunkIndex === chunks.length - 1;
+        units.push({
+          screenplay: {
+            ...beat,
+            text: chunk,
+            ttsText: chunks.length === 1 ? beat.ttsText || chunk : chunk,
+          },
+          beatIndex,
+          interruptibleAfter:
+            lastChunkInBeat && beat.interruptibleAfter !== false,
+          pauseAfterMs:
+            lastChunkInBeat && beat.pauseAfterMs ? beat.pauseAfterMs : 0,
+        });
+      });
+    }
+
+    try {
+      for (const [index, unit] of units.entries()) {
+        if (this.speechInterruptRequested === 'immediate') return false;
+        const startedAt = Date.now();
+        const eventBase = {
+          index,
+          count: units.length,
+          beatIndex: unit.beatIndex,
+          beatCount: speechPlan.beats.length,
+          text: unit.screenplay.text,
+          screenplay: unit.screenplay,
+          interruptibleAfter: unit.interruptibleAfter,
+          startedAt,
+        };
+        this.emit(AITuberOnAirCoreEvent.SPEECH_CHUNK_START, eventBase);
+
+        const maxAttempts = index === 0 ? 2 : 1;
+        let completed = false;
+        let lastError: unknown;
+        for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+          try {
+            await this.voiceService.speak(unit.screenplay, audioOptions);
+            completed = true;
+            break;
+          } catch (error) {
+            lastError = error;
+            if (attempt < maxAttempts) {
+              this.log('Retrying the first speech beat after TTS failure');
+            }
+          }
+        }
+        if (!completed) {
+          this.emit(AITuberOnAirCoreEvent.SPEECH_CHUNK_ERROR, {
+            ...eventBase,
+            endedAt: Date.now(),
+            error: lastError,
+            attempts: maxAttempts,
+          });
+          throw lastError;
+        }
+
+        this.emit(AITuberOnAirCoreEvent.SPEECH_CHUNK_END, {
+          ...eventBase,
+          endedAt: Date.now(),
+        });
+        if (
+          this.speechInterruptRequested === 'immediate' ||
+          (this.speechInterruptRequested === 'beat-boundary' &&
+            unit.interruptibleAfter)
+        ) {
+          return false;
+        }
+        if (unit.pauseAfterMs > 0) {
+          await new Promise((resolve) =>
+            setTimeout(resolve, unit.pauseAfterMs),
+          );
+        }
+      }
+      return true;
+    } finally {
+      this.speechInterruptRequested = null;
+    }
+  }
+
   /**
    * Setup forwarding of ChatProcessor events
    */
@@ -680,18 +833,27 @@ export class AITuberOnAirCore extends EventEmitter {
     });
 
     this.chatProcessor.on('assistantResponse', async (data) => {
-      const { message, screenplay: generatedScreenplay, ...metadata } = data;
+      const {
+        message,
+        screenplay: generatedScreenplay,
+        speechPlan: generatedSpeechPlan,
+        ...metadata
+      } = data;
 
-      let screenplay = generatedScreenplay;
-      if (this.responseScreenplayTransform) {
-        try {
-          screenplay = this.responseScreenplayTransform(generatedScreenplay);
-        } catch (error) {
-          this.log('Response screenplay validation failed:', error);
-          this.emit(AITuberOnAirCoreEvent.ERROR, error);
-          return;
-        }
+      let speechPlan: SpeechPlanV2;
+      try {
+        speechPlan = this.prepareSpeechPlan(
+          generatedSpeechPlan ?? {
+            version: 2,
+            beats: [{ ...generatedScreenplay, interruptibleAfter: true }],
+          },
+        );
+      } catch (error) {
+        this.log('Response speech-plan validation failed:', error);
+        this.emit(AITuberOnAirCoreEvent.ERROR, error);
+        return;
       }
+      const screenplay = speechPlanToScreenplay(speechPlan);
 
       // Generate the raw text with emotion tags using utility function
       const rawText = screenplayToText(screenplay);
@@ -700,6 +862,7 @@ export class AITuberOnAirCore extends EventEmitter {
       this.emit(AITuberOnAirCoreEvent.ASSISTANT_RESPONSE, {
         message,
         screenplay,
+        speechPlan,
         rawText,
         ...metadata,
       });
@@ -713,37 +876,19 @@ export class AITuberOnAirCore extends EventEmitter {
       // Speech synthesis and playback (if VoiceService exists)
       if (this.voiceService && shouldSpeak) {
         try {
-          this.emit(AITuberOnAirCoreEvent.SPEECH_START, screenplay);
-
-          const chunks = this.splitTextForSpeech(screenplay.text);
-
-          // TTS providers commonly rate-limit concurrent synthesis. Preserve
-          // order and allow exactly one request at a time, even when a reply is
-          // split into several speech chunks.
-          const spokenChunks = chunks.filter((value) => value);
-          for (const [index, chunk] of spokenChunks.entries()) {
-            // Keep the delivery controls parsed from the LLM response when
-            // speech is segmented. The previous reconstruction discarded
-            // MiniMax-specific fields such as emotion intensity and vocal
-            // tags, making structured output ineffective at playback time.
-            const chunkScreenplay = {
-              ...screenplay,
-              text: chunk,
-              ttsText: chunk,
-            };
-
-            const startedAt = Date.now();
-            this.emit(AITuberOnAirCoreEvent.SPEECH_CHUNK_START, { index, count: spokenChunks.length, text: chunk, startedAt });
-            try {
-              await this.voiceService.speak(chunkScreenplay, { enableAnimation: true });
-              this.emit(AITuberOnAirCoreEvent.SPEECH_CHUNK_END, { index, count: spokenChunks.length, text: chunk, startedAt, endedAt: Date.now() });
-            } catch (error) {
-              this.emit(AITuberOnAirCoreEvent.SPEECH_CHUNK_ERROR, { index, count: spokenChunks.length, text: chunk, startedAt, endedAt: Date.now(), error });
-              throw error;
-            }
-          }
-
-          this.emit(AITuberOnAirCoreEvent.SPEECH_END);
+          this.emit(AITuberOnAirCoreEvent.SPEECH_START, {
+            ...screenplay,
+            speechPlan,
+          });
+          const completed = await this.speakSpeechPlan(speechPlan, {
+            enableAnimation: true,
+          });
+          this.emit(
+            completed
+              ? AITuberOnAirCoreEvent.SPEECH_END
+              : AITuberOnAirCoreEvent.SPEECH_INTERRUPTED,
+            { speechPlan },
+          );
         } catch (error) {
           this.log('Error in speech synthesis:', error);
           this.emit(AITuberOnAirCoreEvent.ERROR, error);

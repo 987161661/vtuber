@@ -312,6 +312,7 @@ const cases: HandlerCase[] = [
     options: {
       engineType: 'minimax',
       speaker: 'voice',
+      minimaxApiUrl: 'http://localhost:5173/api/minimax-tts',
       groupId: 'group',
       endpoint: 'global',
       minimaxModel: 'speech-02-hd',
@@ -329,6 +330,7 @@ const cases: HandlerCase[] = [
       minimaxAudioChannel: 1,
     },
     allowedUpdateKeys: [
+      'minimaxApiUrl',
       'groupId',
       'endpoint',
       'minimaxModel',
@@ -347,6 +349,7 @@ const cases: HandlerCase[] = [
     expectedCalls: {
       setGroupId: ['group'],
       setEndpoint: ['global'],
+      setApiEndpoint: ['http://localhost:5173/api/minimax-tts'],
       setModel: ['speech-02-hd'],
       setLanguage: ['Japanese'],
       setVoiceSettings: [

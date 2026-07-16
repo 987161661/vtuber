@@ -94,6 +94,8 @@ export interface LiveMemoryPromptOptions {
 export type LivePlatform =
   | 'youtube'
   | 'twitch'
+  | 'bilibili'
+  | 'douyin'
   | 'web'
   | 'discord'
   | 'custom'
@@ -292,4 +294,241 @@ export interface EmotionBehaviorMapper {
     emotion: EmotionSignal,
     context: EmotionBehaviorContext,
   ): AvatarBehaviorEvent | Promise<AvatarBehaviorEvent>;
+}
+
+export type LiveHostPhase =
+  | 'offline'
+  | 'observing'
+  | 'deliberating'
+  | 'speaking'
+  | 'cooldown'
+  | 'recovering'
+  | 'operator_hold';
+
+export type LiveHostPriority = 'low' | 'normal' | 'high' | 'urgent';
+export type LiveHostTurnKind =
+  | 'viewer'
+  | 'proactive'
+  | 'engagement'
+  | 'safety'
+  | 'operator';
+
+/**
+ * Identity boundary for one coordinator session.
+ *
+ * Integrations which provide a scope get stale-event protection across
+ * persona/stream switches. Scope remains optional on events for backwards
+ * compatibility with existing unscoped integrations.
+ */
+export interface LiveHostScope {
+  profileId: string;
+  sessionId: string;
+  streamId?: string;
+}
+
+export interface LiveHostTurn {
+  eventId: string;
+  kind: LiveHostTurnKind;
+  priority: LiveHostPriority;
+  createdAt: number;
+  targetViewerId?: string;
+  proactiveSource?: string;
+  proactiveOpportunityId?: string;
+  scope?: LiveHostScope;
+}
+
+export interface LiveHostPolicy {
+  quietThresholdMs: number;
+  proactiveCooldownMs: number;
+  maxProactiveTurns: number;
+}
+
+export type LiveHostEvent = (
+  | { type: 'stream-state'; at: number; isLive: boolean; eventId?: string }
+  | (ViewerPresenceEvent & {
+      type: 'viewer-presence';
+      eventId?: string;
+    })
+  | {
+      type: 'audience-message';
+      at: number;
+      eventId: string;
+      viewerId?: string;
+      priority?: LiveHostPriority;
+    }
+  | {
+      type: 'engagement';
+      at: number;
+      eventId: string;
+      viewerId?: string;
+      priority?: LiveHostPriority;
+      engagementKind: 'follow' | 'like' | 'gift' | 'superchat' | 'guard';
+    }
+  | {
+      type: 'environment';
+      at: number;
+      eventId: string;
+      priority: LiveHostPriority;
+    }
+  | {
+      type: 'quiet-candidate';
+      at: number;
+      eventId: string;
+      source: string;
+      /** Stable identity of the quiet-room opportunity; defaults to eventId. */
+      opportunityId?: string;
+      /** Candidates which expire before selection are never prepared. */
+      expiresAt?: number;
+      prompt: string;
+      busy: boolean;
+    }
+  | {
+      type: 'generation';
+      at: number;
+      eventId: string;
+      stage: 'started' | 'completed' | 'failed';
+      turn: LiveHostTurn;
+    }
+  | {
+      type: 'speech';
+      at: number;
+      eventId: string;
+      stage:
+        | 'started'
+        | 'beat-completed'
+        | 'completed'
+        | 'interrupted'
+        | 'failed';
+      beatIndex?: number;
+      interruptibleAfter?: boolean;
+    }
+  | {
+      type: 'runtime-fault';
+      at: number;
+      eventId?: string;
+      reasonCode: string;
+    }
+  | {
+      type: 'operator-command';
+      at: number;
+      eventId?: string;
+      command: 'takeover' | 'mute' | 'resume';
+      isLive?: boolean;
+    }
+) & { scope?: LiveHostScope };
+
+export interface LiveHostDecisionMetadata {
+  /** Stable key for idempotent execution by an integration. */
+  actionId?: string;
+  /** Coordinator time at which this action was issued. */
+  issuedAt?: number;
+  /** Bound persona/session scope, when the integration supplied one. */
+  scope?: LiveHostScope;
+}
+
+export type LiveHostDecisionPayload =
+  | {
+      kind: 'queue-audience-turn';
+      eventId: string;
+      targetViewerId?: string;
+      priority: LiveHostPriority;
+      reasonCode: string;
+      /** Complete turn envelope for the queue consumer. */
+      turn?: LiveHostTurn;
+    }
+  | {
+      kind: 'prepare-reply';
+      eventId: string;
+      turnKind: LiveHostTurnKind;
+      prompt?: string;
+      reasonCode: string;
+      /** Complete turn envelope for the generation consumer. */
+      turn?: LiveHostTurn;
+    }
+  | {
+      kind: 'speak-turn';
+      eventId: string;
+      reasonCode: string;
+      /** Complete turn envelope for the speech queue consumer. */
+      turn?: LiveHostTurn;
+    }
+  | {
+      kind: 'interrupt';
+      eventId?: string;
+      mode: 'immediate' | 'beat-boundary';
+      reasonCode: string;
+      turn?: LiveHostTurn;
+    }
+  | {
+      kind: 'drop';
+      eventId?: string;
+      reasonCode: string;
+      turn?: LiveHostTurn;
+    }
+  | {
+      kind: 'emit-avatar-intent';
+      eventId: string;
+      intent: 'observing' | 'speaking' | 'recovering';
+      reasonCode: string;
+    }
+  | {
+      kind: 'enter-recovery';
+      eventId?: string;
+      reasonCode: string;
+      recoveryCount?: number;
+    }
+  | {
+      kind: 'request-operator-attention';
+      eventId?: string;
+      reasonCode: string;
+      severity?: 'warning' | 'critical';
+      recoveryCount?: number;
+    };
+
+/** Backwards-compatible decision shape. New integrations should consume actions. */
+export type LiveHostDecision = LiveHostDecisionPayload &
+  LiveHostDecisionMetadata;
+
+type RequireTurnForExecutableAction<T> = T extends {
+  kind: 'queue-audience-turn' | 'prepare-reply' | 'speak-turn';
+}
+  ? Omit<T, 'turn'> & { turn: LiveHostTurn }
+  : T extends { kind: 'enter-recovery' }
+    ? Omit<T, 'recoveryCount'> & { recoveryCount: number }
+    : T extends { kind: 'request-operator-attention' }
+      ? Omit<T, 'severity' | 'recoveryCount'> & {
+          severity: 'warning' | 'critical';
+          recoveryCount: number;
+        }
+      : T;
+
+/**
+ * Fully executable coordinator output. `dispatch` always returns this shape.
+ * The legacy `LiveHostDecision` name remains available to existing consumers.
+ */
+export type LiveHostAction =
+  RequireTurnForExecutableAction<LiveHostDecisionPayload> & {
+    actionId: string;
+    issuedAt: number;
+    scope?: LiveHostScope;
+  };
+
+export interface LiveHostSnapshot {
+  phase: LiveHostPhase;
+  scope?: LiveHostScope;
+  activeTurn?: LiveHostTurn;
+  pendingTurnCount?: number;
+  readyTurnIds?: string[];
+  pendingInterruptEventId?: string;
+  lastAudienceActivityAt: number;
+  lastHostSpeechAt: number;
+  proactiveDeliveredCount: number;
+  proactiveRemaining: number;
+  nextProactiveAt: number;
+  lastProactiveSource?: string;
+  lastProactiveOpportunityId?: string;
+  recoveryCount: number;
+  currentBeatIndex?: number;
+  currentBeatInterruptible: boolean;
+  lastDecisionReason: string;
 }

@@ -415,6 +415,18 @@ export function buildMemoryContext(
     (r.reinforcement - r.disputation) * 5 +
     r.confidence * 8 +
     r.updatedAt / 1e13;
+  const isSameViewerPrivateMemory = (record: StreamerMemoryRecord) =>
+    record.visibility === 'private' &&
+    Boolean(viewerId) &&
+    record.subjectId === viewerId;
+  const isLongTermMemory = (record: StreamerMemoryRecord) =>
+    (record.status === 'confirmed' || record.status === 'protected') &&
+    record.memoryTier === 'long_term' &&
+    (record.phase === 'long_term' || record.phase === 'fading');
+  const isRecentViewerTrace = (record: StreamerMemoryRecord) =>
+    isSameViewerPrivateMemory(record) &&
+    record.memoryTier === 'short_term' &&
+    record.phase !== 'forgotten';
   const selected = records
     .filter(
       (record) =>
@@ -422,17 +434,20 @@ export function buildMemoryContext(
         (!activeCoreRecordId ||
           record.scope !== 'core' ||
           record.id.startsWith(activeCoreRecordId)) &&
-        (record.status === 'confirmed' || record.status === 'protected') &&
-        record.memoryTier === 'long_term' &&
-        (record.phase === 'long_term' || record.phase === 'fading') &&
-        record.visibility !== 'private' &&
+        (isLongTermMemory(record) || isRecentViewerTrace(record)) &&
+        (record.visibility !== 'private' || isSameViewerPrivateMemory(record)) &&
         (!record.expiresAt || record.expiresAt > Date.now()) &&
         (!record.subjectId || !viewerId || record.subjectId === viewerId),
     )
     .sort((a, b) => score(b) - score(a))
-    .slice(0, 16);
+    .slice(0, 8);
   let used = 0;
   const lines: string[] = [];
+  if (selected.some(isRecentViewerTrace)) {
+    lines.push(
+      '- [使用规则] 近期私有记忆只是当前观众本人这样说过，必须记住并可自然承接；但不能据此断言第三方或客观事件为真。',
+    );
+  }
   for (const r of selected) {
     const content = sanitizeSpeechText(r.content);
     if (!content) continue;

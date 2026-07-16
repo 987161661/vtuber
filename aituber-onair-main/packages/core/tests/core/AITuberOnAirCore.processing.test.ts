@@ -19,6 +19,11 @@ vi.mock('@aituber-onair/chat', () => {
     ChatServiceOptions: {},
     textsToScreenplay: vi.fn(),
     textToScreenplay: vi.fn().mockReturnValue({ text: '' }),
+    speechPlanToScreenplay: vi.fn((plan) => plan.beats[0]),
+    textToSpeechPlan: vi.fn((text) => ({
+      version: 2,
+      beats: [{ text, ttsText: text, interruptibleAfter: true }],
+    })),
     screenplayToText: vi.fn().mockReturnValue(''),
   };
 });
@@ -92,6 +97,21 @@ describe('AITuberOnAirCore processing flow', () => {
 
     expect(result).toBe(false);
     expect(events).toEqual(['start', 'error', 'end']);
+  });
+
+  it('returns false when ChatProcessor reports a handled provider failure', async () => {
+    const core = new AITuberOnAirCore(createOptions());
+    const chatProcessor = (core as any).chatProcessor;
+
+    vi.spyOn(chatProcessor, 'processTextChat').mockResolvedValue(false);
+
+    const events: string[] = [];
+    core.on(AITuberOnAirCoreEvent.PROCESSING_START, () => events.push('start'));
+    core.on(AITuberOnAirCoreEvent.PROCESSING_END, () => events.push('end'));
+
+    await expect(core.processChat('hello')).resolves.toBe(false);
+    expect(events).toEqual(['start', 'end']);
+    expect((core as any).responseSpeechQueue).toEqual([]);
   });
 
   it('emits vision start/end and updates prompt when provided', async () => {

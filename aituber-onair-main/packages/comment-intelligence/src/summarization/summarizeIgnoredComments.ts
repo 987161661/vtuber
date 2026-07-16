@@ -31,14 +31,14 @@ const enLabels: Record<string, string> = {
 
 export function summarizeIgnoredComments(_input: {
   comments: LiveComment[];
-  language?: 'ja' | 'en' | 'auto';
+  language?: 'zh-CN' | 'ja' | 'en' | 'auto';
   maxExamplesPerCluster?: number;
 }): IgnoredCommentsSummary {
   const input = _input;
   const language = resolveLanguage(input.language);
   const clusters = clusterComments(
     input.comments,
-    input.maxExamplesPerCluster ?? 3
+    input.maxExamplesPerCluster ?? 3,
   );
   const totalCount = input.comments.length;
 
@@ -46,17 +46,21 @@ export function summarizeIgnoredComments(_input: {
     return {
       totalCount,
       summary:
-        language === 'ja'
-          ? '未選択コメントはありません。'
-          : 'There are no ignored comments.',
+        language === 'zh-CN'
+          ? '没有未选中的弹幕。'
+          : language === 'ja'
+            ? '未選択コメントはありません。'
+            : 'There are no ignored comments.',
       clusters,
     };
   }
 
   const summary =
-    language === 'ja'
-      ? buildJapaneseSummary(clusters)
-      : buildEnglishSummary(clusters);
+    language === 'zh-CN'
+      ? `共忽略 ${totalCount} 条弹幕。`
+      : language === 'ja'
+        ? buildJapaneseSummary(clusters)
+        : buildEnglishSummary(clusters);
 
   return {
     totalCount,
@@ -68,10 +72,10 @@ export function summarizeIgnoredComments(_input: {
 function buildJapaneseSummary(clusters: IgnoredCommentsSummary['clusters']) {
   const parts = clusters.map(
     (cluster) =>
-      `${jaLabels[cluster.label] ?? cluster.label}が${cluster.count}件`
+      `${jaLabels[cluster.label] ?? cluster.label}が${cluster.count}件`,
   );
   const suffix = clusters.some(
-    (cluster) => cluster.label === 'unsafe_instruction'
+    (cluster) => cluster.label === 'unsafe_instruction',
   )
     ? '危険な指示を含むコメントは除外しました。'
     : '';
@@ -81,10 +85,10 @@ function buildJapaneseSummary(clusters: IgnoredCommentsSummary['clusters']) {
 
 function buildEnglishSummary(clusters: IgnoredCommentsSummary['clusters']) {
   const parts = clusters.map(
-    (cluster) => `${cluster.count} ${enLabels[cluster.label] ?? cluster.label}`
+    (cluster) => `${cluster.count} ${enLabels[cluster.label] ?? cluster.label}`,
   );
   const suffix = clusters.some(
-    (cluster) => cluster.label === 'unsafe_instruction'
+    (cluster) => cluster.label === 'unsafe_instruction',
   )
     ? ' Unsafe instructions were ignored.'
     : '';

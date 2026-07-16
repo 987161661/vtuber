@@ -189,7 +189,10 @@ describe('ChatProcessor', () => {
       // check other necessary events
       expect(emitSpy).toHaveBeenCalledWith(
         'assistantResponse',
-        expect.any(Object),
+        expect.objectContaining({
+          modelRawText: 'Once upon a time',
+          message: expect.objectContaining({ content: 'Once upon a time' }),
+        }),
       );
     });
 
@@ -266,6 +269,29 @@ describe('ChatProcessor', () => {
         }),
       );
       expect(mockChatService.chatOnce).toHaveBeenCalledTimes(2);
+    });
+
+    it('retries a truncated final answer only once', async () => {
+      mockChatService.chatOnce.mockResolvedValue({
+        blocks: [{ type: 'text', text: 'Still partial' }],
+        stop_reason: 'end',
+        truncated: true,
+        finish_reason: 'length',
+      });
+      const emitSpy = vi.spyOn(chatProcessor as any, 'emit');
+      await (chatProcessor as any).processTextChat('Hello');
+
+      expect(mockChatService.chatOnce).toHaveBeenCalledTimes(2);
+      expect(emitSpy).toHaveBeenCalledWith(
+        'error',
+        expect.objectContaining({
+          message: expect.stringMatching(/remained truncated/i),
+        }),
+      );
+      expect(emitSpy).not.toHaveBeenCalledWith(
+        'assistantResponse',
+        expect.anything(),
+      );
     });
   });
 
@@ -417,12 +443,7 @@ describe('ChatProcessor', () => {
       const emitSpy = vi.spyOn(chatProcessor as any, 'emit');
 
       // Act
-      try {
-        await (chatProcessor as any).processTextChat('Hello');
-      } catch (e) {
-        // catch error and do nothing
-        // Caught error in test
-      }
+      const completed = await (chatProcessor as any).processTextChat('Hello');
 
       // Assert
       // check each event individually
@@ -436,6 +457,7 @@ describe('ChatProcessor', () => {
       expect(errorEmitCalls.length).toBeGreaterThan(0);
       expect(errorEmitCalls[0][1]).toEqual(error);
       expect(processingEndCalls.length).toBeGreaterThan(0);
+      expect(completed).toBe(false);
     });
   });
 

@@ -45,9 +45,13 @@ __pycache__/
 
 # generated assets
 outputs/
+.runtime/
 
 # Package-specific ignores (for monorepo)
 packages/*/node_modules/
 packages/*/dist/
 packages/*/build/
 packages/*/*.tsbuildinfo
+
+# local Java gateway build output
+tools/ordinaryroad-gateway/target/

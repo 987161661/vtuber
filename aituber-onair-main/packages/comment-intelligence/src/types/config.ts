@@ -40,7 +40,7 @@ export type CommentIntelligenceConfig = {
     maxExamplesPerCluster?: number;
   };
   context?: {
-    language?: 'ja' | 'en' | 'auto';
+    language?: 'zh-CN' | 'ja' | 'en' | 'auto';
     style?: 'compact' | 'aituber-live';
   };
   viewerSafety?: {

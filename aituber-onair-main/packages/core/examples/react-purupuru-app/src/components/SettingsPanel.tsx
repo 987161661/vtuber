@@ -15,6 +15,9 @@ import type { PuruPuruAvatarPackage } from '../lib/purupuruPackage';
 import type { ChatProviderOption, TTSEngineOption } from '../types/settings';
 import type { useSettings } from '../hooks/useSettings';
 import type { useStreamerMemory } from '../hooks/useStreamerMemory';
+import { fetchMinimaxVoiceOptions } from '../lib/minimaxVoicePreview';
+import { isServerManagedCredential } from '../lib/runtimeSettingsSecurity';
+import { ServerManagedCredentialInput } from './ServerManagedCredentialInput';
 
 type SettingsHook = ReturnType<typeof useSettings>;
 type ScreenVisionController = ReturnType<typeof useScreenVisionController>;
@@ -307,6 +310,8 @@ export function SettingsPanel({
   updateTwitchEnabled,
   updateTwitchCommentIntervalMs,
   updateBilibiliEnabled,
+  updateBilibiliReplyEnabled,
+  updateBilibiliGatewayUrl,
   updateCustomSseEndpoint,
   updateCustomSseEnabled,
   updateCommentIntelligenceEnabled,
@@ -349,6 +354,21 @@ export function SettingsPanel({
         'none'
       : 'none';
   const openRouterApiKey = getApiKeyForProvider('openrouter').trim();
+  const llmCredentialIsServerManaged = isServerManagedCredential(
+    settings.llm.apiKeys[
+      settings.llm.provider as keyof typeof settings.llm.apiKeys
+    ],
+  );
+  const isMiniMaxLlmGateway =
+    settings.llm.provider === 'openai-compatible' &&
+    (/minimax/iu.test(settings.llm.model) ||
+      settings.llm.endpoint?.includes('/api/minimax-chat'));
+  const llmCredentialConfigured =
+    llmCredentialIsServerManaged ||
+    Boolean(getApiKeyForProvider(settings.llm.provider).trim());
+  const minimaxCredentialIsServerManaged = isServerManagedCredential(
+    settings.tts.minimaxApiKey,
+  );
   const openRouterDynamicFreeModels =
     settings.llm.openRouterDynamicFreeModels?.models || [];
   const openRouterFetchedAt =
@@ -462,7 +482,7 @@ export function SettingsPanel({
     updateTTSSpeaker,
   ]);
 
-  // Fetch MiniMax speaker list after API key is entered
+  // Fetch MiniMax speaker list through the same-origin credential gateway.
   useEffect(() => {
     if (settings.tts.engine !== 'minimax') {
       return;
@@ -479,43 +499,10 @@ export function SettingsPanel({
     const fetchMinimaxVoices = async () => {
       setIsFetchingMinimaxVoices(true);
       try {
-        const response = await fetch(
-          'https://api.minimaxi.com/v1/get_voice',
-          {
-            method: 'POST',
-            headers: {
-              Authorization: `Bearer ${apiKey}`,
-              'Content-Type': 'application/json',
-            },
-            body: JSON.stringify({ voice_type: 'all' }),
-            signal: controller.signal,
-          },
-        );
-
-        if (!response.ok) {
-          throw new Error(`HTTP ${response.status}`);
-        }
-
-        const payload = (await response.json()) as {
-          base_resp?: { status_code?: number; status_msg?: string };
-          system_voice?: MinimaxVoice[];
-          voice_cloning?: MinimaxVoice[];
-          voice_generation?: MinimaxVoice[];
-        };
+        const voices = await fetchMinimaxVoiceOptions(apiKey, {
+          signal: controller.signal,
+        });
         if (controller.signal.aborted) return;
-
-        if (payload.base_resp && payload.base_resp.status_code !== 0) {
-          throw new Error(payload.base_resp.status_msg || 'MiniMax API 返回错误');
-        }
-
-        const voices = [
-          ...(payload.system_voice || []),
-          ...(payload.voice_cloning || []),
-          ...(payload.voice_generation || []),
-        ].map((voice) => ({
-          voice_id: voice.voice_id,
-          voice_name: voice.voice_name || voice.voice_id,
-        }));
         setMinimaxVoices(voices);
         setFetchError('');
 
@@ -782,9 +769,7 @@ export function SettingsPanel({
 
             {settings.llm.provider === 'xai' && (
               <div className="settings-field">
-                <label htmlFor="xai-reasoning-effort">
-                  xAI 推理强度
-                </label>
+                <label htmlFor="xai-reasoning-effort">xAI 推理强度</label>
                 <select
                   id="xai-reasoning-effort"
                   value={xaiReasoningEffortValue}
@@ -903,9 +888,7 @@ export function SettingsPanel({
             {settings.llm.provider === 'gemini-nano' && (
               <>
                 <div className="settings-field">
-                  <small>
-                    Gemini Nano 使用浏览器内置 AI，无需 API 密钥。
-                  </small>
+                  <small>Gemini Nano 使用浏览器内置 AI，无需 API 密钥。</small>
                 </div>
                 <div className="settings-field">
                   <small>{geminiNano.statusText}</small>
@@ -919,15 +902,14 @@ export function SettingsPanel({
                       onClick={() => geminiNano.prepareModel()}
                       disabled={disabled || geminiNano.isPreparing}
                     >
-                      {geminiNano.isPreparing
-                        ? '正在准备……'
-                        : '准备模型'}
+                      {geminiNano.isPreparing ? '正在准备……' : '准备模型'}
                     </button>
                   )}
                   <small>
                     需要 Chrome 138 或更高版本。打开 `chrome://flags`，将
                     `#optimization-guide-on-device-model` 和
-                    `#prompt-api-for-gemini-nano` 设为 `Enabled`，然后重启 Chrome。
+                    `#prompt-api-for-gemini-nano` 设为 `Enabled`，然后重启
+                    Chrome。
                   </small>
                   <small>
                     启用上述标志后，点击“准备模型”即可开始下载。首次下载可能需要数分钟。
@@ -941,24 +923,40 @@ export function SettingsPanel({
                 <div className="settings-field">
                   <label htmlFor="llm-apikey">
                     API 密钥（{settings.llm.provider}）
-                    {settings.llm.provider === 'openai-compatible'
+                    {settings.llm.provider === 'openai-compatible' &&
+                    !isMiniMaxLlmGateway
                       ? '（可选）'
                       : ''}
                   </label>
-                  <input
+                  <ServerManagedCredentialInput
+                    key={settings.llm.provider}
                     id="llm-apikey"
-                    type="password"
                     value={getApiKeyForProvider(settings.llm.provider)}
+                    isServerManaged={llmCredentialIsServerManaged}
                     onChange={(e) =>
-                      updateLLMApiKey(settings.llm.provider, e.target.value)
+                      updateLLMApiKey(settings.llm.provider, e)
                     }
                     placeholder={
-                      settings.llm.provider === 'openai-compatible'
+                      isMiniMaxLlmGateway
+                        ? '必填：请输入原 MiniMax API key'
+                        : settings.llm.provider === 'openai-compatible'
                         ? '仅在服务要求时填写'
                         : 'XXX-...'
                     }
                     disabled={disabled}
                   />
+                  {llmCredentialIsServerManaged && (
+                    <p className="settings-field-hint">
+                      密钥由本机服务托管，浏览器仅显示固定遮罩。
+                    </p>
+                  )}
+                  {isMiniMaxLlmGateway && !llmCredentialConfigured && (
+                    <p className="settings-field-hint">
+                      当前服务端没有 MiniMax 凭据，模型生成会以
+                      generation_auth_failed 终止。重新输入原 key
+                      即可，不需要轮换。
+                    </p>
+                  )}
                 </div>
               )}
           </>
@@ -1089,9 +1087,7 @@ export function SettingsPanel({
                   />
                 </div>
                 <div className="settings-field">
-                  <label htmlFor="tts-gemini-prompt">
-                    语音风格提示词
-                  </label>
+                  <label htmlFor="tts-gemini-prompt">语音风格提示词</label>
                   <input
                     id="tts-gemini-prompt"
                     type="text"
@@ -1444,9 +1440,7 @@ export function SettingsPanel({
                   />
                 </div>
                 <div className="settings-field">
-                  <label htmlFor="tts-eleven-similarity">
-                    音色相似度增强
-                  </label>
+                  <label htmlFor="tts-eleven-similarity">音色相似度增强</label>
                   <input
                     id="tts-eleven-similarity"
                     type="number"
@@ -1510,9 +1504,7 @@ export function SettingsPanel({
                   />
                 </div>
                 <div className="settings-field">
-                  <label htmlFor="tts-eleven-speaker-boost">
-                    音色增强
-                  </label>
+                  <label htmlFor="tts-eleven-speaker-boost">音色增强</label>
                   <select
                     id="tts-eleven-speaker-boost"
                     value={settings.tts.elevenLabsUseSpeakerBoost || 'default'}
@@ -1530,9 +1522,7 @@ export function SettingsPanel({
                   </select>
                 </div>
                 <div className="settings-field">
-                  <label htmlFor="tts-eleven-normalization">
-                    文本规范化
-                  </label>
+                  <label htmlFor="tts-eleven-normalization">文本规范化</label>
                   <select
                     id="tts-eleven-normalization"
                     value={
@@ -1691,9 +1681,7 @@ export function SettingsPanel({
                   />
                 </div>
                 <div className="settings-field">
-                  <label htmlFor="tts-inworld-speaking-rate">
-                    语速
-                  </label>
+                  <label htmlFor="tts-inworld-speaking-rate">语速</label>
                   <input
                     id="tts-inworld-speaking-rate"
                     type="number"
@@ -1824,9 +1812,7 @@ export function SettingsPanel({
                   />
                 </div>
                 <div className="settings-field">
-                  <label htmlFor="tts-gradium-similarity">
-                    音色相似度
-                  </label>
+                  <label htmlFor="tts-gradium-similarity">音色相似度</label>
                   <input
                     id="tts-gradium-similarity"
                     type="number"
@@ -1947,8 +1933,9 @@ export function SettingsPanel({
                 </div>
                 <div className="settings-field">
                   <small>
-                    由于体积和第三方许可证限制，项目不包含运行时资源。请参考 README 中的 Piper Plus 安装说明，
-                    在 `public/piper/` 下放置 `dist/`、`src/`、`assets/` 和 `models/`。
+                    由于体积和第三方许可证限制，项目不包含运行时资源。请参考
+                    README 中的 Piper Plus 安装说明， 在 `public/piper/` 下放置
+                    `dist/`、`src/`、`assets/` 和 `models/`。
                   </small>
                 </div>
               </>
@@ -1972,9 +1959,7 @@ export function SettingsPanel({
                   />
                 </div>
                 <div className="settings-field">
-                  <label htmlFor="tts-openai-compatible-url">
-                    接口地址
-                  </label>
+                  <label htmlFor="tts-openai-compatible-url">接口地址</label>
                   <input
                     id="tts-openai-compatible-url"
                     type="text"
@@ -2148,14 +2133,19 @@ export function SettingsPanel({
               <>
                 <div className="settings-field">
                   <label htmlFor="tts-minimax-apikey">API 密钥</label>
-                  <input
+                  <ServerManagedCredentialInput
                     id="tts-minimax-apikey"
-                    type="password"
                     value={settings.tts.minimaxApiKey || ''}
-                    onChange={(e) => updateMinimaxApiKey(e.target.value)}
+                    isServerManaged={minimaxCredentialIsServerManaged}
+                    onChange={updateMinimaxApiKey}
                     placeholder="请输入 MiniMax API 密钥"
                     disabled={disabled}
                   />
+                  {minimaxCredentialIsServerManaged && (
+                    <p className="settings-field-hint">
+                      Chat/TTS 共用同一个服务端密钥，浏览器不保存原文。
+                    </p>
+                  )}
                 </div>
                 <div className="settings-field">
                   <label htmlFor="tts-minimax-groupid">
@@ -2186,11 +2176,10 @@ export function SettingsPanel({
                       </option>
                     ))}
                     {!settings.tts.minimaxApiKey && (
-                      <option value="">
-                        输入 API 密钥后获取音色列表
-                      </option>
+                      <option value="">输入 API 密钥后获取音色列表</option>
                     )}
-                    {settings.tts.minimaxApiKey && isFetchingMinimaxVoices && (
+                    {settings.tts.minimaxApiKey &&
+                      isFetchingMinimaxVoices && (
                       <option value="">正在获取音色列表……</option>
                     )}
                     {settings.tts.minimaxApiKey &&
@@ -2482,6 +2471,8 @@ export function SettingsPanel({
         updateTwitchEnabled={updateTwitchEnabled}
         updateTwitchCommentIntervalMs={updateTwitchCommentIntervalMs}
         updateBilibiliEnabled={updateBilibiliEnabled}
+        updateBilibiliReplyEnabled={updateBilibiliReplyEnabled}
+        updateBilibiliGatewayUrl={updateBilibiliGatewayUrl}
         updateCustomSseEndpoint={updateCustomSseEndpoint}
         updateCustomSseEnabled={updateCustomSseEnabled}
         updateCommentIntelligenceEnabled={updateCommentIntelligenceEnabled}

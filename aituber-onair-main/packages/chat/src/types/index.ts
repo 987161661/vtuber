@@ -10,6 +10,8 @@ export {
   VisionBlock,
   ChatType,
   Screenplay,
+  SpeechBeat,
+  SpeechPlanV2,
 } from './chat';
 
 // Tool related type definitions

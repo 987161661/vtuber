@@ -5,6 +5,10 @@ import {
   TYPHOON_BOSS_RADAR_EXTENSION_ID,
 } from '../host-extensions/typhoonBossRadar';
 import {
+  CITY_WEATHER_EXTENSION_ID,
+  createCityWeatherExtension,
+} from '../host-extensions/cityWeather';
+import {
   enrichWithHostExtensions,
   type HostExtensionInput,
 } from '../host-extensions/types';
@@ -20,6 +24,7 @@ export function useHostExtensions(options: {
 
   const extensions = useMemo(
     () => [
+      createCityWeatherExtension(),
       createTyphoonBossRadarExtension({
         enabled: typhoonEnabled,
         enrichTyphoon: typhoonSkill.enrich,
@@ -33,7 +38,14 @@ export function useHostExtensions(options: {
     () => ({
       enrich: (input: HostExtensionInput) =>
         enrichWithHostExtensions(extensions, input),
-      activeExtensionIds: extensions.filter((extension) => extension.id === TYPHOON_BOSS_RADAR_EXTENSION_ID && typhoonEnabled).map((extension) => extension.id),
+      activeExtensionIds: extensions
+        .filter(
+          (extension) =>
+            extension.id === CITY_WEATHER_EXTENSION_ID ||
+            (extension.id === TYPHOON_BOSS_RADAR_EXTENSION_ID &&
+              typhoonEnabled),
+        )
+        .map((extension) => extension.id),
     }),
     [extensions, typhoonEnabled],
   );

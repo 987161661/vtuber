@@ -1,3 +1,5 @@
+import type { RoomInteractionSnapshot } from './roomInteractionTracker';
+
 export type OperatorQueueStatus =
   | 'pending'
   | 'preparing'
@@ -7,9 +9,40 @@ export type OperatorQueueStatus =
   | 'skipped'
   | 'failed';
 
+/**
+ * Serializable SpeechPlan subset kept with a prepared queue item.  Keeping
+ * this alongside the display text prevents the operator queue from erasing
+ * beat-level voice and avatar direction before playback begins.
+ */
+export type PreparedSpeechBeat = {
+  text: string;
+  ttsText?: string;
+  emotion?: string;
+  delivery?: string;
+  emotionIntensity?: number;
+  prosody?: Record<string, number>;
+  pauseAfterMs?: number;
+  motion?: string;
+  gaze?: string;
+  gesture?: string;
+  interruptibleAfter?: boolean;
+};
+
+export type PreparedSpeechPlan = {
+  version: 2;
+  beats: PreparedSpeechBeat[];
+};
+
 export type OperatorQueueItem = {
   eventId: string;
+  /** Short, operator-visible summary. User messages remain capped by the queue API. */
   text: string;
+  /**
+   * Internal generation context for system-originated turns such as quiet-room
+   * awareness. This is intentionally separate from `text`: it is not a
+   * viewer message and must never be truncated to fit the control-room card.
+   */
+  prompt?: string;
   source: string;
   sourceLabel?: string;
   viewerId?: string;
@@ -20,6 +53,8 @@ export type OperatorQueueItem = {
   order: number;
   status: OperatorQueueStatus;
   preparedReply?: string;
+  /** Original structured output used by the TTS/animation execution path. */
+  preparedSpeechPlan?: PreparedSpeechPlan;
   preparedAt?: number;
   doneAt?: number;
   /** Why this message was deliberately kept out of the broadcast queue. */
@@ -40,6 +75,8 @@ export type OperatorQueueItem = {
     | 'prepare-lease-expiry';
   faultConsumed?: boolean;
   interactionObservedAt?: number;
+  /** Presence-triggered host speech must not be counted as a viewer message. */
+  presenceOnly?: boolean;
   engagementAppliedAt?: number;
   engagementSignals?: Array<'follow' | 'like' | 'gift' | 'superchat' | 'guard'>;
   leaseOwnerId?: string;
@@ -50,7 +87,27 @@ export type OperatorQueueItem = {
   otherViewerRelationshipMutated?: boolean;
   /** Runtime owner selected for a stress run; other listener pages must not claim it. */
   assignedOwnerId?: string;
+  /** Bounded room-level evidence for persona planning; never displayed as chat. */
+  roomContext?: RoomInteractionSnapshot;
 };
+
+export const MAX_READY_REPLY_AGE_MS = 45_000;
+
+/**
+ * A generated reply becomes misleading once the live room has already moved
+ * on. Operator-authored speech is exempt because it is an explicit command.
+ */
+export function isStaleReadyReply(
+  item: OperatorQueueItem,
+  now = Date.now(),
+  maxAgeMs = MAX_READY_REPLY_AGE_MS,
+): boolean {
+  return (
+    item.status === 'ready' &&
+    item.source !== 'operator-manual' &&
+    now - item.createdAt > maxAgeMs
+  );
+}
 
 export async function updateOperatorQueue(
   eventId: string,

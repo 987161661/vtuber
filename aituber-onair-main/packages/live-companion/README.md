@@ -112,6 +112,55 @@ The planner supplies constraints that forbid language such as "I can see you
 lurking" and caps both global and per-viewer frequency. Set `doNotDisturb` on a
 viewer identity to opt that viewer out completely.
 
+## Host execution authority
+
+`LiveHostCoordinator.dispatch` returns `LiveHostAction[]`. Every action has an
+idempotency key (`actionId`), an issue time, and enough turn data for the queue,
+generation, or speech consumer to execute it without reconstructing policy.
+Feed generation and speech lifecycle events back into the same coordinator;
+do not start playback merely because generation completed unless it emitted a
+`speak-turn` action.
+
+Provide the same `LiveHostScope` on every event to reject delayed events after
+a persona or stream session switch. Unscoped events remain supported for older
+integrations.
+
+Quiet-room candidates should carry a stable `opportunityId`. Reusing a source
+label is valid after cooldown; reusing an already selected opportunity id is
+not. A new thought or observation must receive a new opportunity id.
+
+```ts
+const scope = {
+  profileId: 'linglan',
+  sessionId: 'session-2026-07-16',
+  streamId: 'stream-1',
+};
+
+coordinator.dispatch({
+  type: 'stream-state',
+  at: Date.now(),
+  isLive: true,
+  scope,
+});
+
+const actions = coordinator.dispatch({
+  type: 'quiet-candidate',
+  at: Date.now(),
+  eventId: 'candidate-12',
+  opportunityId: 'empty-room-thought-12',
+  source: 'empty-room-awareness',
+  prompt: 'Continue the current thought without repeating the last line.',
+  busy: false,
+  scope,
+});
+
+for (const action of actions) {
+  if (action.kind === 'prepare-reply') {
+    await generationQueue.enqueue(action.turn, action.prompt, action.actionId);
+  }
+}
+```
+
 ## Emotion to avatar behavior protocol
 
 An application owns the emotion mapping. Implement `EmotionBehaviorMapper` to

@@ -27,19 +27,21 @@ import {
 } from '../lib/liveResponseScheduler';
 import type { TwitchChatMessage } from '../services/twitch/twitchService';
 import type { YouTubeChatMessage } from '../services/youtube/youtubeService';
+import {
+  RoomInteractionTracker,
+  type RoomInteractionSnapshot,
+} from '../lib/roomInteractionTracker';
 import type { LiveRoomEvent } from '../services/live-platform/types';
 import type { ChatMessage } from '../types/chat';
 import type { AppSettings, ChatProviderOption } from '../types/settings';
 import { useInterval } from './useInterval';
 
-type StreamPlatform =
-  | 'youtube'
-  | 'twitch'
-  | 'bilibili'
-  | 'custom-sse'
-  | 'none';
+type StreamPlatform = 'youtube' | 'twitch' | 'bilibili' | 'custom-sse' | 'none';
 const GPT5_SAMPLE_PROVIDER_OPTIONS = { gpt5Preset: 'casual' as const };
 const RESPONSE_COOLDOWN_MS = 500;
+// A live answer that has not started drafting quickly enough is no longer a
+// live answer. Drop it before spending another model/TTS turn on old chat.
+const MAX_LIVE_DRAFT_AGE_MS = 12_000;
 const DIRECT_ENGAGEMENT_PATTERN =
   /(主播|凌岚|聊聊天|聊天|聊聊|能否|能不能|有没有|请问|可以.*吗|[?？])/i;
 
@@ -61,6 +63,7 @@ type ProcessChat = (
     processingAt?: number;
     sourcesSeen?: string[];
     catchup?: boolean;
+    roomContext?: RoomInteractionSnapshot;
   },
 ) => Promise<void>;
 
@@ -112,6 +115,9 @@ export function useLiveCommentIntelligence({
   const [lastAnalysis, setLastAnalysis] =
     useState<CommentIntelligenceResult | null>(null);
   const schedulerRef = useRef<LiveResponseScheduler | null>(null);
+  const roomInteractionTrackerRef = useRef(new RoomInteractionTracker());
+  const flushRef = useRef<() => Promise<void>>(async () => undefined);
+  const scheduledFlushTimerRef = useRef<number | null>(null);
   const onTransitionRef = useRef(onTransition);
 
   useEffect(() => {
@@ -121,6 +127,9 @@ export function useLiveCommentIntelligence({
   if (!schedulerRef.current) {
     schedulerRef.current = new LiveResponseScheduler({
       maxGroups: Math.max(1, Math.min(12, maxCommentsPerBatch)),
+      // A single viewer should not pay the old 1.5 s burst-settle tax.  The
+      // event-driven flush below still groups messages arriving together.
+      settleWindowMs: 400,
       onTransition: (transition) => {
         setQueueDepth(transition.queueDepth);
         onTransitionRef.current?.(transition);
@@ -176,7 +185,7 @@ export function useLiveCommentIntelligence({
           blockDurationMs: viewerBlockDurationMs,
         },
         context: {
-          language: 'ja',
+          language: 'zh-CN',
           style: 'aituber-live',
         },
       }),
@@ -191,8 +200,15 @@ export function useLiveCommentIntelligence({
   );
 
   const enqueue = useCallback((comments: LiveComment[]) => {
+    roomInteractionTrackerRef.current.observe(comments);
     schedulerRef.current?.enqueue(comments);
     setQueueDepth(schedulerRef.current?.size ?? 0);
+    if (scheduledFlushTimerRef.current === null) {
+      scheduledFlushTimerRef.current = window.setTimeout(() => {
+        scheduledFlushTimerRef.current = null;
+        void flushRef.current();
+      }, 500);
+    }
   }, []);
 
   const enqueueYouTubeComments = useCallback(
@@ -225,7 +241,10 @@ export function useLiveCommentIntelligence({
           },
           metadata: {
             ...comment.metadata,
-            sourcePlatform: 'bridge',
+            sourcePlatform:
+              String(comment.metadata?.platformId || '') ||
+              String(comment.metadata?.sourcePlatform || '') ||
+              'web',
             eventType: comment.type,
             superChat: comment.type === 'superchat',
           },
@@ -254,7 +273,13 @@ export function useLiveCommentIntelligence({
       scheduled = schedulerRef.current.dequeue();
       setQueueDepth(schedulerRef.current.size);
       if (!scheduled) return;
-      const comments = [scheduled.comment];
+      if (Date.now() - scheduled.commentAt > MAX_LIVE_DRAFT_AGE_MS) {
+        schedulerRef.current.mark(scheduled, 'dropped', 'expired');
+        return;
+      }
+      const comments = scheduled.comments.length
+        ? scheduled.comments
+        : [scheduled.comment];
       const result = await intelligence.analyze({
         comments,
         recentMessages: messages.slice(-12).map((message) => ({
@@ -272,13 +297,13 @@ export function useLiveCommentIntelligence({
           mode: 'live',
           topic: streamTopic.trim() || undefined,
           title: streamTitle.trim() || undefined,
-          language: 'ja',
+          language: 'zh-CN',
         },
       });
 
       setLastAnalysis(result);
 
-      const candidate = comments[0];
+      const candidate = scheduled.comment;
       const selected =
         result.selectedComments[0] ??
         (isDirectEngagement(candidate)
@@ -287,11 +312,7 @@ export function useLiveCommentIntelligence({
             )
           : undefined);
       if (!selected) {
-        schedulerRef.current.mark(
-          scheduled,
-          'dropped',
-          'analysis_filtered',
-        );
+        schedulerRef.current.mark(scheduled, 'dropped', 'analysis_filtered');
         return;
       }
 
@@ -301,10 +322,10 @@ export function useLiveCommentIntelligence({
           selected.text,
         );
       const lengthRule = scheduled.catchup
-        ? '这是合并追答：只说1至2句，总共不超过80个汉字，不逐条复述问题。'
+        ? '这是直播间的一波合并互动：只抓一个共同话题或气氛回应，目标口播8至15秒，最多2个自然节拍；不要逐条点名、逐条反驳或复述问题。'
         : weatherQuestion
-          ? '只说1至2句，总共不超过60个汉字。'
-          : '只说1句，不超过32个汉字。';
+          ? '这是事实解释：目标口播8至20秒，最多3个自然节拍，必要安全信息优先。'
+          : '这是普通回答：目标口播5至12秒，使用1至2个自然节拍。';
       const promptForCore = [
         '<live_comment>',
         `你是${profile.fullName}，正在回应已经通过安全筛选的直播弹幕。`,
@@ -312,12 +333,25 @@ export function useLiveCommentIntelligence({
         `观众：${authorName}`,
         `弹幕：${selected.text}`,
         lengthRule,
+        /(?:找打|想打你|滚(?:开)?|草泥马|操你妈|来劲儿)/.test(selected.text)
+          ? '这是本轮唯一允许回应的摩擦性玩笑：只用一句不挑衅的控场回应，把话题交还直播间；不得反向挑战、约架、要求背台风知识或继续斗嘴。'
+          : '',
+        /(?:被|别)说话/.test(selected.text) && !/[?？]/.test(selected.text)
+          ? '这条可能含错字或语义不完整：不要把它当作命令或冒犯；若回应，只作轻量确认或自然略过。'
+          : '',
         '直接回应最具体的内容；不要复述内部说明，不要使用“说人话、按脑子、竖起耳朵、别给自己加戏、查户口”等训斥话术。高冷只能表现为简洁、克制和机灵。',
         '观众表达感谢、担心或当地现场感受时，先认可其信息或情绪，不得嘲讽、否定现场感受。',
         '天气问题必须先给资料支持的结论；模式预报必须说成参考或推测，不能说成当地实况。没有证据时禁止声称风眼经过、必经之路、已经登陆、高危区或全省都会受影响。安全建议最多一项。',
         '</live_comment>',
       ].join('\n');
       const displayText = `${authorName} 的弹幕：${selected.text}`;
+
+      // The model analysis itself can take seconds during a busy room. Check
+      // freshness again before it is allowed to create a broadcast draft.
+      if (Date.now() - scheduled.commentAt > MAX_LIVE_DRAFT_AGE_MS) {
+        schedulerRef.current.mark(scheduled, 'dropped', 'expired');
+        return;
+      }
 
       await processChat(promptForCore, {
         displayText,
@@ -331,15 +365,14 @@ export function useLiveCommentIntelligence({
         processingAt: scheduled.selectedAt,
         sourcesSeen: scheduled.sourcesSeen,
         catchup: scheduled.catchup,
+        roomContext: roomInteractionTrackerRef.current.snapshot(
+          scheduled.roomBatch,
+        ),
       });
       schedulerRef.current.mark(scheduled, 'generated');
     } catch (error) {
       if (scheduled) {
-        schedulerRef.current?.mark(
-          scheduled,
-          'dropped',
-          'processing_error',
-        );
+        schedulerRef.current?.mark(scheduled, 'dropped', 'processing_error');
       }
       console.warn('Live comment processing failed.', error);
     } finally {
@@ -357,6 +390,16 @@ export function useLiveCommentIntelligence({
     streamTopic,
     profile.fullName,
   ]);
+  flushRef.current = flush;
+
+  useEffect(
+    () => () => {
+      if (scheduledFlushTimerRef.current !== null) {
+        window.clearTimeout(scheduledFlushTimerRef.current);
+      }
+    },
+    [],
+  );
 
   useInterval(
     () => {
