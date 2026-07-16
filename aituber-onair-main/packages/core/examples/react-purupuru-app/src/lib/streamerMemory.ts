@@ -430,7 +430,7 @@ export function buildMemoryContext(
         (!record.subjectId || !viewerId || record.subjectId === viewerId),
     )
     .sort((a, b) => score(b) - score(a))
-    .slice(0, 16);
+    .slice(0, 8);
   let used = 0;
   const lines: string[] = [];
   for (const r of selected) {

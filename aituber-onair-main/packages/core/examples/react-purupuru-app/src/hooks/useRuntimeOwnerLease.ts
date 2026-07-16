@@ -1,54 +1,48 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 
-const LIVE_RUNTIME_LOCK = 'aituber-live-runtime-owner';
+const LEASE_HEARTBEAT_MS = 3_000;
 
 /** Serializes every listener/overlay candidate onto one browser runtime. */
 export function useRuntimeOwnerLease(candidate: boolean): boolean {
   const [ownsRuntime, setOwnsRuntime] = useState(false);
+  const ownerIdRef = useRef(`runtime-lease-${crypto.randomUUID()}`);
 
   useEffect(() => {
-    if (!candidate) return;
-
-    const controller = new AbortController();
-    let release: () => void = () => undefined;
-    const released = new Promise<void>((resolve) => {
-      release = resolve;
-    });
-
-    if (!navigator.locks) {
-      // Web Locks is available in the Chromium versions used by OBS. Keep a
-      // functional fallback for unusual browsers without pretending it is a
-      // cross-tab lease.
-      queueMicrotask(() => {
-        if (!controller.signal.aborted) setOwnsRuntime(true);
-      });
-      return () => {
-        controller.abort();
-        setOwnsRuntime(false);
-      };
+    const ownerId = ownerIdRef.current;
+    if (!candidate) {
+      queueMicrotask(() => setOwnsRuntime(false));
+      return;
     }
 
-    void navigator.locks
-      .request(
-        LIVE_RUNTIME_LOCK,
-        { mode: 'exclusive', signal: controller.signal },
-        async () => {
-          if (controller.signal.aborted) return;
-          setOwnsRuntime(true);
-          await released;
-          setOwnsRuntime(false);
-        },
-      )
-      .catch((error: unknown) => {
-        if (!(error instanceof DOMException && error.name === 'AbortError')) {
-          console.warn('Live runtime owner lease failed.', error);
-        }
-      });
+    // Web Locks are scoped to a browser origin. OBS/control pages can be
+    // opened through localhost and 127.0.0.1, which makes them different lock
+    // namespaces even though they drive the same Vite process. The local
+    // server is therefore the authoritative lease owner.
+    let disposed = false;
+    const heartbeat = async () => {
+      try {
+        const response = await fetch('/api/live-runtime-owner', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ ownerId }),
+        });
+        const payload = (await response.json()) as { owns?: unknown };
+        if (!disposed) setOwnsRuntime(payload.owns === true);
+      } catch {
+        if (!disposed) setOwnsRuntime(false);
+      }
+    };
+    void heartbeat();
+    const timer = window.setInterval(() => void heartbeat(), LEASE_HEARTBEAT_MS);
 
     return () => {
-      controller.abort();
-      release();
-      setOwnsRuntime(false);
+      disposed = true;
+      window.clearInterval(timer);
+      void fetch('/api/live-runtime-owner', {
+        method: 'DELETE',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ownerId }),
+      }).catch(() => undefined);
     };
   }, [candidate]);
 

@@ -7,6 +7,7 @@ import {
   EventHub,
   normalizeHistoryComment,
   normalizeRoomEvent,
+  parseJsonBody,
   splitDanmuText,
 } from './bilibili-room-supervisor.mjs';
 
@@ -16,6 +17,17 @@ test('encodes and decodes protocol packets', () => {
   );
   assert.equal(decoded.operation, 5);
   assert.deepEqual(JSON.parse(decoded.body.toString()), { cmd: 'TEST' });
+});
+
+test('falls back to GB18030 when a danmaku JSON body is not UTF-8', () => {
+  const body = Buffer.concat([
+    Buffer.from('{"cmd":"DANMU_MSG","info":[[0,0,0,0,1],"@'),
+    Buffer.from([0xc9, 0xcf, 0xba, 0xa3]),
+    Buffer.from('",[1,"viewer"],[]]}'),
+  ]);
+  const payload = parseJsonBody({ body });
+  assert.equal(payload.info[1], '@上海');
+  assert.equal(normalizeRoomEvent(payload).text, '@上海');
 });
 
 test('normalizes danmaku messages', () => {

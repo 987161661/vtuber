@@ -527,6 +527,8 @@ export class MinimaxEngine implements VoiceEngine {
       input.delivery,
       input.emotionIntensity,
     );
+    const streamController = new AbortController();
+    const requestTimer = setTimeout(() => streamController.abort(), 30_000);
     const response = await fetchWithTimeout(this.getTtsApiUrl(), {
       method: 'POST',
       headers: {
@@ -545,6 +547,9 @@ export class MinimaxEngine implements VoiceEngine {
         language_boost: this.language,
         subtitle_enable: false,
       }),
+      signal: streamController.signal,
+    }).finally(() => {
+      clearTimeout(requestTimer);
     });
     if (!response.ok || !response.body) {
       throw new Error(`MiniMax streaming TTS failed: HTTP ${response.status}`);
@@ -569,13 +574,18 @@ export class MinimaxEngine implements VoiceEngine {
     const reader = response.body.getReader();
     const decoder = new TextDecoder();
     let pending = '';
-    // At 128 kbps, ~32 KiB is about 2 seconds of MP3. This aligns closely
-    // with two 0.96 s FlashHead Lite slices, avoiding alternating 0.96/1.92 s
-    // render batches that can starve real-time playback.
-    const targetChunkBytes = 32 * 1024;
+    // At 128 kbps, 16 KiB is about one second of MP3. Yield that smaller
+    // startup chunk so the host can acknowledge the viewer sooner, then use
+    // 32 KiB chunks for stable real-time FlashHead rendering and playback.
+    const firstChunkBytes = 16 * 1024;
+    const steadyChunkBytes = 32 * 1024;
+    let nextChunkBytes = firstChunkBytes;
     let audioParts: Uint8Array[] = [];
     let audioBytes = 0;
     let receivedIncrementalAudio = false;
+    let streamComplete = false;
+    let lastAudioAt = 0;
+    const streamAudioIdleTimeoutMs = 8_000;
     const appendAudio = (audio: ArrayBuffer) => {
       const part = new Uint8Array(audio);
       audioParts.push(part);
@@ -615,6 +625,7 @@ export class MinimaxEngine implements VoiceEngine {
           `MiniMax API error: ${payload.base_resp.status_code} - ${payload.base_resp.status_msg || 'Unknown error'}`,
         );
       }
+      if (payload.data?.status === 2) streamComplete = true;
       if (!payload.data?.audio) return null;
       // MiniMax can finish an HTTP stream with status=2 containing the full
       // MP3, after status=1 events already delivered the incremental audio.
@@ -622,11 +633,38 @@ export class MinimaxEngine implements VoiceEngine {
       // Keep status=2 when it is the only audio response (short synthesis).
       if (payload.data.status === 2 && receivedIncrementalAudio) return null;
       if (payload.data.status !== 2) receivedIncrementalAudio = true;
+      lastAudioAt = Date.now();
       return decodeHexToArrayBuffer(payload.data.audio);
     };
 
     while (true) {
-      const { value, done } = await reader.read();
+      let idleTimer: ReturnType<typeof setTimeout> | undefined;
+      const audioIdleRemainingMs = Math.max(
+        0,
+        streamAudioIdleTimeoutMs - (Date.now() - lastAudioAt),
+      );
+      const readResult = receivedIncrementalAudio
+        ? await Promise.race([
+            reader.read().then((result) => ({ kind: 'data' as const, result })),
+            new Promise<{ kind: 'idle' }>((resolve) => {
+              idleTimer = setTimeout(
+                () => resolve({ kind: 'idle' }),
+                audioIdleRemainingMs,
+              );
+            }),
+          ]).finally(() => {
+            if (idleTimer) clearTimeout(idleTimer);
+          })
+        : { kind: 'data' as const, result: await reader.read() };
+      if (readResult.kind === 'idle') {
+        // Some proxies keep a completed SSE connection alive with empty status
+        // frames. Once real audio has arrived, only another audio fragment (not
+        // an empty heartbeat) extends the useful stream lifetime.
+        streamController.abort();
+        void reader.cancel().catch(() => undefined);
+        break;
+      }
+      const { value, done } = readResult.result;
       pending += decoder.decode(value, { stream: !done });
       const events = pending.split('\n\n');
       pending = events.pop() || '';
@@ -634,21 +672,32 @@ export class MinimaxEngine implements VoiceEngine {
         const audio = consumeEvent(event);
         if (audio) {
           appendAudio(audio);
-          while (audioBytes >= targetChunkBytes) {
-            const chunk = flushAudio(targetChunkBytes);
-            if (chunk) yield chunk;
+          while (audioBytes >= nextChunkBytes) {
+            const chunk = flushAudio(nextChunkBytes);
+            if (chunk) {
+              yield chunk;
+              nextChunkBytes = steadyChunkBytes;
+            }
           }
         }
       }
+      if (streamComplete) {
+        streamController.abort();
+        void reader.cancel().catch(() => undefined);
+        break;
+      }
       if (done) break;
     }
-    if (pending.trim()) {
+    if (!streamComplete && pending.trim()) {
       const audio = consumeEvent(pending);
       if (audio) appendAudio(audio);
     }
-    while (audioBytes >= targetChunkBytes) {
-      const chunk = flushAudio(targetChunkBytes);
-      if (chunk) yield chunk;
+    while (audioBytes >= nextChunkBytes) {
+      const chunk = flushAudio(nextChunkBytes);
+      if (chunk) {
+        yield chunk;
+        nextChunkBytes = steadyChunkBytes;
+      }
     }
     const finalChunk = flushAudio();
     if (finalChunk) yield finalChunk;

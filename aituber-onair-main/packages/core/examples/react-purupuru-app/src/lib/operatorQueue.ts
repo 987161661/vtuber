@@ -9,7 +9,14 @@ export type OperatorQueueStatus =
 
 export type OperatorQueueItem = {
   eventId: string;
+  /** Short, operator-visible summary. User messages remain capped by the queue API. */
   text: string;
+  /**
+   * Internal generation context for system-originated turns such as quiet-room
+   * awareness. This is intentionally separate from `text`: it is not a
+   * viewer message and must never be truncated to fit the control-room card.
+   */
+  prompt?: string;
   source: string;
   sourceLabel?: string;
   viewerId?: string;
@@ -40,6 +47,8 @@ export type OperatorQueueItem = {
     | 'prepare-lease-expiry';
   faultConsumed?: boolean;
   interactionObservedAt?: number;
+  /** Presence-triggered host speech must not be counted as a viewer message. */
+  presenceOnly?: boolean;
   engagementAppliedAt?: number;
   engagementSignals?: Array<'follow' | 'like' | 'gift' | 'superchat' | 'guard'>;
   leaseOwnerId?: string;

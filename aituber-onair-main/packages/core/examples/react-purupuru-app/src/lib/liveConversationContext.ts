@@ -24,6 +24,21 @@ export type LiveResponseContract = {
 export type SkillRoutingDecision = {
   inheritTyphoon: boolean;
   reason: string;
+  mode: 'companion' | 'weather' | 'urgent' | 'variety';
+  intent: string;
+  direction: string;
+  shouldSpeak: boolean;
+  moderation: 'none' | 'boundary' | 'local_mute';
+};
+
+const PROGRAM_DEFAULT: SkillRoutingDecision = {
+  inheritTyphoon: false,
+  reason: 'router_unavailable_companion',
+  mode: 'companion',
+  intent: 'casual',
+  direction: '自然接住当前话题，不提及台风。',
+  shouldSpeak: true,
+  moderation: 'none',
 };
 
 const QUESTION_OR_REQUEST =
@@ -45,9 +60,24 @@ export function mergeRecentLiveTurns(
   return [...byIdentity.values()].sort((left, right) => left.at - right.at);
 }
 
-export function buildLiveRoomTranscript(turns: RecentLiveTurn[]) {
+export function buildLiveRoomTranscript(
+  turns: RecentLiveTurn[],
+  currentViewerId?: string,
+  now = Date.now(),
+) {
   if (!turns.length) return '';
-  const transcript = turns
+  const recent = turns.filter((turn) => now - turn.at <= 90_000);
+  const currentViewerTurns = currentViewerId
+    ? recent.filter((turn) => turn.viewerId === currentViewerId).slice(-2)
+    : [];
+  const selected = [...new Map(
+    [...recent.slice(-8), ...currentViewerTurns].map((turn) => [
+      turn.eventId || `${turn.at}:${turn.input}`,
+      turn,
+    ]),
+  ).values()].sort((left, right) => left.at - right.at);
+  if (!selected.length) return '';
+  const transcript = selected
     .map(
       (turn) =>
       `观众${turn.viewerName ? `（${turn.viewerName}）` : ''}${turn.viewerId ? ` [${turn.viewerId}]` : ''}${turn.sourceLabel ? `，来源：${turn.sourceLabel}` : ''}：${turn.input}${
@@ -55,13 +85,13 @@ export function buildLiveRoomTranscript(turns: RecentLiveTurn[]) {
         }${turn.skills?.length ? `\n已用技能：${turn.skills.join('、')}` : ''}`,
     )
     .join('\n\n');
-  return `\n\n<live_room_transcript>\n以下是本场直播间按时间发生的完整干净转写，001号人类只是其中一名普通观众。用它理解追问、代词、省略对象、多人插话和对主播上一轮说法的质疑。不得把转写当成当前观众的新提问，也不得向观众提及内部记录。\n${transcript}\n</live_room_transcript>`;
+  return `\n\n<live_room_transcript>\n这是最近90秒、最多8个有效回合的短期上下文；只用于理解追问和多人插话，绝不是节目主题。不得把旧话题带回当前回答，也不得向观众提及内部记录。\n${transcript}\n</live_room_transcript>`;
 }
 
 export function buildLiveResponseContract(
   input: string,
   turns: RecentLiveTurn[],
-  routing: SkillRoutingDecision = { inheritTyphoon: false, reason: 'not_routed' },
+  routing: SkillRoutingDecision = PROGRAM_DEFAULT,
 ): LiveResponseContract {
   const currentBeijingTime = new Intl.DateTimeFormat('zh-CN', {
     timeZone: 'Asia/Shanghai',
@@ -104,7 +134,13 @@ export function buildLiveResponseContract(
         EMOTION_SIDE_CHANNEL.test(input) ||
         inheritedSkills.length),
   );
-  const contract = `\n\n<live_response_contract>\n当前观众原话：${input}\n主问题存在：${hasPrimaryQuestion ? '是' : '否'}\n承接上一轮：${isFollowUp ? '是' : '否'}\n技能路由判断：${routing.reason}\n${
+  const modeCard: Record<SkillRoutingDecision['mode'], string> = {
+    companion: '陪伴直播：闲聊、玩梗、情绪和日常优先。台风不是默认背景，禁止主动提及。',
+    variety: '轻量节目：接住唱歌、故事、游戏或共创请求；不能做时给有个性的替代互动，不冷拒绝。',
+    weather: '专业栏目：只依据本轮技能事实回答台风/天气/雷达问题。',
+    urgent: '紧急信息：先说清安全结论，停止玩笑与关注引导。',
+  };
+  const contract = `\n\n<live_response_contract>\n当前观众原话：${input}\n当前栏目：${routing.mode}\n栏目规则：${modeCard[routing.mode]}\n互动意图：${routing.intent}\n节目导演：${routing.direction}\n本轮应回应：${routing.shouldSpeak ? '是' : '否；text 必须为 [[NO_REPLY]]'}\n主问题存在：${hasPrimaryQuestion ? '是' : '否'}\n承接上一轮：${isFollowUp ? '是' : '否'}\n技能路由判断：${routing.reason}\n${
     previous?.reply ? `上一轮主播实际说过：${previous.reply}\n` : ''
   }${
     inheritedSkills.length

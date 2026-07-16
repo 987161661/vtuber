@@ -382,12 +382,23 @@ export function decodePackets(input) {
   return decoded;
 }
 
-function parseJsonBody(packet) {
-  try {
-    return JSON.parse(packet.body.toString('utf8').replace(/\0+$/g, ''));
-  } catch {
-    return null;
+export function parseJsonBody(packet) {
+  const utf8 = packet.body.toString('utf8').replace(/\0+$/g, '');
+  // Some Bilibili gateway nodes still return GBK/GB18030-encoded fields in
+  // otherwise JSON-shaped packets. UTF-8 decoding turns 上海 into replacement
+  // characters, which silently breaks every downstream city command.
+  const gb18030 = utf8.includes('\uFFFD')
+    ? new TextDecoder('gb18030').decode(packet.body).replace(/\0+$/g, '')
+    : '';
+  for (const candidate of gb18030 ? [gb18030, utf8] : [utf8]) {
+    if (!candidate) continue;
+    try {
+      return JSON.parse(candidate);
+    } catch {
+      // Try the alternate decoder before rejecting the packet.
+    }
   }
+  return null;
 }
 
 export function normalizeRoomEvent(payload) {

@@ -59,6 +59,12 @@ Windows 本地已完成依赖配置时，在本目录执行：
 # 只启动数字人、FlashHead 和直播总控
 .\Start-AITuber.ps1 -OpenBrowser
 
+# 一键启动真正执行直播任务的数字人控制台（含静息自语、队列与数字人播报）
+.\Start-Linglan-ControlRoom.ps1
+
+# Windows 资源管理器中可直接双击的入口
+.\启动玲兰数字人控制台.cmd
+
 # 启动 B 站网关后再启动数字人；首次传入房间号会保存配置
 .\Start-Linglan-Bilibili.ps1 -RoomId <B站直播间号>
 ```

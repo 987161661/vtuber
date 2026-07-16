@@ -80,6 +80,8 @@ export interface LivePlatformConnectionStatus {
   roomId: string;
   state: string;
   error?: string;
+  isLive?: boolean;
+  onlineCount?: number;
   credentialState?: 'missing' | 'configured' | 'valid' | 'invalid' | 'unknown';
   inbound?: boolean;
   outbound?: boolean;

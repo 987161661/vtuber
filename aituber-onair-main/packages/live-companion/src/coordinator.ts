@@ -40,6 +40,10 @@ export class LiveHostCoordinator {
     this.policy = { ...DEFAULT_LIVE_HOST_POLICY, ...policy };
   }
 
+  updatePolicy(policy: Partial<LiveHostPolicy>) {
+    Object.assign(this.policy, policy);
+  }
+
   dispatch(event: LiveHostEvent): LiveHostDecision[] {
     const decisions = this.reduce(event);
     if (decisions.length) {
@@ -203,6 +207,15 @@ export class LiveHostCoordinator {
           this.pendingTurns.set(event.eventId, { ...event.turn });
           return [];
         }
+        if (
+          this.activeTurn &&
+          this.activeTurn.eventId !== event.eventId
+        ) {
+          // A ready/direct queue item may begin after another turn has already
+          // drafted. Preserve that draft so the actual playback lifecycle
+          // cannot overwrite and lose it.
+          this.pendingTurns.set(this.activeTurn.eventId, this.activeTurn);
+        }
         this.phase = 'deliberating';
         this.activeTurn = { ...event.turn };
         return [];
@@ -220,6 +233,12 @@ export class LiveHostCoordinator {
               reasonCode: 'generation_completed_while_speech_active',
             },
           ];
+        }
+        if (
+          this.activeTurn &&
+          this.activeTurn.eventId !== event.eventId
+        ) {
+          this.pendingTurns.set(this.activeTurn.eventId, this.activeTurn);
         }
         if (!this.activeTurn || this.activeTurn.eventId !== event.eventId) {
           this.activeTurn = { ...event.turn };
@@ -249,6 +268,24 @@ export class LiveHostCoordinator {
     }
 
     if (event.type === 'runtime-fault') {
+      // A proactive candidate is reserved before its asynchronous queue write.
+      // If that write is rejected, no generation or speech ever started, so
+      // recovering the whole host would leave an otherwise healthy room idle.
+      if (event.reasonCode === 'proactive_enqueue_failed') {
+        this.phase = 'observing';
+        this.activeTurn = undefined;
+        this.pendingInterruptEventId = undefined;
+        this.currentBeatIndex = undefined;
+        this.currentBeatInterruptible = false;
+        return [
+          {
+            kind: 'emit-avatar-intent',
+            eventId: event.eventId ?? 'proactive-enqueue',
+            intent: 'observing',
+            reasonCode: event.reasonCode,
+          },
+        ];
+      }
       return this.enterRecovery(event.eventId, event.reasonCode);
     }
 

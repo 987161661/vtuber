@@ -81,6 +81,7 @@ const PROVINCE_NAMES = [
 
 type ResponseIntent =
   | 'history'
+  | 'hazard'
   | 'location'
   | 'forecast'
   | 'strength'
@@ -93,6 +94,13 @@ const RESPONSE_INTENTS: Array<{
   question: RegExp;
   answer: RegExp;
 }> = [
+  {
+    intent: 'hazard',
+    question:
+      /\u96e8\u707e|\u6c34\u707e|\u6d2a\u6c34|\u5185\u6d9d|\u79ef\u6c34|\u5c71\u6d2a|\u6ce5\u77f3\u6d41|\u6df9\u6c34|\u5012\u704c/,
+    answer:
+      /\u96e8\u707e|\u6c34\u707e|\u6d2a\u6c34|\u5185\u6d9d|\u79ef\u6c34|\u5c71\u6d2a|\u6ce5\u77f3\u6d41|\u6df9\u6c34|\u5012\u704c|\u707e\u60c5|\u9884\u8b66/,
+  },
   {
     intent: 'history',
     question: /近年|历史|过去|曾经|出现过|图鉴/,
@@ -172,6 +180,9 @@ function answersViewerIntent(viewerText: string, answer: string): boolean {
 
 function intentPreservingFallback(viewerText = ''): string {
   const intents = detectedIntents(viewerText);
+  if (intents.includes('hazard')) {
+    return '\u5f53\u524d\u8d44\u6599\u6ca1\u6709\u53ef\u6838\u5b9e\u7684\u707e\u60c5\u6216\u5b98\u65b9\u9884\u8b66\uff0c\u6211\u4e0d\u80fd\u636e\u6b64\u5224\u65ad\u5f53\u5730\u662f\u5426\u5b89\u5168\u3002';
+  }
   if (intents.includes('history')) {
     return '当前实时资料不包含这项历史记录，我不能拿台风实况代替回答。';
   }
@@ -252,12 +263,19 @@ function deterministicRewrite(
 ): string {
   const candidate = sanitizeSpeechText(context?.requiredAnswer ?? '');
   const viewerText = context?.viewerText ?? '';
+  const canUseVerifiedWeatherFallback = Boolean(
+    context?.isWeather &&
+      reasons.includes('unsafe_artifact') &&
+      Array.isArray(context.claims) &&
+      context.claims.length > 0,
+  );
   if (
-    !reasons.includes('unsafe_artifact') &&
     !reasons.includes('hostile_tone') &&
+    (!reasons.includes('unsafe_artifact') || context?.isWeather === true) &&
     candidate &&
     !hasUnsafeSpeechArtifacts(candidate) &&
-    answersViewerIntent(viewerText, candidate)
+    (answersViewerIntent(viewerText, candidate) ||
+      canUseVerifiedWeatherFallback)
   ) {
     return candidate;
   }
@@ -268,6 +286,28 @@ function deterministicRewrite(
   return SAFE_FALLBACK;
 }
 
+function unwrapStructuredSpeechPlan(text: string): string | null {
+  if (!text.startsWith('{') || !text.endsWith('}')) return null;
+  try {
+    const parsed = JSON.parse(text) as {
+      version?: unknown;
+      beats?: Array<{ text?: unknown }>;
+    };
+    if (parsed.version !== 2 || !Array.isArray(parsed.beats)) return null;
+    const spokenText = parsed.beats
+      .slice(0, 3)
+      .map((beat) =>
+        typeof beat?.text === 'string' ? sanitizeSpeechText(beat.text) : '',
+      )
+      .filter(Boolean)
+      .join(' ')
+      .trim();
+    return spokenText || null;
+  } catch {
+    return null;
+  }
+}
+
 /**
  * The only viewer-facing output gate. It cleans, validates, and performs one
  * deterministic rewrite before the text can reach history, memory, or TTS.
@@ -276,7 +316,11 @@ export function guardViewerResponse(
   input: string,
   context?: ResponseFactGuard,
 ): GuardedResponse {
-  const sanitized = sanitizeSpeechText(input);
+  const initiallySanitized = sanitizeSpeechText(input);
+  const recoveredStructuredText = unwrapStructuredSpeechPlan(
+    initiallySanitized,
+  );
+  const sanitized = recoveredStructuredText ?? initiallySanitized;
   const unsafeArtifacts = hasUnsafeSpeechArtifacts(sanitized);
   const reasons: string[] = [];
   const evidence = evidenceText(context);
@@ -287,6 +331,13 @@ export function guardViewerResponse(
     reasons.push('hostile_tone');
   }
   if (context?.isWeather) {
+    if (
+      Array.isArray(context.claims) &&
+      context.claims.length === 0 &&
+      sanitizeSpeechText(context.requiredAnswer ?? '')
+    ) {
+      reasons.push('no_fact_claims');
+    }
     if (
       context.viewerText &&
       !detectedIntents(context.viewerText).length &&
@@ -323,7 +374,7 @@ export function guardViewerResponse(
   return {
     text: compactViewerResponse(sanitized, context?.catchup ? 140 : 90),
     sanitizedText: sanitized,
-    rewritten: false,
+    rewritten: recoveredStructuredText !== null,
     reasons,
     unsafeArtifacts,
   };

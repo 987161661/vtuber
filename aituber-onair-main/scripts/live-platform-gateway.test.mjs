@@ -4,7 +4,7 @@ import {
   LiveEventHub,
   splitLiveChatText,
 } from './live-platform-gateway-common.mjs';
-import { safeError } from './live-platform-gateway.mjs';
+import { isBilibiliRoomLive, safeError } from './live-platform-gateway.mjs';
 
 class FakeResponse {
   chunks = [];
@@ -72,4 +72,10 @@ test('safeError redacts authentication material from dependency logs', () => {
   assert.equal(sanitized.includes('one'), false);
   assert.equal(sanitized.includes('two'), false);
   assert.match(sanitized, /\[REDACTED\]/);
+});
+
+test('Bilibili room snapshot identifies an already-started stream', () => {
+  assert.equal(isBilibiliRoomLive({ data: { live_status: 1 } }), true);
+  assert.equal(isBilibiliRoomLive({ data: { live_status: 0 } }), false);
+  assert.equal(isBilibiliRoomLive({}), false);
 });

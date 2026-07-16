@@ -60,8 +60,16 @@ interface QueueGroup {
   queuedAt: number;
   fingerprint: string;
   topicKey: string;
+  lane: ResponseLane;
   sourcesSeen: Set<string>;
 }
+
+type ResponseLane =
+  | 'urgent'
+  | 'weather'
+  | 'engagement'
+  | 'boundary'
+  | 'conversation';
 
 interface SchedulerOptions {
   now?: () => number;
@@ -73,7 +81,6 @@ interface SchedulerOptions {
   dedupeWindowMs?: number;
   settleWindowMs?: number;
   burstGroupThreshold?: number;
-  viewerCooldownMs?: number;
 }
 
 const LOW_INFORMATION =
@@ -107,7 +114,8 @@ function bigrams(value: string): Set<string> {
 
 function isSimilarTopic(left: string, right: string): boolean {
   if (!left || !right) return false;
-  if (left === right || left.includes(right) || right.includes(left)) return true;
+  if (left === right || left.includes(right) || right.includes(left))
+    return true;
   const leftPairs = bigrams(left);
   const rightPairs = bigrams(right);
   if (!leftPairs.size || !rightPairs.size) return false;
@@ -138,15 +146,25 @@ function isPaid(comment: LiveComment): boolean {
   return Boolean(comment.metadata?.superChat);
 }
 
-type AudienceHeat = 'calm' | 'friction' | 'threat';
+const URGENT_SIGNAL =
+  /(?:\u9884\u8b66|\u64a4\u79bb|\u907f\u9669|\u6c42\u52a9|\u5371\u9669|\u505c\u8bfe|\u505c\u5de5|\u96e8\u707e|\u6c34\u707e|\u6d2a\u6c34|\u5185\u6d9d|\u79ef\u6c34|\u5c71\u6d2a|\u6ce5\u77f3\u6d41|\u6df9\u6c34|\u5012\u704c|\u88ab\u56f0|\u53d7\u4f24)/u;
+const WEATHER_SIGNAL =
+  /(?:\u53f0\u98ce|\u5929\u6c14|\u96f7\u8fbe|\u98ce\u529b|\u66b4\u96e8|\u964d\u96e8|\u8def\u5f84|\u767b\u9646|\u6c14\u8c61|\u98ce\u5708)/u;
+const ENGAGEMENT_SIGNAL =
+  /(?:gift|like|follow|super.?chat|\u8d60\u9001|\u9001\u51fa|\u70b9\u8d5e|\u5173\u6ce8)/iu;
+const BOUNDARY_SIGNAL =
+  /(?:\u56de\u590d.{0,4}\u6162|\u4e3b\u64ad.{0,6}\u88c5|\u5783\u573e|\u5e9f\u7269|\u6eda|\u95ed\u5634|\u6076\u5fc3|\u9a97\u5b50)/u;
 
-function audienceHeat(text: string): AudienceHeat {
-  const value = normalizeText(text);
-  if (/(?:弄死|打死|杀了|砍死|捅死|威胁)/.test(value)) return 'threat';
-  if (/(?:找打|想打你|滚(?:开)?|草泥马|操你妈|来劲儿)/.test(value)) {
-    return 'friction';
+export function responseLane(comment: LiveComment): ResponseLane {
+  const text = normalizeText(comment.text);
+  const eventType = String(comment.metadata?.eventType || '');
+  if (URGENT_SIGNAL.test(text)) return 'urgent';
+  if (WEATHER_SIGNAL.test(text)) return 'weather';
+  if (isPaid(comment) || ENGAGEMENT_SIGNAL.test(`${eventType} ${text}`)) {
+    return 'engagement';
   }
-  return 'calm';
+  if (BOUNDARY_SIGNAL.test(text)) return 'boundary';
+  return 'conversation';
 }
 
 export function isLowInformationComment(comment: LiveComment): boolean {
@@ -163,12 +181,10 @@ export class LiveResponseScheduler {
   private readonly dedupeWindowMs: number;
   private readonly settleWindowMs: number;
   private readonly burstGroupThreshold: number;
-  private readonly viewerCooldownMs: number;
   private readonly groups: QueueGroup[] = [];
   private readonly overflow: QueueGroup[] = [];
   private readonly seenIds = new Map<string, number>();
   private readonly seenText = new Map<string, number>();
-  private readonly viewerCooldowns = new Map<string, number>();
 
   constructor(options: SchedulerOptions = {}) {
     this.now = options.now ?? Date.now;
@@ -180,7 +196,6 @@ export class LiveResponseScheduler {
     this.dedupeWindowMs = options.dedupeWindowMs ?? 90_000;
     this.settleWindowMs = options.settleWindowMs ?? 1_500;
     this.burstGroupThreshold = options.burstGroupThreshold ?? 3;
-    this.viewerCooldownMs = options.viewerCooldownMs ?? 45_000;
   }
 
   get size(): number {
@@ -207,6 +222,11 @@ export class LiveResponseScheduler {
     this.dropLowInformationWhenBusy(now);
     this.dropExpired(now);
 
+    const urgentIndex = this.groups.findIndex(
+      (group) => group.lane === 'urgent',
+    );
+    if (urgentIndex >= 0) return this.selectAt(urgentIndex, now, false);
+
     const paidIndex = this.groups.findIndex((group) =>
       group.comments.some(isPaid),
     );
@@ -221,24 +241,21 @@ export class LiveResponseScheduler {
     if (now - newestAt < this.settleWindowMs) return undefined;
 
     if (this.groups.length >= this.burstGroupThreshold) {
-      return this.selectCatchup(this.groups.slice(0, 5), now);
+      const catchup = this.catchupCandidates(this.groups, 5);
+      if (catchup.length >= 2) return this.selectCatchup(catchup, now);
     }
 
     const stale = [...this.overflow, ...this.groups].filter(
       (group) => now - group.commentAt >= this.staleAfterMs,
     );
     if (stale.length >= 2 || this.overflow.length > 0) {
-      return this.selectCatchup(stale, now);
+      const catchup = this.catchupCandidates(stale, 5);
+      if (catchup.length >= 2) return this.selectCatchup(catchup, now);
+      if (this.overflow.length > 0) return this.selectOldest(now);
     }
 
     if (!this.groups.length) return undefined;
-    let oldestIndex = 0;
-    for (let index = 1; index < this.groups.length; index += 1) {
-      if (this.groups[index].commentAt < this.groups[oldestIndex].commentAt) {
-        oldestIndex = index;
-      }
-    }
-    return this.selectAt(oldestIndex, now, false);
+    return this.selectOldest(now);
   }
 
   mark(
@@ -255,6 +272,7 @@ export class LiveResponseScheduler {
         queuedAt: event.queuedAt,
         fingerprint: event.fingerprint,
         topicKey: topicKey(event.comment.text),
+        lane: responseLane(event.comment),
         sourcesSeen: new Set(event.sourcesSeen),
       },
       stage,
@@ -270,24 +288,6 @@ export class LiveResponseScheduler {
     const fingerprint = `${comment.metadata?.eventType || 'comment'}:${canonicalAuthor(comment)}:${normalized}`;
     const base = this.makeGroup(comment, receivedAt, now, fingerprint);
     this.emitGroup(base, 'received', now);
-
-    const author = canonicalAuthor(comment);
-    const cooldownUntil = this.viewerCooldowns.get(author) ?? 0;
-    if (cooldownUntil > now && !isPaid(comment)) {
-      this.emitGroup(base, 'dropped', now, { dropReason: 'audience_cooldown' });
-      return;
-    }
-    const heat = audienceHeat(comment.text);
-    if (heat === 'threat') {
-      this.viewerCooldowns.set(author, now + this.viewerCooldownMs);
-      this.emitGroup(base, 'dropped', now, { dropReason: 'audience_cooldown' });
-      return;
-    }
-    if (heat === 'friction') {
-      // A single sharp joke can receive one calm de-escalation. Further
-      // friction from the same viewer becomes a quiet moderation action.
-      this.viewerCooldowns.set(author, now + this.viewerCooldownMs);
-    }
 
     if (this.seenIds.has(comment.id)) {
       this.emitGroup(base, 'deduplicated', now, { dropReason: 'duplicate_id' });
@@ -305,12 +305,16 @@ export class LiveResponseScheduler {
 
     const mergeTarget = this.groups.find(
       (group) =>
+        group.lane === base.lane &&
         Math.abs(comment.timestamp - group.commentAt) <= this.mergeWindowMs &&
         isSimilarTopic(group.topicKey, base.topicKey),
     );
     if (mergeTarget && !isPaid(comment)) {
       mergeTarget.comments.push(comment);
-      mergeTarget.commentAt = Math.min(mergeTarget.commentAt, comment.timestamp);
+      mergeTarget.commentAt = Math.min(
+        mergeTarget.commentAt,
+        comment.timestamp,
+      );
       mergeTarget.receivedAt = Math.min(mergeTarget.receivedAt, receivedAt);
       mergeTarget.sourcesSeen.add(sourceOf(comment));
       this.emitGroup(base, 'deduplicated', now, { dropReason: 'merged' });
@@ -335,12 +339,15 @@ export class LiveResponseScheduler {
       queuedAt,
       fingerprint,
       topicKey: topicKey(comment.text),
+      lane: responseLane(comment),
       sourcesSeen: new Set([sourceOf(comment)]),
     };
   }
 
   private dropLowInformationWhenBusy(now: number): void {
-    if (!this.groups.some((group) => !isLowInformationComment(group.comments[0])))
+    if (
+      !this.groups.some((group) => !isLowInformationComment(group.comments[0]))
+    )
       return;
     for (let index = this.groups.length - 1; index >= 0; index -= 1) {
       const group = this.groups[index];
@@ -388,6 +395,42 @@ export class LiveResponseScheduler {
   ): ScheduledLiveComment {
     const [group] = this.groups.splice(index, 1);
     return this.toSelection(group, now, catchup);
+  }
+
+  private selectOldest(now: number): ScheduledLiveComment | undefined {
+    const candidates = [...this.groups, ...this.overflow];
+    if (!candidates.length) return undefined;
+    const oldest = candidates.reduce((current, group) =>
+      group.commentAt < current.commentAt ? group : current,
+    );
+    const groupIndex = this.groups.indexOf(oldest);
+    if (groupIndex >= 0) this.groups.splice(groupIndex, 1);
+    const overflowIndex = this.overflow.indexOf(oldest);
+    if (overflowIndex >= 0) this.overflow.splice(overflowIndex, 1);
+    return this.toSelection(oldest, now, false);
+  }
+
+  private catchupCandidates(
+    candidates: QueueGroup[],
+    limit: number,
+  ): QueueGroup[] {
+    const lanes = new Map<ResponseLane, QueueGroup[]>();
+    for (const group of candidates) {
+      // Safety-critical messages are always answered individually. Other
+      // lanes may be summarized, but only with messages from the same domain.
+      if (group.lane === 'urgent') continue;
+      const lane = lanes.get(group.lane) ?? [];
+      lane.push(group);
+      lanes.set(group.lane, lane);
+    }
+    return (
+      [...lanes.values()]
+        .sort((left, right) => {
+          if (right.length !== left.length) return right.length - left.length;
+          return left[0].commentAt - right[0].commentAt;
+        })[0]
+        ?.slice(0, limit) ?? []
+    );
   }
 
   private selectCatchup(
@@ -509,9 +552,6 @@ export class LiveResponseScheduler {
       if (now - seenAt > this.dedupeWindowMs) {
         this.seenText.delete(fingerprint);
       }
-    }
-    for (const [author, until] of this.viewerCooldowns) {
-      if (until <= now) this.viewerCooldowns.delete(author);
     }
   }
 }

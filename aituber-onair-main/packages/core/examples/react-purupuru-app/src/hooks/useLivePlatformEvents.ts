@@ -27,8 +27,6 @@ export function useLivePlatformEvents<TEvent, TStatus>({
   useEffect(() => {
     if (!isEnabled) return;
     let source: EventSource | null = null;
-    let releaseLock: (() => void) | null = null;
-    let retryTimer = 0;
     let reconnectTimer = 0;
     let cancelled = false;
 
@@ -69,40 +67,16 @@ export function useLivePlatformEvents<TEvent, TStatus>({
       };
     };
 
-    if (navigator.locks) {
-      const acquireListenerLock = async () => {
-        while (!cancelled) {
-          let acquired = false;
-          await navigator.locks.request(
-            adapter.listenerLockName,
-            { ifAvailable: true },
-            async (lock) => {
-              if (!lock || cancelled) return;
-              acquired = true;
-              connect();
-              await new Promise<void>((resolve) => {
-                releaseLock = resolve;
-              });
-            },
-          );
-          if (cancelled || acquired) return;
-          onStatusRef.current?.({ state: 'standby' } as TStatus);
-          await new Promise<void>((resolve) => {
-            retryTimer = window.setTimeout(resolve, 2_000);
-          });
-        }
-      };
-      void acquireListenerLock();
-    } else {
-      connect();
-    }
+    // The local runtime-owner lease already elects exactly one candidate
+    // across OBS and control pages. Browser Web Locks can be retained by a
+    // non-owner page after a Vite reload, leaving the elected runtime with no
+    // SSE subscription and silently dropping real platform events.
+    connect();
 
     return () => {
       cancelled = true;
-      window.clearTimeout(retryTimer);
       window.clearTimeout(reconnectTimer);
       source?.close();
-      releaseLock?.();
     };
   }, [adapter, clientKey, isEnabled]);
 }

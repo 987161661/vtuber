@@ -28,6 +28,7 @@ import {
 import type { StressRunState } from './StressTestPanel';
 import { LiveConnectorConsole } from './LiveConnectorConsole';
 import { SimulatorRoomConsole } from './SimulatorRoomConsole';
+import { BroadcastTopologyPanel } from './BroadcastTopologyPanel';
 import type { LiveHostSnapshot } from '@aituber-onair/live-companion';
 
 type Workspace =
@@ -36,6 +37,7 @@ type Workspace =
   | 'simulator'
   | 'memory'
   | 'insights'
+  | 'pipeline'
   | 'config';
 
 interface ControlRoomProps {
@@ -60,7 +62,6 @@ interface ControlRoomProps {
   speakingAvatarVideoUrl?: string | null;
   avatarViewTransform: AvatarViewTransform;
   onAvatarViewTransformChange: (transform: AvatarViewTransform) => void;
-  onSend: (text: string) => void;
   onBroadcast: (text: string) => void;
   onStop: () => void;
   onEmergencyTakeover: () => void;
@@ -104,6 +105,11 @@ interface ControlRoomProps {
 }
 
 type RuntimeHealth = {
+  runtimeOwner?: {
+    active: boolean;
+    available: boolean;
+    ttsConfigured: boolean;
+  };
   lastFaults?: Partial<
     Record<
       'model' | 'skill' | 'tts' | 'flashhead' | 'platform',
@@ -113,18 +119,65 @@ type RuntimeHealth = {
   repeatedReplyCount?: number;
 };
 
+type LiveProgramState = {
+  mode: 'companion' | 'weather' | 'urgent' | 'variety';
+  locked: boolean;
+  updatedAt?: number;
+};
+
+type LiveSafetyState = {
+  viewers: Array<{
+    viewerId: string;
+    viewerName?: string;
+    sourceLabel?: string;
+    score: number;
+    mutedUntil?: number;
+  }>;
+  events: Array<{
+    id: string;
+    at: number;
+    viewerId?: string;
+    viewerName?: string;
+    sourceLabel?: string;
+    action: 'allow' | 'boundary' | 'local_mute';
+    reason: string;
+  }>;
+};
+
+type PipelineLatencyRecord = {
+  requestId: string;
+  eventId?: string;
+  input?: string;
+  inputAt?: number;
+  llmCompletedAt?: number;
+  endedAt?: number;
+  ttsRequestedAt?: number;
+  ttsFirstByteAt?: number;
+  flashHeadFirstFrameAt?: number;
+  firstPlaybackAt?: number;
+  inputToEndMs?: number;
+  source?: string;
+  origin?: { channel?: string; commentAt?: number; receivedAt?: number };
+};
+type PipelineRuntimeEvent = { eventId?: string; stage?: string; source?: string; at?: number };
+
 const workspaceLabels: Record<Workspace, string> = {
   avatars: '数字人管理',
   overview: '总控',
   simulator: '模拟直播间',
   memory: '记忆',
-  insights: '洞察',
+  insights: '播送策略',
+  pipeline: '链路监控',
   config: '配置',
 };
 
 function formatAge(milliseconds: number) {
   if (!milliseconds) return '—';
   return `${Math.max(1, Math.round(milliseconds / 1000))} 秒`;
+}
+
+function createEmptyRoomStrategyId() {
+  return `strategy-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
 const interactionStageLabels = {
@@ -268,6 +321,20 @@ export function ControlRoom(props: ControlRoomProps) {
     null,
   );
   const [runtimeHealth, setRuntimeHealth] = useState<RuntimeHealth>({});
+  const [pipelineLatencyRecords, setPipelineLatencyRecords] = useState<
+    PipelineLatencyRecord[]
+  >([]);
+  const [pipelineRuntimeEvents, setPipelineRuntimeEvents] = useState<
+    PipelineRuntimeEvent[]
+  >([]);
+  const [liveProgram, setLiveProgram] = useState<LiveProgramState>({
+    mode: 'companion',
+    locked: false,
+  });
+  const [liveSafety, setLiveSafety] = useState<LiveSafetyState>({
+    viewers: [],
+    events: [],
+  });
   const sourceRooms = useMemo(() => {
     const connectors = props.settings.liveConnectors;
     const ordinaryRoad = Object.entries(connectors.ordinaryRoad.platforms)
@@ -334,6 +401,93 @@ export function ControlRoom(props: ControlRoomProps) {
       window.clearInterval(timer);
     };
   }, []);
+  useEffect(() => {
+    let cancelled = false;
+    const refresh = () =>
+      void fetch('/api/live-runtime-events?history=1&limit=80', { cache: 'no-store' })
+        .then((response) => (response.ok ? response.json() : null))
+        .then((payload: { events?: PipelineRuntimeEvent[] } | null) => {
+          if (!cancelled && Array.isArray(payload?.events)) setPipelineRuntimeEvents(payload.events);
+        })
+        .catch(() => undefined);
+    refresh();
+    const timer = window.setInterval(refresh, 600);
+    return () => { cancelled = true; window.clearInterval(timer); };
+  }, []);
+  useEffect(() => {
+    let cancelled = false;
+    const refresh = () =>
+      void fetch('/api/reply-latency?limit=24', { cache: 'no-store' })
+        .then((response) => (response.ok ? response.json() : null))
+        .then((payload: { records?: PipelineLatencyRecord[] } | null) => {
+          if (!cancelled && Array.isArray(payload?.records)) {
+            setPipelineLatencyRecords(payload.records);
+          }
+        })
+        .catch(() => undefined);
+    refresh();
+    const timer = window.setInterval(refresh, 2_000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, []);
+  useEffect(() => {
+    let cancelled = false;
+    const refresh = () =>
+      void fetch('/api/live-program', { cache: 'no-store' })
+        .then((response) => (response.ok ? response.json() : null))
+        .then((state: LiveProgramState | null) => {
+          if (!cancelled && state) setLiveProgram(state);
+        })
+        .catch(() => undefined);
+    refresh();
+    const timer = window.setInterval(refresh, 2_000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, []);
+  const updateLiveProgram = (update: Partial<LiveProgramState>) => {
+    void fetch('/api/live-program', {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(update),
+    })
+      .then((response) => (response.ok ? response.json() : null))
+      .then((state: LiveProgramState | null) => {
+        if (state) setLiveProgram(state);
+      })
+      .catch(() => undefined);
+  };
+  useEffect(() => {
+    let cancelled = false;
+    const refresh = () =>
+      void fetch('/api/live-safety', { cache: 'no-store' })
+        .then((response) => (response.ok ? response.json() : null))
+        .then((state: LiveSafetyState | null) => {
+          if (!cancelled && state) setLiveSafety(state);
+        })
+        .catch(() => undefined);
+    refresh();
+    const timer = window.setInterval(refresh, 2_000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, []);
+  const releaseViewerSafety = (viewerId: string) => {
+    void fetch('/api/live-safety', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action: 'release', viewerId }),
+    })
+      .then((response) => (response.ok ? response.json() : null))
+      .then((state: LiveSafetyState | null) => {
+        if (state) setLiveSafety(state);
+      })
+      .catch(() => undefined);
+  };
   const [selectedQueueId, setSelectedQueueId] = useState<string | null>(null);
   const [replyDraft, setReplyDraft] = useState('');
   const [draggingQueueId, setDraggingQueueId] = useState<string | null>(null);
@@ -472,122 +626,6 @@ export function ControlRoom(props: ControlRoomProps) {
                 ? '自动播出：已启用'
                 : '自动播出：已暂停'}
             </button>
-            <details className="empty-room-control">
-              <summary>
-                <span
-                  className={`awareness-status ${props.settings.emptyRoomAwareness.enabled ? 'is-enabled' : ''}`}
-                />
-                空场意识 ·{' '}
-                {props.settings.emptyRoomAwareness.enabled
-                  ? '运行中'
-                  : '已关闭'}
-              </summary>
-              <div className="awareness-control-panel">
-                <header>
-                  <div>
-                    <span>EMPTY ROOM PULSE</span>
-                    <strong>无弹幕互动时偶尔产生一个念头</strong>
-                  </div>
-                  <label className="awareness-master-switch">
-                    <input
-                      type="checkbox"
-                      checked={props.settings.emptyRoomAwareness.enabled}
-                      onChange={(event) =>
-                        props.onUpdateEmptyRoomAwareness({
-                          enabled: event.target.checked,
-                        })
-                      }
-                    />
-                    启用
-                  </label>
-                </header>
-                <p>
-                  这是直播总控能力，自动作用于当前数字人；弹幕、礼物、进场等互动会重新计时，安静至少两分钟后才可能触发。
-                </p>
-                <div className="awareness-window">
-                  <label>
-                    最短
-                    <span>
-                      <input
-                        type="number"
-                        min="2"
-                        max="60"
-                        value={Math.round(
-                          props.settings.emptyRoomAwareness.minIntervalMs /
-                            60_000,
-                        )}
-                        onChange={(event) =>
-                          props.onUpdateEmptyRoomAwareness({
-                            minIntervalMs:
-                              Number(event.target.value || 2) * 60_000,
-                          })
-                        }
-                      />
-                      分钟
-                    </span>
-                  </label>
-                  <div className="awareness-window-rail" aria-hidden="true">
-                    <i />
-                    <span>随机时间窗</span>
-                    <i />
-                  </div>
-                  <label>
-                    最长
-                    <span>
-                      <input
-                        type="number"
-                        min="2"
-                        max="60"
-                        value={Math.round(
-                          props.settings.emptyRoomAwareness.maxIntervalMs /
-                            60_000,
-                        )}
-                        onChange={(event) =>
-                          props.onUpdateEmptyRoomAwareness({
-                            maxIntervalMs:
-                              Number(event.target.value || 2) * 60_000,
-                          })
-                        }
-                      />
-                      分钟
-                    </span>
-                  </label>
-                </div>
-                <div className="awareness-sources">
-                  {(
-                    [
-                      ['interfaceWeight', '当前界面'],
-                      ['memoryWeight', '睡眠记忆'],
-                      ['inspirationWeight', '灵感种子'],
-                      ['audienceWeight', '观众寒暄'],
-                    ] as const
-                  ).map(([key, label]) => (
-                    <label key={key}>
-                      <span>
-                        {label}
-                        <strong>
-                          {props.settings.emptyRoomAwareness[key]}
-                        </strong>
-                      </span>
-                      <input
-                        type="range"
-                        min="0"
-                        max="100"
-                        value={props.settings.emptyRoomAwareness[key]}
-                        onChange={(event) =>
-                          props.onUpdateEmptyRoomAwareness({
-                            [key]: Number(event.target.value),
-                          })
-                        }
-                      />
-                    </label>
-                  ))}
-                </div>
-                <small>
-                  权重只决定灵感来源；真正说出口的内容始终由当前数字人的人设和模型临场生成。
-                </small>
-              </div>
-            </details>
           </div>
           <button className="danger-action" onClick={props.onEmergencyTakeover}>
             紧急接管
@@ -948,6 +986,12 @@ export function ControlRoom(props: ControlRoomProps) {
               </article>
               <article>
                 <strong>
+                  {runtimeHealth.runtimeOwner?.active ? '在线' : '失联'}
+                </strong>
+                <span>执行端心跳</span>
+              </article>
+              <article>
+                <strong>
                   {props.liveHostSnapshot.nextProactiveAt
                     ? new Date(
                         props.liveHostSnapshot.nextProactiveAt,
@@ -980,6 +1024,57 @@ export function ControlRoom(props: ControlRoomProps) {
             <small className="queue-age">
               最近决策：{props.liveHostSnapshot.lastDecisionReason}
             </small>
+            <section className="program-director" aria-label="直播栏目导演">
+              <div>
+                <b>当前栏目：{liveProgram.mode}</b>
+                <small>{liveProgram.locked ? '总控已锁定，智能体不切换栏目' : '智能体按当前互动自动切换'}</small>
+              </div>
+              <div className="program-director-actions">
+                {(['companion', 'variety', 'weather', 'urgent'] as const).map((mode) => (
+                  <button
+                    key={mode}
+                    className={liveProgram.mode === mode ? 'is-active' : ''}
+                    onClick={() => updateLiveProgram({ mode })}
+                  >
+                    {mode === 'companion' ? '陪伴' : mode === 'variety' ? '节目' : mode === 'weather' ? '天气' : '紧急'}
+                  </button>
+                ))}
+                <button onClick={() => updateLiveProgram({ locked: !liveProgram.locked })}>
+                  {liveProgram.locked ? '解除锁定' : '锁定栏目'}
+                </button>
+              </div>
+            </section>
+            <section className="program-director live-safety-console" aria-label="直播安全网关">
+              <div>
+                <b>直播安全网关</b>
+                <small>
+                  本地静默保护数字人，不会伪装成平台禁言；高危事件请由房管在 B 站后台处理。
+                </small>
+              </div>
+              <div className="live-safety-list">
+                {liveSafety.viewers.length ? liveSafety.viewers.map((viewer) => (
+                  <div key={viewer.viewerId} className="live-safety-viewer">
+                    <span>
+                      <b>{viewer.viewerName || viewer.viewerId}</b>
+                      <small>{viewer.sourceLabel || '未知来源'} · 风险 {viewer.score}</small>
+                    </span>
+                    <span>
+                      <small>静默至 {viewer.mutedUntil ? new Date(viewer.mutedUntil).toLocaleTimeString('zh-CN') : '—'}</small>
+                      <button className="quiet-action" onClick={() => releaseViewerSafety(viewer.viewerId)}>
+                        解除本地静默
+                      </button>
+                    </span>
+                  </div>
+                )) : (
+                  <small>当前没有本地静默观众。</small>
+                )}
+              </div>
+              {liveSafety.events[0] && (
+                <small>
+                  最近安全决策：{liveSafety.events[0].action} · {liveSafety.events[0].reason}
+                </small>
+              )}
+            </section>
             <small className="queue-age">
               最近故障：
               {(['model', 'skill', 'tts', 'flashhead', 'platform'] as const)
@@ -1293,16 +1388,6 @@ export function ControlRoom(props: ControlRoomProps) {
                     </div>
                   )}
                 </div>
-                <div className="manual-send">
-                  <div className="panel-heading">
-                    <span>手动播报</span>
-                    <small>直接送入当前安全链路</small>
-                  </div>
-                  <ChatInput
-                    onSend={props.onSend}
-                    disabled={props.isProcessing}
-                  />
-                </div>
                 <div className="broadcast-pulse" aria-label="播出脉冲">
                   {['接入', '筛选', '生成', '语音', '头像', '播出'].map(
                     (label, index) => (
@@ -1415,12 +1500,6 @@ export function ControlRoom(props: ControlRoomProps) {
                       (item) => item.status === 'ready',
                     ) && <p className="empty-state">暂无已准备的待播回复。</p>}
                   </div>
-                  <div className="sidebar-manual">
-                    <ChatInput
-                      onSend={props.onSend}
-                      disabled={props.isProcessing}
-                    />
-                  </div>
                 </aside>
               </section>
             </div>
@@ -1489,13 +1568,7 @@ export function ControlRoom(props: ControlRoomProps) {
               </article>
             </div>
             <div className="memory-audit-queue">
-              {props.memory.records
-                .filter(
-                  (record) =>
-                    record.phase === 'sleep_queue' ||
-                    record.phase === 'fading' ||
-                    record.phase === 'dormant',
-                )
+              {[...props.memory.records]
                 .sort((a, b) => b.updatedAt - a.updatedAt)
                 .slice(0, 12)
                 .map((record) => {
@@ -1510,6 +1583,12 @@ export function ControlRoom(props: ControlRoomProps) {
                       <small>
                         {record.phase === 'sleep_queue'
                           ? '等待睡眠'
+                          : record.phase === 'long_term'
+                            ? '长时记忆'
+                            : record.phase === 'forgotten'
+                              ? '已经遗忘'
+                              : record.phase === 'now'
+                                ? '此刻印象'
                           : record.phase === 'dormant'
                             ? '已经沉睡'
                             : '正在模糊'}{' '}
@@ -1518,14 +1597,9 @@ export function ControlRoom(props: ControlRoomProps) {
                     </article>
                   );
                 })}
-              {!props.memory.records.some(
-                (record) =>
-                  record.phase === 'sleep_queue' ||
-                  record.phase === 'fading' ||
-                  record.phase === 'dormant',
-              ) && (
+              {!props.memory.records.length && (
                 <p className="empty-state">
-                  当前没有等待整理或正在淡去的记忆。
+                  还没有可审计的记忆记录。
                 </p>
               )}
             </div>
@@ -1543,13 +1617,374 @@ export function ControlRoom(props: ControlRoomProps) {
           <SimulatorRoomConsole onEmit={props.onSimulateLiveRoomEvent} />
         )}
         {workspace === 'insights' && (
-          <section className="workspace-card">
-            <h1>节目与台风洞察</h1>
-            <p>
-              屏幕视觉、台风事实核验与主动播报保持现有运行方式；新版总控会在下一阶段把它们移入此工作区。
-            </p>
-            <button onClick={props.onOpenLegacySettings}>打开节目配置</button>
+          <section className="workspace-card broadcast-strategy-workspace">
+            <div className="workspace-heading">
+              <div>
+                <span className="stage-label">BROADCAST STRATEGY</span>
+                <h1>播送策略</h1>
+              </div>
+              <p>管理主播何时主动开口，以及静息时从哪里获得自然的话题。</p>
+            </div>
+            <div className="awareness-control-panel">
+              <header>
+                <div>
+                  <span>EMPTY ROOM PULSE</span>
+                  <strong>空场意识</strong>
+                </div>
+                <label className="awareness-master-switch">
+                  <input
+                    type="checkbox"
+                    checked={props.settings.emptyRoomAwareness.enabled}
+                    onChange={(event) =>
+                      props.onUpdateEmptyRoomAwareness({
+                        enabled: event.target.checked,
+                      })
+                    }
+                  />
+                  {props.settings.emptyRoomAwareness.enabled ? '已启用' : '已关闭'}
+                </label>
+              </header>
+              <p>
+                没有弹幕互动时，主播会偶尔自然说出一个生活化念头。弹幕、礼物、进场等互动会重新计时；安静至少两分钟后才可能触发。
+              </p>
+              <div className="awareness-strategy-grid" hidden>
+                <label>
+                  观众条件
+                  <select
+                    value={props.settings.emptyRoomAwareness.audiencePolicy}
+                    onChange={(event) =>
+                      props.onUpdateEmptyRoomAwareness({
+                        audiencePolicy: event.target.value as
+                          | 'any'
+                          | 'empty_only'
+                          | 'audience_only',
+                      })
+                    }
+                  >
+                    <option value="any">不限制在场状态</option>
+                    <option value="empty_only">仅无人时自语</option>
+                    <option value="audience_only">仅有人在场时主动搭话</option>
+                  </select>
+                </label>
+                <label>
+                  口播长度
+                  <select
+                    value={props.settings.emptyRoomAwareness.maxSentences}
+                    onChange={(event) =>
+                      props.onUpdateEmptyRoomAwareness({
+                        maxSentences: Number(event.target.value) as 1 | 2 | 3,
+                      })
+                    }
+                  >
+                    <option value="1">一句，简短出现</option>
+                    <option value="2">最多两句，默认</option>
+                    <option value="3">最多三句，更完整</option>
+                  </select>
+                </label>
+              </div>
+              <div className="awareness-schedule">
+                <label className="awareness-master-switch">
+                  <input
+                    type="checkbox"
+                    checked={props.settings.emptyRoomAwareness.scheduleEnabled}
+                    onChange={(event) =>
+                      props.onUpdateEmptyRoomAwareness({
+                        scheduleEnabled: event.target.checked,
+                      })
+                    }
+                  />
+                  只在指定时段触发
+                </label>
+                <div className="awareness-schedule-hours">
+                  <label>
+                    开始
+                    <select
+                      disabled={!props.settings.emptyRoomAwareness.scheduleEnabled}
+                      value={props.settings.emptyRoomAwareness.scheduleStartHour}
+                      onChange={(event) =>
+                        props.onUpdateEmptyRoomAwareness({
+                          scheduleStartHour: Number(event.target.value),
+                        })
+                      }
+                    >
+                      {Array.from({ length: 24 }, (_, hour) => (
+                        <option key={hour} value={hour}>
+                          {String(hour).padStart(2, '0')}:00
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                  <span>至</span>
+                  <label>
+                    结束
+                    <select
+                      disabled={!props.settings.emptyRoomAwareness.scheduleEnabled}
+                      value={props.settings.emptyRoomAwareness.scheduleEndHour}
+                      onChange={(event) =>
+                        props.onUpdateEmptyRoomAwareness({
+                          scheduleEndHour: Number(event.target.value),
+                        })
+                      }
+                    >
+                      {Array.from({ length: 24 }, (_, hour) => (
+                        <option key={hour} value={hour}>
+                          {String(hour).padStart(2, '0')}:00
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                </div>
+                <small>开始与结束设为同一小时，表示全天允许；跨午夜时段也会正确生效。</small>
+              </div>
+              <div className="awareness-window">
+                <label>
+                  最短间隔
+                  <span>
+                    <input
+                      type="number"
+                      min="2"
+                      max="60"
+                      value={Math.round(
+                        props.settings.emptyRoomAwareness.minIntervalMs / 60_000,
+                      )}
+                      onChange={(event) =>
+                        props.onUpdateEmptyRoomAwareness({
+                          minIntervalMs: Number(event.target.value || 2) * 60_000,
+                        })
+                      }
+                    />
+                    分钟
+                  </span>
+                </label>
+                <div className="awareness-window-rail" aria-hidden="true">
+                  <i />
+                  <span>随机触发窗口</span>
+                  <i />
+                </div>
+                <label>
+                  最长间隔
+                  <span>
+                    <input
+                      type="number"
+                      min="2"
+                      max="60"
+                      value={Math.round(
+                        props.settings.emptyRoomAwareness.maxIntervalMs / 60_000,
+                      )}
+                      onChange={(event) =>
+                        props.onUpdateEmptyRoomAwareness({
+                          maxIntervalMs: Number(event.target.value || 2) * 60_000,
+                        })
+                      }
+                    />
+                    分钟
+                  </span>
+                </label>
+              </div>
+              <div className="awareness-window">
+                <label>
+                  每次冷却
+                  <span>
+                    <input
+                      type="number"
+                      min="1"
+                      max="60"
+                      value={Math.round(
+                        props.settings.emptyRoomAwareness.proactiveCooldownMs /
+                          60_000,
+                      )}
+                      onChange={(event) =>
+                        props.onUpdateEmptyRoomAwareness({
+                          proactiveCooldownMs:
+                            Number(event.target.value || 1) * 60_000,
+                        })
+                      }
+                    />
+                    分钟
+                  </span>
+                </label>
+                <label>
+                  单场上限
+                  <span>
+                    <input
+                      type="number"
+                      min="1"
+                      max="100"
+                      value={props.settings.emptyRoomAwareness.maxProactiveTurns}
+                      onChange={(event) =>
+                        props.onUpdateEmptyRoomAwareness({
+                          maxProactiveTurns: Number(event.target.value || 1),
+                        })
+                      }
+                    />
+                    次
+                  </span>
+                </label>
+              </div>
+              <section className="behavior-strategy-list" aria-label="静息行为策略">
+                <div className="behavior-strategy-heading">
+                  <div>
+                    <span>BEHAVIOR LIBRARY</span>
+                    <strong>静息时主动做什么</strong>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() =>
+                      props.onUpdateEmptyRoomAwareness({
+                        behaviorStrategies: [
+                          ...props.settings.emptyRoomAwareness.behaviorStrategies,
+                          {
+                            id: createEmptyRoomStrategyId(),
+                            name: '新行为策略',
+                            prompt: '描述这一次静息时希望数字人主动做什么，以及需要遵守的边界。',
+                            probability: 10,
+                            enabled: true,
+                          },
+                        ],
+                      })
+                    }
+                  >
+                    添加策略
+                  </button>
+                </div>
+                <p>每次触发会从已启用、概率大于 0 的策略中按比例选一条，并将其作为 <code>&lt;behavior_strategy&gt;</code> 模块插入完整静息提示词。</p>
+                {props.settings.emptyRoomAwareness.behaviorStrategies.map(
+                  (strategy) => (
+                    <article
+                      className="behavior-strategy-card"
+                      key={strategy.id}
+                    >
+                      <div className="behavior-strategy-card-header">
+                        <label className="awareness-master-switch">
+                          <input
+                            type="checkbox"
+                            checked={strategy.enabled}
+                            onChange={(event) =>
+                              props.onUpdateEmptyRoomAwareness({
+                                behaviorStrategies: props.settings.emptyRoomAwareness.behaviorStrategies.map((item) =>
+                                  item.id === strategy.id
+                                    ? { ...item, enabled: event.target.checked }
+                                    : item,
+                                ),
+                              })
+                            }
+                          />
+                          {strategy.enabled ? '已启用' : '已停用'}
+                        </label>
+                        <button
+                          type="button"
+                          className="behavior-strategy-delete"
+                          aria-label={`删除策略：${strategy.name}`}
+                          onClick={() =>
+                            props.onUpdateEmptyRoomAwareness({
+                              behaviorStrategies: props.settings.emptyRoomAwareness.behaviorStrategies.filter(
+                                (item) => item.id !== strategy.id,
+                              ),
+                            })
+                          }
+                        >
+                          删除
+                        </button>
+                      </div>
+                      <label>
+                        行为策略名
+                        <input
+                          value={strategy.name}
+                          maxLength={80}
+                          onChange={(event) =>
+                            props.onUpdateEmptyRoomAwareness({
+                              behaviorStrategies: props.settings.emptyRoomAwareness.behaviorStrategies.map((item) =>
+                                item.id === strategy.id
+                                  ? { ...item, name: event.target.value }
+                                  : item,
+                              ),
+                            })
+                          }
+                        />
+                      </label>
+                      <label>
+                        策略提示词
+                        <textarea
+                          value={strategy.prompt}
+                          maxLength={1600}
+                          rows={4}
+                          onChange={(event) =>
+                            props.onUpdateEmptyRoomAwareness({
+                              behaviorStrategies: props.settings.emptyRoomAwareness.behaviorStrategies.map((item) =>
+                                item.id === strategy.id
+                                  ? { ...item, prompt: event.target.value }
+                                  : item,
+                              ),
+                            })
+                          }
+                        />
+                      </label>
+                      <label className="behavior-strategy-probability">
+                        <span>行为概率 <strong>{strategy.probability}%</strong></span>
+                        <input
+                          type="range"
+                          min="0"
+                          max="100"
+                          value={strategy.probability}
+                          onChange={(event) =>
+                            props.onUpdateEmptyRoomAwareness({
+                              behaviorStrategies: props.settings.emptyRoomAwareness.behaviorStrategies.map((item) =>
+                                item.id === strategy.id
+                                  ? { ...item, probability: Number(event.target.value) }
+                                  : item,
+                              ),
+                            })
+                          }
+                        />
+                      </label>
+                    </article>
+                  ),
+                )}
+              </section>
+              <div className="awareness-sources" hidden>
+                {(
+                  [
+                    ['interfaceWeight', '当前界面'],
+                    ['memoryWeight', '睡眠记忆'],
+                    ['inspirationWeight', '灵感种子'],
+                    ['audienceWeight', '观众寒暄'],
+                  ] as const
+                ).map(([key, label]) => (
+                  <label key={key}>
+                    <span>
+                      {label}
+                      <strong>{props.settings.emptyRoomAwareness[key]}</strong>
+                    </span>
+                    <input
+                      type="range"
+                      min="0"
+                      max="100"
+                      value={props.settings.emptyRoomAwareness[key]}
+                      onChange={(event) =>
+                        props.onUpdateEmptyRoomAwareness({
+                          [key]: Number(event.target.value),
+                        })
+                      }
+                    />
+                  </label>
+                ))}
+              </div>
+              <small>
+                权重只控制话题来源；实际口播仍由当前数字人的人设与实时提示词生成。
+              </small>
+            </div>
+            <div className="digital-human-actions">
+              <button onClick={props.onOpenLegacySettings}>打开节目配置</button>
+            </div>
           </section>
+        )}
+        {workspace === 'pipeline' && (
+          <BroadcastTopologyPanel
+            records={pipelineLatencyRecords}
+            queue={props.operatorQueue}
+            health={runtimeHealth}
+            events={pipelineRuntimeEvents}
+          />
         )}
         {workspace === 'config' && (
           <section className="workspace-card config-workspace">

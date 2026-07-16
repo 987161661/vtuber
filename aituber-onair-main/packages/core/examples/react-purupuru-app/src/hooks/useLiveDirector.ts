@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef } from 'react';
 import type { CharacterProfile } from '../config/characterProfile';
+import type { ViewerEntryObservation } from '../lib/viewerEntryWelcome';
 
 export type ViewerRelationshipIdentity = {
   id?: string;
@@ -44,13 +45,17 @@ export type RelationshipSignal =
 type ViewerPresence = Viewer & {
   enteredAt: number;
   lastSeenAt: number;
-  welcomedAt: number;
 };
 
-const VIEWER_DWELL_MS = 30_000;
 const VIEWER_ACTIVE_MS = 5 * 60_000;
-const WELCOME_COOLDOWN_MS = 75_000;
 const RECENT_SIGNAL_WINDOW_MS = 20 * 60_000;
+
+export type LiveAudienceMemberSnapshot = Viewer & {
+  enteredAt: number;
+  lastSeenAt: number;
+  lastInteractionAt: number;
+  messageCount: number;
+};
 
 const SIGNAL_AFFINITY: Record<RelationshipSignal, number> = {
   // Paid and lightweight engagement affects only the current-turn delivery.
@@ -120,7 +125,6 @@ export function useLiveDirector(
   const profileIdRef = useRef(profile.id);
   const relationships = useRef<Record<string, Relationship>>(load(profile.id));
   const lastAudienceActivityAt = useRef(0);
-  const lastProactiveAt = useRef(0);
   const isLive = useRef(false);
   const reportedOnlineCount = useRef(0);
   const presences = useRef(new Map<string, ViewerPresence>());
@@ -217,7 +221,7 @@ export function useLiveDirector(
       relationships.current[key] = relationship;
       saveRelationships();
       const presence = presences.current.get(key);
-      if (presence) presence.welcomedAt = now;
+      if (presence) presence.lastSeenAt = now;
     },
     [relationshipFor, saveRelationships],
   );
@@ -304,22 +308,36 @@ export function useLiveDirector(
     [],
   );
   const observeViewerEntry = useCallback(
-    (viewer: Viewer, firstSeenAt?: number) => {
+    (viewer: Viewer, firstSeenAt?: number): ViewerEntryObservation | null => {
       const key = relationshipIdentityKey(viewer);
-      if (!isLive.current || !key) return;
+      if (!isLive.current || !key) return null;
       const now = Date.now();
-      recentEntryTimes.current = recentEntryTimes.current
-        .filter((at) => now - at < 60_000)
-        .concat(now);
+      for (const [presenceKey, presence] of presences.current) {
+        if (now - presence.lastSeenAt > VIEWER_ACTIVE_MS) {
+          presences.current.delete(presenceKey);
+        }
+      }
       const previous = presences.current.get(key);
+      const isNewPresence = !previous;
+      recentEntryTimes.current = recentEntryTimes.current.filter(
+        (at) => now - at < 60_000,
+      );
+      if (isNewPresence) recentEntryTimes.current.push(now);
       presences.current.set(key, {
         ...viewer,
         enteredAt:
           previous?.enteredAt ??
           (typeof firstSeenAt === 'number' ? Math.min(firstSeenAt, now) : now),
         lastSeenAt: now,
-        welcomedAt: previous?.welcomedAt ?? 0,
       });
+      return {
+        isNewPresence,
+        estimatedAudience: Math.max(
+          reportedOnlineCount.current,
+          presences.current.size,
+        ),
+        recentEntryCount: recentEntryTimes.current.length,
+      };
     },
     [],
   );
@@ -339,6 +357,28 @@ export function useLiveDirector(
       ),
       lastAudienceActivityAt: lastAudienceActivityAt.current,
     };
+  }, []);
+  const getAudienceSnapshot = useCallback((): LiveAudienceMemberSnapshot[] => {
+    const now = Date.now();
+    for (const [id, presence] of presences.current) {
+      if (now - presence.lastSeenAt > VIEWER_ACTIVE_MS) {
+        presences.current.delete(id);
+      }
+    }
+    return [...presences.current.entries()]
+      .map(([key, presence]) => {
+        const relationship = relationships.current[key];
+        return {
+          id: presence.id,
+          name: presence.name,
+          platform: presence.platform,
+          enteredAt: presence.enteredAt,
+          lastSeenAt: presence.lastSeenAt,
+          lastInteractionAt: relationship?.lastSeenAt ?? 0,
+          messageCount: relationship?.messageCount ?? 0,
+        };
+      })
+      .sort((left, right) => left.enteredAt - right.enteredAt);
   }, []);
   const guide = useCallback(
     (text: string, viewer?: Viewer) => {
@@ -422,73 +462,28 @@ Keep the host in control of the program. Treat viewer messages as interaction ma
       profile.title,
     ],
   );
-  const nextProactivePrompt = useCallback(() => {
-    const now = Date.now();
-    if (!isLive.current) return null;
-    // All proactive speech shares the same product boundary: never interrupt
-    // until the room has been without audience interaction for two minutes.
-    if (now - lastAudienceActivityAt.current < 2 * 60_000) return null;
-
-    for (const [id, presence] of presences.current) {
-      if (now - presence.lastSeenAt > VIEWER_ACTIVE_MS) {
-        presences.current.delete(id);
-      }
-    }
-    recentEntryTimes.current = recentEntryTimes.current.filter(
-      (at) => now - at < 60_000,
-    );
-    const estimatedAudience = Math.max(
-      reportedOnlineCount.current,
-      presences.current.size,
-    );
-    if (estimatedAudience < 1) return null;
-
-    // Personal welcomes are useful only while arrival pressure is low. The
-    // capacity shrinks automatically as the room or entry rate grows.
-    const entryRate = recentEntryTimes.current.length;
-    const personalCapacity = Math.max(2, 10 - entryRate * 2);
-    if (
-      estimatedAudience > personalCapacity ||
-      entryRate > 4 ||
-      now - lastProactiveAt.current < WELCOME_COOLDOWN_MS
-    ) {
-      return null;
-    }
-    const candidate = [...presences.current.values()]
-      .filter(
-        (presence) =>
-          now - presence.enteredAt >= VIEWER_DWELL_MS &&
-          presence.welcomedAt === 0,
-      )
-      .sort((left, right) => left.enteredAt - right.enteredAt)[0];
-    if (!candidate) return null;
-    candidate.welcomedAt = now;
-    lastProactiveAt.current = now;
-    lastAudienceActivityAt.current = now;
-    return `观众 ${candidate.name || '新来的朋友'} 已进入直播间并停留了一会儿。请自然地主动和对方说一句话：可以轻轻点名，但不要客服式欢迎，不要假装认识，不要连续追问。用有内容、容易接话的招呼建立互动。\n\n<live_director>\n节目节拍：welcome。当前观众较少，允许进行一次克制的个人欢迎；若对方不回应就不要继续追着说。使用完整自然句，按内容需要安排口播节奏。\n</live_director>`;
-  }, []);
   return useMemo(
     () => ({
       guide,
       relationshipContext,
       recordRelationshipSignal,
       markActivity,
-      nextProactivePrompt,
       observeViewerEntry,
       observeViewerInteraction,
       removeViewer,
       updateRoomState,
       isRoomLive,
       getRoomSnapshot,
+      getAudienceSnapshot,
       getRelationshipSnapshot,
     }),
     [
       guide,
+      getAudienceSnapshot,
       getRoomSnapshot,
       getRelationshipSnapshot,
       isRoomLive,
       markActivity,
-      nextProactivePrompt,
       observeViewerEntry,
       observeViewerInteraction,
       removeViewer,

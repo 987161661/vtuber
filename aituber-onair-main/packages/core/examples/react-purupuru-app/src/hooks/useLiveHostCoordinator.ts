@@ -2,9 +2,10 @@ import {
   LiveHostCoordinator,
   type LiveHostDecision,
   type LiveHostEvent,
+  type LiveHostPolicy,
   type LiveHostSnapshot,
 } from '@aituber-onair/live-companion';
-import { useCallback, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 
 const DISABLED_SNAPSHOT: LiveHostSnapshot = {
   phase: 'observing',
@@ -18,11 +19,19 @@ const DISABLED_SNAPSHOT: LiveHostSnapshot = {
   lastDecisionReason: 'host_coordinator_v2_disabled',
 };
 
-export function useLiveHostCoordinator(enabled: boolean) {
-  const [coordinator] = useState(() => new LiveHostCoordinator());
+export function useLiveHostCoordinator(
+  enabled: boolean,
+  policy: Partial<LiveHostPolicy>,
+) {
+  const [coordinator] = useState(() => new LiveHostCoordinator(policy));
   const [snapshot, setSnapshot] = useState<LiveHostSnapshot>(() =>
     enabled ? coordinator.snapshot() : DISABLED_SNAPSHOT,
   );
+
+  useEffect(() => {
+    coordinator.updatePolicy(policy);
+    if (enabled) setSnapshot(coordinator.snapshot());
+  }, [coordinator, enabled, policy]);
 
   const dispatch = useCallback(
     (event: LiveHostEvent): LiveHostDecision[] => {

@@ -270,7 +270,16 @@ async function fetchJson(url) {
   return response.json();
 }
 
+async function readJsonFile(filePath, fallback) {
+  try {
+    return JSON.parse(await readFile(filePath, 'utf8'));
+  } catch {
+    return fallback;
+  }
+}
+
 export function intentFor(question) {
+  if (/\u96e8\u707e|\u6c34\u707e|\u6d2a\u6c34|\u5185\u6d9d|\u79ef\u6c34|\u5c71\u6d2a|\u6ce5\u77f3\u6d41|\u6df9\u6c34|\u5012\u704c/.test(question)) return 'hazard';
   if (/在哪里|在哪儿|位置|到哪(?:里|儿)?了|走到哪/.test(question)) return 'location';
   if (/(?:北京|天津|上海|重庆|河北|山西|辽宁|吉林|黑龙江|江苏|浙江|安徽|福建|江西|山东|河南|湖北|湖南|广东|广西|海南|四川|贵州|云南|西藏|陕西|甘肃|青海|宁夏|新疆|台湾|香港|澳门).*(?:什么情况|怎么样|怎样了|有影响吗?)/.test(question)) return 'impact';
   if (/来源|哪里查|哪查|数据.*哪|依据|接口/.test(question)) return 'source';
@@ -376,7 +385,47 @@ function shortTime(value) {
   }).format(new Date(parsed))}（北京时间）`;
 }
 
-function buildRequiredAnswer(question, intent, cityWind, defense, storms, sources, landfall) {
+export function extractNamedTyphoonQuery(question) {
+  const chinese = String(question || '').match(/^\s*([\u4e00-\u9fff]{2,4})(?:啊|呀|呢)?(?:现在|目前|后来)?(?:怎么样|如何|去哪|到哪|在哪|还在|登陆|消散|降级|减弱)/);
+  if (chinese?.[1]) return chinese[1];
+  const english = String(question || '').match(/\b([A-Za-z]{3,})\b/);
+  return english?.[1] || null;
+}
+
+function historyMatchesQuestion(question, history) {
+  return [history?.nameZh, history?.nameEn, ...(history?.aliases || [])]
+    .filter(Boolean)
+    .some((name) => String(question).toLowerCase().includes(String(name).toLowerCase()));
+}
+
+function historicalLifecycleAnswer(question, history) {
+  if (!history || !historyMatchesQuestion(question, history)) return null;
+  if (history.status === 'active') return null;
+  const lastObserved = history.lastObservedAt ? shortTime(history.lastObservedAt) : '上游档案最后一次记录时';
+  const stage = history.finalStage;
+  const classification = stage
+    ? `最后可核验记录显示它已减弱为${stage}`
+    : '上游档案未提供最后一次强度分类';
+  const correction = ['热带低压', '热带风暴', '强热带风暴'].includes(stage)
+    ? '，已经不再是台风级，不能再把它当作台风实况来称呼。'
+    : '；上游随后已停止对它编号，它不属于当前活动台风。';
+  return `${history.nameZh}啊，它不是现在正在活动的台风。${lastObserved}${classification}${correction}`;
+}
+
+export function buildRequiredAnswer(question, intent, cityWind, defense, storms, sources, landfall) {
+  const lifecycle = arguments[7] || null;
+  const history = arguments[8] || null;
+  if (intent === 'hazard') {
+    const place = cityWind?.city ? `${cityWind.city}` : '\u5f53\u5730';
+    return `\u5f53\u524d\u6280\u80fd\u6ca1\u6709\u53d6\u5f97${place}\u53ef\u6838\u5b9e\u7684\u96e8\u707e\u3001\u6d2a\u6c34\u3001\u5185\u6d9d\u6216\u5b98\u65b9\u9884\u8b66\u8d44\u6599\uff0c\u6240\u4ee5\u4e0d\u80fd\u5224\u65ad\u73b0\u5728\u6709\u6ca1\u6709\u96e8\u707e\u3002\u8bf7\u67e5\u770b\u5f53\u5730\u6c14\u8c61\u3001\u5e94\u6025\u548c\u6c34\u52a1\u90e8\u95e8\u7684\u6700\u65b0\u9884\u8b66\uff1b\u82e5\u5df2\u51fa\u73b0\u79ef\u6c34\u4e0a\u6da8\u6216\u5012\u704c\uff0c\u5148\u8fdc\u79bb\u4f4e\u6d3c\u5904\u3002`;
+  }
+  const historicalAnswer = historicalLifecycleAnswer(question, history);
+  if (historicalAnswer) return historicalAnswer;
+  if (lifecycle && lifecycleMatchesQuestion(question, lifecycle)) {
+    const exitedAt = lifecycle.exitedLiveTrackAt ? shortTime(lifecycle.exitedLiveTrackAt) : null;
+    const lastObserved = lifecycle.lastObservedAt ? shortTime(lifecycle.lastObservedAt) : null;
+    return `${lifecycle.nameZh}\u5df2\u7ecf\u4ece\u5f53\u524d\u6d3b\u52a8\u53f0\u98ce\u5217\u8868\u4e2d\u9000\u51fa\u4e86\uff0c\u8fd9\u4e00\u8f6e\u53ef\u4ee5\u89c6\u4e3a\u5df2\u7ecf\u6536\u5c3e\uff0c\u4e0d\u518d\u4f5c\u4e3a\u5f53\u524d\u6d3b\u52a8\u7cfb\u7edf\u8ddf\u8e2a\u3002${exitedAt ? `\u4ece\u6d3b\u8dc3\u8ffd\u8e2a\u4e2d\u9000\u51fa\u65f6\u95f4\u662f${exitedAt}\u3002` : ''}${lastObserved ? `\u6700\u540e\u53ef\u6838\u5b9e\u5b9e\u51b5\u65f6\u6b21\u662f${lastObserved}\u3002` : ''}`;
+  }
   const selectedStorms = selectStormsForQuestion(question, storms);
   const storm = selectedStorms[0];
   if (intent === 'location') {
@@ -424,6 +473,12 @@ function buildRequiredAnswer(question, intent, cityWind, defense, storms, source
   return '当前查询没有取得足够的台风或当地风力数据，不能给出具体数字。';
 }
 
+export function lifecycleMatchesQuestion(question, lifecycle) {
+  return [lifecycle?.nameZh, lifecycle?.nameEn]
+    .filter(Boolean)
+    .some((name) => question.toLowerCase().includes(String(name).toLowerCase()));
+}
+
 function buildDeliveryGuide(question, intent, defense) {
   if (/没概念|没有概念|不懂|害怕|担心|慌/.test(question)) {
     return { emotion: 'relaxed', delivery: 'warm', emotionIntensity: 0.62, reason: '观众需要耐心解释和安抚' };
@@ -437,8 +492,30 @@ function buildDeliveryGuide(question, intent, defense) {
   return { emotion: 'relaxed', delivery: 'warm', emotionIntensity: 0.55, reason: '数字解释保持清楚且有人味' };
 }
 
-function buildClaims(question, cityWind, defense, storms, sources) {
+function buildClaims(question, cityWind, defense, storms, sources, lifecycle = null, history = null) {
   const claims = [];
+  if (intentFor(question) === 'hazard') return claims;
+  if (lifecycle && lifecycleMatchesQuestion(question, lifecycle)) {
+    claims.push({
+      id: `storm-lifecycle-${lifecycle.id}`,
+      type: 'source_lifecycle_transition',
+      text: `${lifecycle.nameZh}\u5df2\u4ece\u4e0a\u6e38\u6d3b\u52a8\u53f0\u98ce\u5217\u8868\u9000\u51fa\uff0c\u5f53\u524d\u4e0d\u518d\u4f5c\u4e3a\u6d3b\u52a8\u7cfb\u7edf\u8ddf\u8e2a\u3002`,
+      source: sources[0].name,
+      observedAt: lifecycle.exitedLiveTrackAt || lifecycle.lastObservedAt || null,
+      confidence: 'high',
+    });
+  }
+  if (history && historyMatchesQuestion(question, history) && history.status !== 'active') {
+    const classification = history.finalStage ? `最后可核验分类为${history.finalStage}` : '上游档案未提供最后强度分类';
+    claims.push({
+      id: `storm-history-${history.id}`,
+      type: 'source_lifecycle_transition',
+      text: `${history.nameZh}已停止编号，不属于当前活动台风；${classification}。`,
+      source: history.source || sources[0].name,
+      observedAt: history.lastObservedAt || history.endedAt || null,
+      confidence: 'high',
+    });
+  }
   const selectedStorms = selectStormsForQuestion(question, storms);
   if (intentFor(question) === 'location') {
     for (const storm of selectedStorms) {
@@ -515,15 +592,20 @@ export async function queryTyphoonRadar(question, options = {}) {
   const documentPath = `${root}/${DOCUMENT_NAME}`;
   const intent = intentFor(question);
   const needsStormTrack = !['source', 'wind'].includes(intent);
-  const [content, metadata, stormsPayload] = await Promise.all([
+  const namedTyphoon = needsStormTrack ? extractNamedTyphoonQuery(question) : null;
+  const [content, metadata, stormsPayload, entityPayload, evolutionState] = await Promise.all([
     readFile(documentPath, 'utf8'),
     stat(documentPath),
     needsStormTrack
       ? fetchJson(`${baseUrl}/api/storms/current`)
       : Promise.resolve({ storms: [] }),
+    namedTyphoon
+      ? fetchJson(`${baseUrl}/api/storms/entity?query=${encodeURIComponent(namedTyphoon)}`).catch(() => null)
+      : Promise.resolve(null),
+    readJsonFile(`${root}/.runtime/typhoon-evolution-agent.json`, {}),
   ]);
   const document = parseDocument(content, metadata.mtime);
-  const needsPlace = ['wind', 'impact'].includes(intent);
+  const needsPlace = ['wind', 'impact', 'hazard'].includes(intent) && !namedTyphoon;
   const placeResult = needsPlace
     ? await resolvePlace(question, document.cityRows)
     : {
@@ -555,23 +637,32 @@ export async function queryTyphoonRadar(question, options = {}) {
     }
   }
   const storms = (stormsPayload.storms || []).map(compactStorm).filter(Boolean);
+  const lifecycleCandidates = [
+    ...(Array.isArray(evolutionState?.lifecycleEvents)
+      ? evolutionState.lifecycleEvents
+      : []),
+    stormsPayload.lastTrackedStorm,
+  ].filter((event) => event?.status === 'exited-live-track');
+  const lifecycle = lifecycleCandidates.find((event) => lifecycleMatchesQuestion(question, event))
+    ?? null;
+  const history = entityPayload?.status === 'found' ? entityPayload.record : null;
   const sources = [
     { fields: '台风位置、强度、气压、风圈、路径预报', name: document.source || '浙江省水利厅台风路径公开接口', url: document.sourceUrl },
     { fields: '代表坐标10米模式预报风速、风力等级、风向', name: document.cityWindSource || 'MET Norway Locationforecast 2.0 模式预报', url: 'https://api.met.no/weatherapi/locationforecast/2.0/compact' },
   ];
-  const claims = buildClaims(question, cityWind, defense, storms, sources);
+  const claims = buildClaims(question, cityWind, defense, storms, sources, lifecycle, history);
   const landfall = buildLandfallStatus(question, storms);
   return {
     queryTimeBeijing: toBeijingTime(new Date().toISOString()),
     timeZone: 'Asia/Shanghai',
     intent, question, place, placeResolution: placeResult.resolution,
-    cityWind, defense, storms, claims,
+    cityWind, defense, storms, lifecycle, history, claims,
     landfall,
     document: {
       runAt: document.runAt, modifiedAt: document.modifiedAt, stale: document.stale,
     },
     sources,
-    requiredAnswer: buildRequiredAnswer(question, intent, cityWind, defense, storms, sources, landfall),
+    requiredAnswer: buildRequiredAnswer(question, intent, cityWind, defense, storms, sources, landfall, lifecycle, history),
     deliveryGuide: buildDeliveryGuide(question, intent, defense),
     answerRules: [
       ...(intent === 'location'

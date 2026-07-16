@@ -6,6 +6,7 @@ import {
   hasUnsafeSpeechArtifacts,
   isGPT5Model,
   isXaiReasoningEffortModel,
+  MinimaxEngine,
   sanitizeSpeechText,
 } from '@aituber-onair/core';
 import { ManneriDetector } from '@aituber-onair/manneri';
@@ -42,6 +43,42 @@ interface ScreenplayLike {
   motion?: string;
   gaze?: string;
   gesture?: string;
+}
+
+async function* closeAudioStreamAfterIdle(
+  source: AsyncGenerator<ArrayBuffer>,
+  idleTimeoutMs = 5_000,
+): AsyncGenerator<ArrayBuffer> {
+  const iterator = source[Symbol.asyncIterator]();
+  let receivedAudio = false;
+  while (true) {
+    let idleTimer: ReturnType<typeof setTimeout> | undefined;
+    const nextPromise = iterator
+      .next()
+      .then((result) => ({ kind: 'next' as const, result }));
+    const outcome = receivedAudio
+      ? await Promise.race([
+          nextPromise,
+          new Promise<{ kind: 'idle' }>((resolve) => {
+            idleTimer = setTimeout(
+              () => resolve({ kind: 'idle' }),
+              idleTimeoutMs,
+            );
+          }),
+        ]).finally(() => {
+          if (idleTimer) clearTimeout(idleTimer);
+        })
+      : await nextPromise;
+    if (outcome.kind === 'idle') {
+      // Do not let a provider/proxy connection that stays open after its last
+      // useful chunk hold the operator queue until the global watchdog fires.
+      void iterator.return?.(new ArrayBuffer(0)).catch(() => undefined);
+      return;
+    }
+    if (outcome.result.done) return;
+    receivedAudio = true;
+    yield outcome.result.value;
+  }
 }
 
 interface UseAituberCoreOptions {
@@ -276,11 +313,10 @@ function buildVoiceOptions(
       tts.engine === 'minimax'
         ? LINGLAN_PROFILE.voice.languageBoost
         : undefined,
-    // MiniMax's browser SSE response can remain open without yielding a first
-    // playable chunk, leaving the chat busy forever and never reaching the
-    // lip-sync renderer. The complete-response path is slightly slower but
-    // reliably returns a valid MP3 and still uses the normal playback queue.
-    minimaxStream: false,
+    // MiniMax streaming is parsed by MinimaxEngine and delivered through the
+    // existing audio queue. The local same-origin gateway was live-probed
+    // before enabling this path so the browser receives incremental SSE data.
+    minimaxStream: true,
     aivisCloudModelUuid: tts.aivisCloudModelUuid,
     aivisCloudSpeakerUuid: tts.aivisCloudSpeakerUuid,
     aivisCloudStyleId: Number.isNaN(parsedAivisCloudStyleId)
@@ -617,6 +653,20 @@ export function useAituberCore({
       return;
     }
 
+    // ChatProcessor has already produced a validated structured response by
+    // the time this transform runs. Deliver its draft here instead of waiting
+    // for a later async core event: some provider/core combinations finish
+    // processing before that event reaches the browser listener. Clearing the
+    // callback makes the later ASSISTANT_RESPONSE event idempotent.
+    const deliverPreparedDraft = (text: string) => {
+      const pending = pendingMemoryRef.current;
+      const reply = text.trim();
+      if (!pending?.onPrepared || !reply) return;
+      const onPrepared = pending.onPrepared;
+      pending.onPrepared = undefined;
+      onPrepared(reply);
+    };
+
     const core = new AITuberOnAirCore({
       apiKey: llmApiKey.trim(),
       chatProvider: settings.llm.provider,
@@ -671,6 +721,7 @@ export function useAituberCore({
               reasons: guarded.reasons,
               factGuard: pending?.factGuard,
             });
+            deliverPreparedDraft(guarded.text);
             if (guarded.rewritten || guarded.text !== combinedText) {
               return {
                 version: 2 as const,
@@ -724,6 +775,7 @@ export function useAituberCore({
           reasons: guarded.reasons,
           factGuard: pending?.factGuard,
         });
+        deliverPreparedDraft(guarded.text);
         if (guarded.rewritten) {
           emitRuntimeTrace({
             eventId: pending?.eventId,
@@ -865,7 +917,7 @@ export function useAituberCore({
       if (pending && viewerContent && pending.persistInteraction !== false) {
         onAssistantResponseRef.current?.(pending.input, viewerContent, pending);
       }
-      pending?.onPrepared?.(noReply ? NO_REPLY_TOKEN : viewerContent);
+      deliverPreparedDraft(noReply ? NO_REPLY_TOKEN : viewerContent);
       setPartialResponse('');
     });
 
@@ -1055,6 +1107,12 @@ export function useAituberCore({
       }
 
       try {
+        // `displayText` is deliberately the short, operator-facing label for
+        // system-originated turns (for example, "空场自语（inspiration）").
+        // The actual `text` may instead be a bounded internal prompt carrying
+        // the current clock and the quiet-room cue. Sending the label here
+        // discards that context and makes the model invent a plausible time.
+        const modelInput = text.trim();
         emitRuntimeTrace({
           eventId: options?.eventId,
           stage: 'model_request',
@@ -1063,6 +1121,7 @@ export function useAituberCore({
           provider: settings.llm.provider,
           model: settings.llm.model,
           viewerInput: displayText,
+          modelInput,
           systemPrompt: buildCharacterSystemPrompt(profile, {
             speechPlanV2Enabled,
           }),
@@ -1071,7 +1130,7 @@ export function useAituberCore({
           source: options?.source ?? 'chat',
           sourceLabel: options?.sourceLabel,
         });
-        return await coreRef.current.processChat(displayText, {
+        return await coreRef.current.processChat(modelInput, {
           speak: !options?.silent,
           transientContext,
         });
@@ -1120,10 +1179,10 @@ export function useAituberCore({
     async (text: string) => {
       const spokenText = text.trim();
       if (!spokenText) return;
-      // Operator-queue playback must not inherit a provider adapter request
-      // that can remain pending after MiniMax has completed upstream.  This
-      // same-origin bridge returns one verified, finite MP3 response and keeps
-      // the existing avatar/audio callbacks as the single playback surface.
+      // Operator playback reuses the package-level MiniMax SSE parser instead
+      // of maintaining a second response protocol in the example app. This
+      // keeps explicit error propagation while allowing audio playback before
+      // the provider has synthesized the entire reply.
       if (settings.tts.engine === 'minimax') {
         const startedAt = Date.now();
         const chunk = {
@@ -1131,32 +1190,48 @@ export function useAituberCore({
           count: 1,
           text: spokenText,
           startedAt,
-          bridge: 'minimax-audio',
+          bridge: 'minimax-stream',
         };
         let speechStarted = false;
         try {
-          const response = await fetch('/api/minimax-audio', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ text: spokenText }),
+          const engine = new MinimaxEngine();
+          engine.setApiEndpoint('/api/minimax-tts');
+          engine.setModel('speech-2.8-turbo');
+          engine.setLanguageBoost(LINGLAN_PROFILE.voice.languageBoost);
+          engine.setAudioSettings({
+            sampleRate: 44100,
+            bitrate: 128000,
+            format: 'mp3',
+            channel: 1,
           });
-          if (!response.ok) {
-            const detail = await response.text().catch(() => '');
-            throw new Error(
-              `minimax_audio_bridge_failed:${response.status}:${detail.slice(0, 120)}`,
-            );
-          }
-          const audio = await response.arrayBuffer();
-          if (audio.byteLength < 16)
-            throw new Error('minimax_audio_bridge_empty');
-          // Do not announce a speech start while the provider request is
-          // still pending. The queue watchdog must measure real playback,
-          // otherwise a valid MP3 can be marked stale before Web Audio ever
-          // receives it.
+          const audioStream = engine.fetchAudioStream(
+            { style: 'talk', message: spokenText },
+            settings.tts.speaker,
+            ttsApiKey,
+          );
+          const boundedAudioStream = closeAudioStreamAfterIdle(audioStream);
           onSpeechStartRef.current?.({ text: spokenText });
           onSpeechChunkRef.current?.('start', chunk);
           speechStarted = true;
-          await onAudioPlayRef.current(audio);
+          if (onAudioStreamRef.current) {
+            await onAudioStreamRef.current(boundedAudioStream);
+          } else {
+            const parts: Uint8Array[] = [];
+            let byteLength = 0;
+            for await (const part of boundedAudioStream) {
+              const bytes = new Uint8Array(part);
+              parts.push(bytes);
+              byteLength += bytes.byteLength;
+            }
+            if (byteLength < 16) throw new Error('minimax_stream_empty');
+            const audio = new Uint8Array(byteLength);
+            let offset = 0;
+            for (const part of parts) {
+              audio.set(part, offset);
+              offset += part.byteLength;
+            }
+            await onAudioPlayRef.current(audio.buffer);
+          }
           onSpeechChunkRef.current?.('end', {
             ...chunk,
             endedAt: Date.now(),
@@ -1180,7 +1255,7 @@ export function useAituberCore({
         enableAnimation: true,
       });
     },
-    [settings.tts.engine],
+    [settings.tts.engine, settings.tts.speaker, ttsApiKey],
   );
 
   // A provider request can outlive its transport timeout.  Retire that core

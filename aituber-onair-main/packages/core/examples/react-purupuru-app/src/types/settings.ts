@@ -220,10 +220,31 @@ export interface ManneriSettings {
   minMessageLength: number;
 }
 
+/** A selectable, user-authored module inserted into the quiet-room prompt. */
+export interface EmptyRoomBehaviorStrategy {
+  id: string;
+  name: string;
+  prompt: string;
+  /** Relative chance among enabled strategies. Zero keeps the draft without scheduling it. */
+  probability: number;
+  enabled: boolean;
+}
+
 export interface EmptyRoomAwarenessSettings {
   enabled: boolean;
+  /** Which audience state permits a proactive turn. */
+  audiencePolicy: 'any' | 'empty_only' | 'audience_only';
+  /** Optional local-time window; equal start/end means the whole day. */
+  scheduleEnabled: boolean;
+  scheduleStartHour: number;
+  scheduleEndHour: number;
   minIntervalMs: number;
   maxIntervalMs: number;
+  proactiveCooldownMs: number;
+  maxProactiveTurns: number;
+  maxSentences: 1 | 2 | 3;
+  behaviorStrategies: EmptyRoomBehaviorStrategy[];
+  /** @deprecated Replaced by behaviorStrategies; retained to migrate existing settings. */
   interfaceWeight: number;
   memoryWeight: number;
   inspirationWeight: number;

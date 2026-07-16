@@ -111,6 +111,27 @@ describe('LiveHostCoordinator', () => {
     ).toMatchObject({ reasonCode: 'proactive_budget_exhausted' });
   });
 
+  it('applies an operator policy update without replacing the live coordinator', () => {
+    const coordinator = new LiveHostCoordinator({
+      quietThresholdMs: 120_000,
+      maxProactiveTurns: 1,
+    });
+    coordinator.dispatch({ type: 'stream-state', at: 0, isLive: true });
+    coordinator.updatePolicy({ quietThresholdMs: 30_000, maxProactiveTurns: 3 });
+
+    expect(
+      coordinator.dispatch({
+        type: 'quiet-candidate',
+        at: 30_000,
+        eventId: 'operator-updated-policy',
+        source: 'interface',
+        prompt: 'A short proactive line.',
+        busy: false,
+      })[0],
+    ).toMatchObject({ kind: 'prepare-reply' });
+    expect(coordinator.snapshot().proactiveRemaining).toBe(3);
+  });
+
   it('defers engagement and urgent events to a beat boundary', () => {
     const coordinator = new LiveHostCoordinator();
     coordinator.dispatch({ type: 'stream-state', at: 0, isLive: true });
@@ -205,6 +226,71 @@ describe('LiveHostCoordinator', () => {
       phase: 'recovering',
       recoveryCount: 1,
     });
+  });
+
+  it('releases an unqueued proactive candidate without pausing the host', () => {
+    const coordinator = new LiveHostCoordinator();
+    coordinator.dispatch({ type: 'stream-state', at: 0, isLive: true });
+    coordinator.dispatch({
+      type: 'quiet-candidate',
+      at: 120_000,
+      eventId: 'proactive-1',
+      source: 'audience',
+      prompt: 'Say something brief.',
+      busy: false,
+    });
+
+    expect(
+      coordinator.dispatch({
+        type: 'runtime-fault',
+        at: 120_001,
+        eventId: 'proactive-1',
+        reasonCode: 'proactive_enqueue_failed',
+      }),
+    ).toMatchObject([
+      { kind: 'emit-avatar-intent', intent: 'observing' },
+    ]);
+    expect(coordinator.snapshot()).toMatchObject({
+      phase: 'observing',
+      activeTurn: undefined,
+      recoveryCount: 0,
+    });
+  });
+
+  it('preserves a drafted viewer turn when a direct turn starts playback', () => {
+    const coordinator = new LiveHostCoordinator();
+    coordinator.dispatch({ type: 'stream-state', at: 0, isLive: true });
+    coordinator.dispatch({
+      type: 'generation',
+      at: 1,
+      eventId: 'viewer-1',
+      stage: 'started',
+      turn: {
+        eventId: 'viewer-1', kind: 'viewer', priority: 'normal', createdAt: 1,
+      },
+    });
+    coordinator.dispatch({
+      type: 'generation',
+      at: 2,
+      eventId: 'direct-1',
+      stage: 'started',
+      turn: {
+        eventId: 'direct-1', kind: 'viewer', priority: 'normal', createdAt: 2,
+      },
+    });
+    coordinator.dispatch({
+      type: 'speech', at: 3, eventId: 'direct-1', stage: 'started',
+    });
+    coordinator.dispatch({
+      type: 'speech', at: 4, eventId: 'direct-1', stage: 'completed',
+    });
+
+    expect(coordinator.snapshot()).toMatchObject({ phase: 'deliberating' });
+    expect(
+      coordinator.dispatch({
+        type: 'speech', at: 5, eventId: 'viewer-1', stage: 'started',
+      }),
+    ).toMatchObject([{ kind: 'emit-avatar-intent', eventId: 'viewer-1' }]);
   });
 
   it('does not replace the speaking turn while drafting the next reply', () => {

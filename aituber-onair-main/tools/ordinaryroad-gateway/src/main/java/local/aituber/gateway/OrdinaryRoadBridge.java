@@ -29,6 +29,7 @@ import tech.ordinaryroad.live.chat.client.codec.kuaishou.msg.*;
 
 import java.io.BufferedReader;
 import java.io.InputStreamReader;
+import java.io.PrintStream;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.time.Instant;
@@ -45,6 +46,13 @@ import java.util.concurrent.atomic.AtomicReference;
  * credential-free JSON-lines protocol consumed by the local Node gateway.
  */
 public final class OrdinaryRoadBridge {
+  static {
+    // The Node parent always reads this JSON-lines protocol as UTF-8. On
+    // Windows, System.out otherwise follows the active console code page
+    // (typically GBK), corrupting Chinese danmaku such as "@上海" in transit.
+    System.setOut(new PrintStream(System.out, true, StandardCharsets.UTF_8));
+  }
+
   private static final ObjectMapper JSON = new ObjectMapper();
   private static final AtomicLong EVENT_SEQUENCE = new AtomicLong();
   private final Map<String, Connection> connections = new ConcurrentHashMap<>();
@@ -208,7 +216,11 @@ public final class OrdinaryRoadBridge {
   private BilibiliLiveChatClient createBilibili(String id, String room, String cookie) {
     BilibiliLiveChatClientConfig config = new BilibiliLiveChatClientConfig();
     configure(config, room, cookie);
-    config.setProtover(ProtoverEnum.NORMAL_ZLIB);
+    // The compressed Bilibili path in this OrdinaryRoad build can decode GBK
+    // danmaku as UTF-8, turning @上海 into replacement characters before the
+    // Node bridge sees it. The uncompressed protocol retains the original
+    // UTF-8 JSON payload and is adequate for this single-room local relay.
+    config.setProtover(ProtoverEnum.NORMAL_NO_COMPRESSION);
     return new BilibiliLiveChatClient(config, new IBilibiliMsgListener() {
       public void onDanmuMsg(DanmuMsgMsg msg) { publishDanmu(id, "bilibili", room, msg, "comment"); }
       public void onGiftMsg(SendGiftMsg msg) { publishGift(id, "bilibili", room, msg); }

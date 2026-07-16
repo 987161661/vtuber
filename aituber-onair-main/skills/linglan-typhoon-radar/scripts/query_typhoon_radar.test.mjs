@@ -2,6 +2,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   buildLandfallStatus,
+  buildRequiredAnswer,
+  extractNamedTyphoonQuery,
   extractSpecificPlace,
   intentFor,
   isAllowedGeocodeCandidate,
@@ -9,10 +11,60 @@ import {
   stormLocationAnswer,
 } from './query_typhoon_radar.mjs';
 
+test('answers a historical named storm from its archived final classification', () => {
+  const history = {
+    id: '202609',
+    nameZh: '巴威',
+    nameEn: 'BAVI',
+    aliases: ['巴威', 'BAVI'],
+    status: 'ceased-numbering',
+    finalStage: '热带风暴',
+    lastObservedAt: '2026-07-14T11:00:00.000Z',
+    endedAt: '2026-07-14T12:30:00.000Z',
+    source: '浙江省水利厅台风路径公开接口',
+  };
+  const answer = buildRequiredAnswer('巴威怎么样了', 'storm', null, null, [], [], { records: [] }, null, history);
+  assert.match(answer, /巴威啊/);
+  assert.match(answer, /不是现在正在活动的台风/);
+  assert.match(answer, /减弱为热带风暴/);
+  assert.match(answer, /不能再把它当作台风实况来称呼/);
+  assert.equal(extractNamedTyphoonQuery('巴威怎么样了'), '巴威');
+});
+
+test('answers a named storm that left the active feed as ended, not unavailable', () => {
+  const lifecycle = {
+    id: '202609',
+    nameZh: '巴威',
+    nameEn: 'BAVI',
+    status: 'exited-live-track',
+    lastObservedAt: '2026-07-14T11:00:00.000Z',
+    exitedLiveTrackAt: '2026-07-14T12:30:00.000Z',
+  };
+  const answer = buildRequiredAnswer('巴威现在怎么样', 'storm', null, null, [], [], { records: [] }, lifecycle);
+  assert.match(answer, /巴威已经从当前活动台风列表中退出/);
+  assert.match(answer, /已经收尾/);
+});
+
 test('treats common where-is-it phrasings as location questions', () => {
   assert.equal(intentFor('巴威现在到哪了'), 'location');
   assert.equal(intentFor('巴威现在到哪里了'), 'location');
   assert.equal(intentFor('巴威现在到哪儿了'), 'location');
+});
+
+test('treats rain-disaster questions as hazards and refuses an unsupported all-clear', () => {
+  const question = '\u6211\u5728\u60e0\u5dde\uff0c\u6709\u6ca1\u6709\u96e8\u707e';
+  assert.equal(intentFor(question), 'hazard');
+  const answer = buildRequiredAnswer(
+    question,
+    'hazard',
+    { city: '\u60e0\u5dde\u5e02' },
+    null,
+    [],
+    [],
+    { records: [] },
+  );
+  assert.match(answer, /\u6ca1\u6709\u53d6\u5f97\u60e0\u5dde\u5e02\u53ef\u6838\u5b9e\u7684\u96e8\u707e/);
+  assert.match(answer, /\u4e0d\u80fd\u5224\u65ad/);
 });
 
 test('keeps confirmed landfalls distinct from missing landfall data', () => {

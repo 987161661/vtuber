@@ -16,6 +16,9 @@ import { LiveEventHub, splitLiveChatText } from './live-platform-gateway-common.
 
 const DEFAULT_PORT = 8197;
 const DEFAULT_SEND_INTERVAL_MS = 1600;
+const OUTBOUND_ECHO_TTL_MS = 30_000;
+const RADAR_CITY_EVENT_URL =
+  process.env.RADAR_CITY_EVENT_URL || 'http://127.0.0.1:3038/api/live-city-events';
 const ORDINARYROAD_VERSION = '1.5.8';
 const here = dirname(fileURLToPath(import.meta.url));
 const appRoot = resolve(here, '..');
@@ -48,6 +51,12 @@ const PLATFORM_MANIFEST = [
   { id: 'kuaishou', label: '快手', inbound: true, outbound: true, credential: true },
 ];
 const PLATFORM_IDS = new Set(PLATFORM_MANIFEST.map((item) => item.id));
+const SELF_VIEWER_IDS = new Set(
+  String(process.env.BILIBILI_SELF_UIDS || '')
+    .split(',')
+    .map((value) => value.trim())
+    .filter(Boolean),
+);
 
 function log(level, message, details = {}) {
   process.stdout.write(`${JSON.stringify({ at: Date.now(), level, message, ...details })}\n`);
@@ -60,6 +69,10 @@ function safeError(error) {
       '$1[REDACTED]',
     )
     .slice(0, 1000);
+}
+
+export function isBilibiliRoomLive(payload) {
+  return Number(payload?.data?.live_status) === 1;
 }
 
 function readJson(path, fallback) {
@@ -243,6 +256,7 @@ class LivePlatformGateway {
   constructor(options = {}) {
     this.hub = new LiveEventHub();
     this.idempotency = new Map();
+    this.pendingOutboundEchoes = new Map();
     this.config = loadConfig();
     if (options.platform && options.roomId) {
       this.config.platforms[options.platform] = {
@@ -275,15 +289,106 @@ class LivePlatformGateway {
     return `ordinaryroad:${platformId}`;
   }
 
+  outboundEchoKey(platformId, message) {
+    return `${platformId}:${String(message || '').trim()}`;
+  }
+
+  reserveOutboundEcho(platformId, message, idempotencyKey) {
+    const key = this.outboundEchoKey(platformId, message);
+    const reservations = this.pendingOutboundEchoes.get(key) || [];
+    const reservation = {
+      id: randomUUID(),
+      idempotencyKey,
+      expiresAt: Date.now() + OUTBOUND_ECHO_TTL_MS,
+    };
+    reservations.push(reservation);
+    this.pendingOutboundEchoes.set(key, reservations);
+    return { key, id: reservation.id };
+  }
+
+  releaseOutboundEcho(reservation) {
+    const reservations = this.pendingOutboundEchoes.get(reservation.key);
+    if (!reservations) return;
+    const remaining = reservations.filter((item) => item.id !== reservation.id);
+    if (remaining.length) this.pendingOutboundEchoes.set(reservation.key, remaining);
+    else this.pendingOutboundEchoes.delete(reservation.key);
+  }
+
+  consumeOutboundEcho(platformId, event) {
+    if (event?.type !== 'comment') return false;
+    const key = this.outboundEchoKey(platformId, event.text);
+    const now = Date.now();
+    const reservations = (this.pendingOutboundEchoes.get(key) || []).filter(
+      (item) => item.expiresAt > now,
+    );
+    const reservation = reservations.shift();
+    if (reservations.length) this.pendingOutboundEchoes.set(key, reservations);
+    else this.pendingOutboundEchoes.delete(key);
+    if (!reservation) return false;
+    emitAudit({
+      eventId: String(reservation.idempotencyKey || '').replace(/^speech:/, ''),
+      stage: 'live_platform_outbound_echo_suppressed',
+      connectorId: 'ordinaryroad',
+      platformId,
+      roomEventId: event.id,
+    });
+    return true;
+  }
+
+  suppressConfiguredSelfEvent(platformId, event) {
+    const viewerId = String(event?.author?.id || '').trim();
+    if (!viewerId || !SELF_VIEWER_IDS.has(viewerId)) return false;
+    emitAudit({
+      eventId: event.id,
+      stage: 'live_platform_self_event_suppressed',
+      connectorId: 'ordinaryroad',
+      platformId,
+      viewerId,
+    });
+    return true;
+  }
+
   async start() {
     await this.refreshCredentialStates();
+    await this.refreshBilibiliLiveStatus();
     this.bridge.start();
     this.authTimer = setInterval(() => void this.refreshCredentialStates(), 60_000);
+    // OrdinaryRoad emits only live-status changes.  A gateway started after
+    // the stream has begun would otherwise retain the initial false value and
+    // suppress quiet-room dialogue for the entire session.
+    this.liveStatusTimer = setInterval(
+      () => void this.refreshBilibiliLiveStatus(),
+      30_000,
+    );
   }
 
   stop() {
     clearInterval(this.authTimer);
+    clearInterval(this.liveStatusTimer);
     this.bridge.stop();
+  }
+
+  async refreshBilibiliLiveStatus() {
+    const status = this.platforms.bilibili;
+    const roomId = String(this.config.platforms.bilibili?.roomId || '').trim();
+    if (!this.config.platforms.bilibili?.enabled || !roomId) return;
+    try {
+      const response = await fetch(
+        `https://api.live.bilibili.com/room/v1/Room/room_init?id=${encodeURIComponent(roomId)}`,
+        {
+          headers: { 'User-Agent': 'Mozilla/5.0 Chrome/136 Safari/537.36' },
+          signal: AbortSignal.timeout(8_000),
+        },
+      );
+      const payload = await response.json();
+      if (!response.ok || payload?.code !== 0) return;
+      const isLive = isBilibiliRoomLive(payload);
+      if (status.isLive === isLive) return;
+      status.isLive = isLive;
+      this.hub.publish('status', this.safeStatus());
+    } catch {
+      // Do not overwrite a known state with a transient public API failure.
+    }
   }
 
   syncConnections() {
@@ -382,9 +487,12 @@ class LivePlatformGateway {
     const status = this.platforms[platformId];
     if (!status) return;
     if (message.kind === 'room-event' && message.event) {
+      if (this.consumeOutboundEcho(platformId, message.event)) return;
+      if (this.suppressConfiguredSelfEvent(platformId, message.event)) return;
       if (this.hub.publishRoomEvent(message.event)) {
         status.normalizedEvents += 1;
         status.lastEventAt = Date.now();
+        void forwardCityCommentToRadar(message.event, platformId);
       }
       return;
     }
@@ -467,7 +575,13 @@ class LivePlatformGateway {
       let chunksSent = 0;
       for (const chunk of chunks) {
         if (chunksSent) await new Promise((resolveDelay) => setTimeout(resolveDelay, DEFAULT_SEND_INTERVAL_MS));
-        await this.bridge.send(this.connectionId(platformId), chunk);
+        const echoReservation = this.reserveOutboundEcho(platformId, chunk, key);
+        try {
+          await this.bridge.send(this.connectionId(platformId), chunk);
+        } catch (error) {
+          this.releaseOutboundEcho(echoReservation);
+          throw error;
+        }
         chunksSent += 1;
         this.platforms[platformId].sentCount += 1;
         this.platforms[platformId].lastSentAt = Date.now();
@@ -485,6 +599,36 @@ class LivePlatformGateway {
     })();
     this.idempotency.set(compoundKey, { fingerprint, promise: operation, result: null });
     return operation;
+  }
+}
+
+async function forwardCityCommentToRadar(event, platform) {
+  if (event?.type !== 'comment' || !String(event.text || '').trim()) return;
+  try {
+    const response = await fetch(RADAR_CITY_EVENT_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        type: 'aituber:live-comment',
+        version: 1,
+        id: String(event.id || ''),
+        text: String(event.text).trim(),
+        viewerId: String(event.author?.id || ''),
+        viewerName: String(event.author?.name || ''),
+        platform: String(platform || event.metadata?.platformId || 'live'),
+        followEvidence: 'unknown',
+        receivedAt: Number(event.metadata?.receivedAt) || Number(event.timestamp) || Date.now(),
+      }),
+      signal: AbortSignal.timeout(2_000),
+    });
+    if (!response.ok) {
+      log('warn', 'Radar city event forwarding rejected', {
+        status: response.status,
+        platform,
+      });
+    }
+  } catch (error) {
+    log('warn', 'Radar city event forwarding failed', { error: safeError(error) });
   }
 }
 

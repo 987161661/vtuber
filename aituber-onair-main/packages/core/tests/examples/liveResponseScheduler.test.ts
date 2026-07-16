@@ -23,7 +23,10 @@ function comment(
 describe('LiveResponseScheduler', () => {
   it('selects the substantive earlier question before a later low-info ping', () => {
     let now = new Date('2026-07-12T01:13:28+08:00').getTime();
-    const scheduler = new LiveResponseScheduler({ now: () => now });
+    const scheduler = new LiveResponseScheduler({
+      now: () => now,
+      settleWindowMs: 0,
+    });
     scheduler.enqueue([
       comment(
         'kuaiyo',
@@ -51,6 +54,7 @@ describe('LiveResponseScheduler', () => {
     const now = 1_000_000;
     const scheduler = new LiveResponseScheduler({
       now: () => now,
+      settleWindowMs: 0,
       onTransition: (value) => transitions.push(value),
     });
     scheduler.enqueue([

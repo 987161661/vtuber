@@ -8,6 +8,11 @@ const SMOOTH_FACTOR = 0.5;
 const RMS_CEILING = 0.12;
 /** Raise the stream voice above the avatar/background mix. */
 const SPEECH_VOLUME_GAIN = 1.8;
+const AUDIO_CONTEXT_RESUME_TIMEOUT_MS = 1_500;
+
+type AudioContextWindow = Window & {
+  __aituberSharedAudioContext?: AudioContext;
+};
 
 interface PlayAudioOptions {
   onStart?: () => void;
@@ -41,9 +46,33 @@ export function useAudioLipsync() {
 
   const getAudioContext = useCallback(() => {
     if (!ctxRef.current || ctxRef.current.state === 'closed') {
-      ctxRef.current = new AudioContext();
+      const sharedWindow = window as AudioContextWindow;
+      const shared = sharedWindow.__aituberSharedAudioContext;
+      ctxRef.current =
+        shared && shared.state !== 'closed' ? shared : new AudioContext();
+      sharedWindow.__aituberSharedAudioContext = ctxRef.current;
     }
     return ctxRef.current;
+  }, []);
+
+  const resumeAudioContext = useCallback(async (ctx: AudioContext) => {
+    if (ctx.state === 'running') return;
+    let timer: number | null = null;
+    try {
+      await Promise.race([
+        ctx.resume(),
+        new Promise<never>((_, reject) => {
+          timer = window.setTimeout(
+            () => reject(new Error('audio_context_resume_timeout')),
+            AUDIO_CONTEXT_RESUME_TIMEOUT_MS,
+          );
+        }),
+      ]);
+    } finally {
+      if (timer !== null) window.clearTimeout(timer);
+    }
+    if ((ctx.state as string) !== 'running')
+      throw new Error('audio_context_locked');
   }, []);
 
   // Must be called directly from a user gesture. Creating/resuming Web Audio
@@ -51,10 +80,8 @@ export function useAudioLipsync() {
   // leaving a successful TTS request completely silent.
   const unlock = useCallback(async (): Promise<void> => {
     const ctx = getAudioContext();
-    if (ctx.state !== 'running') {
-      await ctx.resume();
-    }
-  }, [getAudioContext]);
+    await resumeAudioContext(ctx);
+  }, [getAudioContext, resumeAudioContext]);
 
   const stopCurrent = useCallback(() => {
     playbackGenerationRef.current += 1;
@@ -141,9 +168,7 @@ export function useAudioLipsync() {
       stopCurrent();
 
       const ctx = getAudioContext();
-      if (ctx.state === 'suspended') {
-        await ctx.resume();
-      }
+      await resumeAudioContext(ctx);
 
       // Decode audio data
       const audioBuffer = await ctx.decodeAudioData(arrayBuffer.slice(0));
@@ -194,7 +219,13 @@ export function useAudioLipsync() {
         options?.onStart?.();
       });
     },
-    [stopCurrent, getAudioContext, ensureAnalyser, startAnalysis],
+    [
+      stopCurrent,
+      getAudioContext,
+      ensureAnalyser,
+      resumeAudioContext,
+      startAnalysis,
+    ],
   );
 
   const beginQueue = useCallback(() => {
@@ -211,7 +242,7 @@ export function useAudioLipsync() {
     ): Promise<QueuedAudio> => {
       const generation = playbackGenerationRef.current;
       const ctx = getAudioContext();
-      if (ctx.state === 'suspended') await ctx.resume();
+      await resumeAudioContext(ctx);
       const audioBuffer = await ctx.decodeAudioData(arrayBuffer.slice(0));
       if (generation !== playbackGenerationRef.current) {
         return {
@@ -265,7 +296,7 @@ export function useAudioLipsync() {
       source.start(startAt);
       return { startAt, duration: audioBuffer.duration, ended };
     },
-    [ensureAnalyser, getAudioContext, startAnalysis],
+    [ensureAnalyser, getAudioContext, resumeAudioContext, startAnalysis],
   );
 
   const finishQueue = useCallback(async () => {
@@ -294,9 +325,6 @@ export function useAudioLipsync() {
   useEffect(() => {
     return () => {
       stopCurrent();
-      if (ctxRef.current && ctxRef.current.state !== 'closed') {
-        void ctxRef.current.close();
-      }
       analyserRef.current?.disconnect();
       analyserRef.current = null;
       ctxRef.current = null;

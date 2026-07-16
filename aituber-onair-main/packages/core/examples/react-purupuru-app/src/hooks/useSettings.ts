@@ -19,6 +19,7 @@ import type {
   DigitalHumanPersona,
   AvatarViewTransform,
   ChatProviderOption,
+  EmptyRoomBehaviorStrategy,
   StreamingPlatformOption,
   SocialStreamSettings,
   LiveConnectorSettings,
@@ -70,6 +71,66 @@ const EMPTY_MODEL_IDS: string[] = [];
 const AVATAR_VIEW_MIN_SCALE = 0.2;
 const AVATAR_VIEW_MAX_SCALE = 3;
 const AVATAR_VIEW_MAX_OFFSET = 100_000;
+
+const DEFAULT_EMPTY_ROOM_BEHAVIOR_STRATEGIES: EmptyRoomBehaviorStrategy[] = [
+  {
+    id: 'talk-to-viewer',
+    name: '向个人观众搭话',
+    prompt:
+      '若现场有可安全识别且近期未被反复追问的观众，可自然地向对方或全体在场的人搭一句话。邀请分享、表达共情即可；不催回复，不虚构对方经历，也不连续点名施压。',
+    probability: 35,
+    enabled: true,
+  },
+  {
+    id: 'present-thought',
+    name: '当下独白',
+    prompt:
+      '从此刻的细微感受、偏好、半截念头或小小自嘲出发，说一句生活化的话。不要播报天气、专业信息或把话说成结论与建议。',
+    probability: 35,
+    enabled: true,
+  },
+  {
+    id: 'memory-association',
+    name: '记忆联想',
+    prompt:
+      '可借用提供的近期记忆产生当下联想，但不能朗读档案、不能编造经历；让它像忽然想起的一点生活感受。',
+    probability: 20,
+    enabled: true,
+  },
+  {
+    id: 'quiet-presence',
+    name: '安静陪伴',
+    prompt:
+      '不要求任何人回应，只留下一句让空间显得有人在的自然表达。可以不完整，可以没有结论。',
+    probability: 10,
+    enabled: true,
+  },
+];
+
+function normalizeEmptyRoomBehaviorStrategies(
+  value: unknown,
+): EmptyRoomBehaviorStrategy[] {
+  if (!Array.isArray(value)) return DEFAULT_EMPTY_ROOM_BEHAVIOR_STRATEGIES;
+  const usedIds = new Set<string>();
+  const strategies = value.flatMap((candidate, index) => {
+    if (!candidate || typeof candidate !== 'object') return [];
+    const raw = candidate as Partial<EmptyRoomBehaviorStrategy>;
+    const name = typeof raw.name === 'string' ? raw.name.trim().slice(0, 80) : '';
+    const prompt = typeof raw.prompt === 'string' ? raw.prompt.trim().slice(0, 1600) : '';
+    if (!name || !prompt) return [];
+    const baseId = typeof raw.id === 'string' && raw.id.trim() ? raw.id.trim().slice(0, 80) : `strategy-${index + 1}`;
+    const id = usedIds.has(baseId) ? `${baseId}-${index + 1}` : baseId;
+    usedIds.add(id);
+    return [{
+      id,
+      name,
+      prompt,
+      probability: clampNumber(Number(raw.probability), 0, 100),
+      enabled: raw.enabled !== false,
+    }];
+  });
+  return strategies.slice(0, 12);
+}
 
 function preferLocalCredential(
   localValue: string | undefined,
@@ -491,8 +552,16 @@ function getDefaultSettings(): AppSettings {
     },
     emptyRoomAwareness: {
       enabled: true,
+      audiencePolicy: 'any',
+      scheduleEnabled: false,
+      scheduleStartHour: 0,
+      scheduleEndHour: 0,
       minIntervalMs: 2 * 60_000,
-      maxIntervalMs: 10 * 60_000,
+      maxIntervalMs: 2 * 60_000,
+      proactiveCooldownMs: 2 * 60_000,
+      maxProactiveTurns: 12,
+      maxSentences: 2,
+      behaviorStrategies: DEFAULT_EMPTY_ROOM_BEHAVIOR_STRATEGIES,
       interfaceWeight: 40,
       memoryWeight: 35,
       inspirationWeight: 25,
@@ -695,7 +764,41 @@ function loadSettings(): AppSettings {
             minIntervalMs,
             maxIntervalMs: Math.max(
               minIntervalMs,
-              normalizePositiveInteger(merged.maxIntervalMs, 10 * 60_000),
+              normalizePositiveInteger(merged.maxIntervalMs, 2 * 60_000),
+            ),
+            proactiveCooldownMs: clampNumber(
+              normalizePositiveInteger(merged.proactiveCooldownMs, 2 * 60_000),
+              30_000,
+              60 * 60_000,
+            ),
+            maxProactiveTurns: clampNumber(
+              normalizePositiveInteger(merged.maxProactiveTurns, 12),
+              1,
+              100,
+            ),
+            audiencePolicy: ['any', 'empty_only', 'audience_only'].includes(
+              merged.audiencePolicy,
+            )
+              ? merged.audiencePolicy
+              : 'any',
+            scheduleEnabled: Boolean(merged.scheduleEnabled),
+            scheduleStartHour: clampNumber(
+              Math.round(Number(merged.scheduleStartHour) || 0),
+              0,
+              23,
+            ),
+            scheduleEndHour: clampNumber(
+              Math.round(Number(merged.scheduleEndHour) || 0),
+              0,
+              23,
+            ),
+            maxSentences: clampNumber(
+              Math.round(Number(merged.maxSentences) || 2),
+              1,
+              3,
+            ) as 1 | 2 | 3,
+            behaviorStrategies: normalizeEmptyRoomBehaviorStrategies(
+              saved.emptyRoomAwareness?.behaviorStrategies,
             ),
             audienceWeight: clampNumber(merged.audienceWeight, 0, 100),
           };
@@ -713,6 +816,24 @@ function saveSettings(settings: AppSettings) {
 }
 
 type RuntimeSettingsRole = 'producer' | 'consumer' | 'standalone';
+
+interface RuntimeSettingsEnvelope {
+  version: 1;
+  revision: number;
+  publishedAt: number;
+  settings: AppSettings;
+}
+
+function isRuntimeSettingsEnvelope(value: unknown): value is RuntimeSettingsEnvelope {
+  if (!value || typeof value !== 'object') return false;
+  const envelope = value as Partial<RuntimeSettingsEnvelope>;
+  return (
+    envelope.version === 1 &&
+    typeof envelope.revision === 'number' &&
+    typeof envelope.publishedAt === 'number' &&
+    Boolean(envelope.settings)
+  );
+}
 
 export function useSettings(runtimeRole: RuntimeSettingsRole = 'standalone') {
   const [settings, setSettings] = useState<AppSettings>(loadSettings);
@@ -746,55 +867,68 @@ export function useSettings(runtimeRole: RuntimeSettingsRole = 'standalone') {
     if (runtimeRole === 'producer') {
       void fetch('/api/runtime-settings', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Runtime-Settings-Role': 'producer',
+        },
         body: JSON.stringify(settings),
       }).catch(() => undefined);
     }
   }, [runtimeRole, settings]);
 
   useEffect(() => {
+    if (runtimeRole !== 'consumer') return;
     let cancelled = false;
+    let source: EventSource | null = null;
+    let latestRevision = -1;
+    const applySnapshot = (envelope: RuntimeSettingsEnvelope) => {
+      if (cancelled || envelope.revision <= latestRevision) return;
+      latestRevision = envelope.revision;
+      const local = loadSettings();
+      const runtimeSettings: AppSettings = retainLocalTtsCredentials(
+        envelope.settings,
+        local,
+      );
+      const normalizedRuntimeSettings: AppSettings = {
+        ...runtimeSettings,
+        visual: {
+          ...runtimeSettings.visual,
+          avatarViewX: 0,
+          avatarViewY: 0,
+          avatarViewScale: 1,
+        },
+      };
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(normalizedRuntimeSettings));
+      setSettings(loadSettings());
+    };
     const sync = async () => {
       try {
         const response = await fetch('/api/runtime-settings', {
           cache: 'no-store',
         });
         if (!response.ok) return;
-        const remote = (await response.json()) as AppSettings;
-        if (cancelled) return;
-        const local = loadSettings();
-        const runtimeSettings: AppSettings = retainLocalTtsCredentials(
-          remote,
-          local,
-        );
-        const normalizedRuntimeSettings: AppSettings = {
-          ...runtimeSettings,
-          visual: {
-            ...runtimeSettings.visual,
-            avatarViewX: 0,
-            avatarViewY: 0,
-            avatarViewScale: 1,
-          },
-          stream: runtimeSettings.stream,
-        };
-        localStorage.setItem(
-          STORAGE_KEY,
-          JSON.stringify(normalizedRuntimeSettings),
-        );
-        setSettings(loadSettings());
+        const payload: unknown = await response.json();
+        if (isRuntimeSettingsEnvelope(payload)) applySnapshot(payload);
       } catch {
-        // Keep the last settings cached by the OBS browser source.
+        // Keep the last published snapshot while the local coordinator reloads.
       }
     };
     void sync();
-    const syncOnSettingsChange = (event: StorageEvent) => {
-      if (event.key === STORAGE_KEY) void sync();
-    };
-    window.addEventListener('storage', syncOnSettingsChange);
-    const timer = window.setInterval(sync, 10_000);
+    source = new EventSource('/api/runtime-settings/events');
+    source.addEventListener('settings', (event: MessageEvent<string>) => {
+      try {
+        const payload: unknown = JSON.parse(event.data);
+        if (isRuntimeSettingsEnvelope(payload)) applySnapshot(payload);
+      } catch {
+        // Ignore a malformed event and wait for the next published revision.
+      }
+    });
+    // EventSource is the delivery path. This slow reconciliation only covers
+    // a local Vite restart between opening the page and attaching the stream.
+    const timer = window.setInterval(sync, 60_000);
     return () => {
       cancelled = true;
-      window.removeEventListener('storage', syncOnSettingsChange);
+      source?.close();
       window.clearInterval(timer);
     };
   }, [runtimeRole]);
@@ -1913,7 +2047,7 @@ export function useSettings(runtimeRole: RuntimeSettingsRole = 'standalone') {
         const maxIntervalMs = Math.max(
           minIntervalMs,
           clampNumber(
-            normalizePositiveInteger(merged.maxIntervalMs, 10 * 60_000),
+            normalizePositiveInteger(merged.maxIntervalMs, 2 * 60_000),
             60_000,
             60 * 60_000,
           ),
@@ -1924,6 +2058,40 @@ export function useSettings(runtimeRole: RuntimeSettingsRole = 'standalone') {
             ...merged,
             minIntervalMs,
             maxIntervalMs,
+            proactiveCooldownMs: clampNumber(
+              normalizePositiveInteger(merged.proactiveCooldownMs, 2 * 60_000),
+              30_000,
+              60 * 60_000,
+            ),
+            maxProactiveTurns: clampNumber(
+              normalizePositiveInteger(merged.maxProactiveTurns, 12),
+              1,
+              100,
+            ),
+            audiencePolicy: ['any', 'empty_only', 'audience_only'].includes(
+              merged.audiencePolicy,
+            )
+              ? merged.audiencePolicy
+              : 'any',
+            scheduleEnabled: Boolean(merged.scheduleEnabled),
+            scheduleStartHour: clampNumber(
+              Math.round(Number(merged.scheduleStartHour) || 0),
+              0,
+              23,
+            ),
+            scheduleEndHour: clampNumber(
+              Math.round(Number(merged.scheduleEndHour) || 0),
+              0,
+              23,
+            ),
+            maxSentences: clampNumber(
+              Math.round(Number(merged.maxSentences) || 2),
+              1,
+              3,
+            ) as 1 | 2 | 3,
+            behaviorStrategies: normalizeEmptyRoomBehaviorStrategies(
+              merged.behaviorStrategies,
+            ),
             interfaceWeight: clampNumber(merged.interfaceWeight, 0, 100),
             memoryWeight: clampNumber(merged.memoryWeight, 0, 100),
             inspirationWeight: clampNumber(merged.inspirationWeight, 0, 100),

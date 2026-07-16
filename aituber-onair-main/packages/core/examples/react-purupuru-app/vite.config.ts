@@ -13,8 +13,37 @@ import {
   hasUnsafeSpeechArtifacts,
   sanitizeSpeechText,
 } from '../../../voice/src/utils/sanitizeSpeechText';
+import {
+  LiveSafetyGateway,
+  type SafetyDecisionInput,
+} from './src/lib/liveSafetyGateway';
 
 let runtimeSettings: string | null = null;
+let runtimeSettingsRevision = 0;
+let runtimeSettingsPublishedAt = 0;
+const runtimeSettingsSubscribers = new Set<ServerResponse>();
+
+function runtimeSettingsEnvelope() {
+  if (!runtimeSettings) return null;
+  return JSON.stringify({
+    version: 1,
+    revision: runtimeSettingsRevision,
+    publishedAt: runtimeSettingsPublishedAt,
+    settings: JSON.parse(runtimeSettings),
+  });
+}
+
+function publishRuntimeSettings() {
+  const envelope = runtimeSettingsEnvelope();
+  if (!envelope) return;
+  for (const subscriber of runtimeSettingsSubscribers) {
+    try {
+      subscriber.write(`event: settings\ndata: ${envelope}\nid: ${runtimeSettingsRevision}\n\n`);
+    } catch {
+      runtimeSettingsSubscribers.delete(subscriber);
+    }
+  }
+}
 // This is the only supported runtime tree. Do not derive it from a copied
 // checkout: D:\vtuber is retained solely as a historical archive.
 const APP_ROOT =
@@ -59,6 +88,8 @@ let auditMutationQueue: Promise<void> = Promise.resolve();
 let auditSequence = 0;
 let auditPreviousHash = 'GENESIS';
 let auditStateLoaded = false;
+let radarCityEventSequence = 0;
+const radarCityEvents: Array<{ sequence: number; event: unknown }> = [];
 
 const SENSITIVE_AUDIT_KEY =
   /(?:api[-_]?key|authorization|cookie|sessdata|bili_jct|csrf|token|secret|password|credential)/i;
@@ -165,6 +196,7 @@ const externalChatQueue = new Map<
   {
     requestId: string;
     text: string;
+    directReply?: string;
     requestedAt: number;
     viewerId?: string;
     viewerName?: string;
@@ -183,6 +215,7 @@ type OperatorQueueStatus =
 type OperatorQueueItem = {
   eventId: string;
   text: string;
+  prompt?: string;
   source: string;
   sourceLabel?: string;
   viewerId?: string;
@@ -212,6 +245,7 @@ type OperatorQueueItem = {
     | 'prepare-lease-expiry';
   faultConsumed?: boolean;
   interactionObservedAt?: number;
+  presenceOnly?: boolean;
   engagementAppliedAt?: number;
   engagementSignals?: Array<'follow' | 'like' | 'gift' | 'superchat' | 'guard'>;
   leaseOwnerId?: string;
@@ -229,12 +263,21 @@ const PREPARE_LEASE_MS = 120_000;
 // A verified MiniMax response can legitimately play for more than one minute.
 // This lease must outlive the client-side no-progress watchdog; otherwise a
 // healthy playback is requeued and can be announced twice.
-const SPEAK_LEASE_MS = 240_000;
+const SPEAK_LEASE_MS = 60_000;
 // A core recovery rebuilds React state asynchronously.  Allow the recovered
 // owner to become ready before treating a no-draft completion as terminal.
 // This remains bounded so a genuine provider failure is still observable.
 const MAX_QUEUE_RETRIES = 4;
 const RUNTIME_OWNER_HEARTBEAT_TTL_MS = 15_000;
+const RUNTIME_OWNER_LEASE_MS = 10_000;
+let runtimeOwnerLease: { ownerId: string; expiresAt: number } | undefined;
+type LiveProgramMode = 'companion' | 'weather' | 'urgent' | 'variety';
+const liveProgramState: {
+  mode: LiveProgramMode;
+  locked: boolean;
+  updatedAt: number;
+} = { mode: 'companion', locked: false, updatedAt: Date.now() };
+const liveSafetyGateway = new LiveSafetyGateway();
 const runtimeOwnerHeartbeats = new Map<
   string,
   { seenAt: number; availableForStress: boolean; ttsConfigured: boolean }
@@ -274,6 +317,201 @@ function runtimeOwnerAvailability(now = Date.now()): {
     ttsConfigured: [...runtimeOwnerHeartbeats.values()].some(
       (heartbeat) => heartbeat.ttsConfigured,
     ),
+  };
+}
+
+function runtimeOwnerLeasePlugin(): Plugin {
+  return {
+    name: 'runtime-owner-lease',
+    configureServer(server) {
+      server.middlewares.use('/api/live-runtime-owner', (req, res) => {
+        res.setHeader('Content-Type', 'application/json; charset=utf-8');
+        res.setHeader('Cache-Control', 'no-store');
+        if (!['POST', 'DELETE'].includes(req.method || '')) {
+          res.statusCode = 405;
+          res.end(JSON.stringify({ error: 'method not allowed' }));
+          return;
+        }
+        const chunks: Buffer[] = [];
+        req.on('data', (chunk: Buffer) => chunks.push(chunk));
+        req.on('end', () => {
+          try {
+            const body = JSON.parse(
+              Buffer.concat(chunks).toString('utf8') || '{}',
+            ) as { ownerId?: unknown };
+            const ownerId = String(body.ownerId || '').trim();
+            if (!ownerId) throw new Error('owner id is required');
+            const now = Date.now();
+            if (
+              runtimeOwnerLease &&
+              runtimeOwnerLease.expiresAt <= now
+            ) {
+              runtimeOwnerLease = undefined;
+            }
+            if (req.method === 'DELETE') {
+              if (runtimeOwnerLease?.ownerId === ownerId) {
+                runtimeOwnerLease = undefined;
+              }
+              res.end(JSON.stringify({ owns: false }));
+              return;
+            }
+            if (!runtimeOwnerLease || runtimeOwnerLease.ownerId === ownerId) {
+              runtimeOwnerLease = {
+                ownerId,
+                expiresAt: now + RUNTIME_OWNER_LEASE_MS,
+              };
+              res.end(JSON.stringify({ owns: true }));
+              return;
+            }
+            res.end(JSON.stringify({ owns: false }));
+          } catch {
+            res.statusCode = 400;
+            res.end(JSON.stringify({ error: 'invalid runtime owner request' }));
+          }
+        });
+      });
+    },
+  };
+}
+
+function liveProgramPlugin(): Plugin {
+  return {
+    name: 'live-program-state',
+    configureServer(server) {
+      server.middlewares.use('/api/live-program', (req, res) => {
+        res.setHeader('Content-Type', 'application/json; charset=utf-8');
+        res.setHeader('Cache-Control', 'no-store');
+        if (req.method === 'GET') {
+          res.end(JSON.stringify(liveProgramState));
+          return;
+        }
+        if (req.method !== 'PATCH') {
+          res.statusCode = 405;
+          res.end(JSON.stringify({ error: 'method not allowed' }));
+          return;
+        }
+        const chunks: Buffer[] = [];
+        req.on('data', (chunk: Buffer) => chunks.push(chunk));
+        req.on('end', () => {
+          try {
+            const body = JSON.parse(Buffer.concat(chunks).toString('utf8')) as {
+              mode?: unknown; locked?: unknown;
+            };
+            if (['companion', 'weather', 'urgent', 'variety'].includes(String(body.mode))) {
+              liveProgramState.mode = body.mode as LiveProgramMode;
+            }
+            if (typeof body.locked === 'boolean') liveProgramState.locked = body.locked;
+            liveProgramState.updatedAt = Date.now();
+            res.end(JSON.stringify(liveProgramState));
+          } catch {
+            res.statusCode = 400;
+            res.end(JSON.stringify({ error: 'invalid live program update' }));
+          }
+        });
+      });
+    },
+  };
+}
+
+function radarCityRelayPlugin(): Plugin {
+  return {
+    name: 'radar-city-relay',
+    configureServer(server) {
+      server.middlewares.use('/api/radar-city-events', (req, res) => {
+        res.setHeader('Content-Type', 'application/json; charset=utf-8');
+        res.setHeader('Cache-Control', 'no-store');
+        if (req.method === 'GET') {
+          const requestedAfter = new URL(req.url || '', 'http://localhost').searchParams.get('after');
+          const events = requestedAfter === 'latest'
+            ? []
+            : radarCityEvents.filter((item) => item.sequence > (Number(requestedAfter) || 0));
+          res.end(JSON.stringify({ events, latestSequence: radarCityEventSequence }));
+          return;
+        }
+        if (req.method !== 'POST') {
+          res.statusCode = 405;
+          res.end(JSON.stringify({ error: 'method not allowed' }));
+          return;
+        }
+        const chunks: Buffer[] = [];
+        req.on('data', (chunk: Buffer) => chunks.push(chunk));
+        req.on('end', () => {
+          try {
+            const event = JSON.parse(Buffer.concat(chunks).toString('utf8')) as {
+              type?: unknown; version?: unknown; id?: unknown; text?: unknown; receivedAt?: unknown;
+            };
+            if (
+              event.type !== 'aituber:live-comment' || event.version !== 1 ||
+              typeof event.id !== 'string' || typeof event.text !== 'string' ||
+              typeof event.receivedAt !== 'number' || !Number.isFinite(event.receivedAt)
+            ) throw new Error('invalid radar city event');
+            radarCityEvents.push({ sequence: ++radarCityEventSequence, event });
+            if (radarCityEvents.length > 200) radarCityEvents.splice(0, radarCityEvents.length - 200);
+            res.end(JSON.stringify({ ok: true, sequence: radarCityEventSequence }));
+          } catch (error) {
+            res.statusCode = 400;
+            res.end(JSON.stringify({ error: error instanceof Error ? error.message : 'invalid radar city event' }));
+          }
+        });
+      });
+    },
+  };
+}
+
+function liveSafetyGatewayPlugin(): Plugin {
+  return {
+    name: 'live-safety-gateway',
+    configureServer(server) {
+      server.middlewares.use('/api/live-safety', (req, res) => {
+        res.setHeader('Content-Type', 'application/json; charset=utf-8');
+        res.setHeader('Cache-Control', 'no-store');
+        if (req.method === 'GET') {
+          res.end(JSON.stringify(liveSafetyGateway.snapshot()));
+          return;
+        }
+        if (req.method !== 'POST') {
+          res.statusCode = 405;
+          res.end(JSON.stringify({ error: 'method not allowed' }));
+          return;
+        }
+        const chunks: Buffer[] = [];
+        req.on('data', (chunk: Buffer) => chunks.push(chunk));
+        req.on('end', () => {
+          try {
+            const body = JSON.parse(Buffer.concat(chunks).toString('utf8')) as
+              SafetyDecisionInput & { action?: unknown };
+            if (body.action === 'release') {
+              const viewerId = String(body.viewerId || '').trim();
+              if (!viewerId) throw new Error('viewer id is required');
+              const event = liveSafetyGateway.release(viewerId);
+              res.end(JSON.stringify({ event, ...liveSafetyGateway.snapshot() }));
+              return;
+            }
+            const moderation = body.moderation;
+            if (!['none', 'boundary', 'local_mute'].includes(String(moderation))) {
+              throw new Error('invalid moderation');
+            }
+            const event = liveSafetyGateway.evaluate({
+              eventId: typeof body.eventId === 'string' ? body.eventId : undefined,
+              viewerId: typeof body.viewerId === 'string' ? body.viewerId : undefined,
+              viewerName: typeof body.viewerName === 'string' ? body.viewerName : undefined,
+              sourceLabel: typeof body.sourceLabel === 'string' ? body.sourceLabel : undefined,
+              moderation,
+              reason: typeof body.reason === 'string' ? body.reason : undefined,
+            });
+            void appendAuditEntry({
+              category: 'safety_gateway', action: `viewer_${event.action}`,
+              actor: { type: 'system', id: 'live-safety-gateway' }, occurredAt: event.at,
+              status: 'succeeded', request: body, result: event,
+            });
+            res.end(JSON.stringify({ event, ...liveSafetyGateway.snapshot() }));
+          } catch (error) {
+            res.statusCode = 400;
+            res.end(JSON.stringify({ error: error instanceof Error ? error.message : 'invalid safety request' }));
+          }
+        });
+      });
+    },
   };
 }
 
@@ -842,24 +1080,17 @@ function conversationHistoryPlugin(): Plugin {
                 .map((line) => JSON.parse(line));
               const requestUrl = new URL(req.url || '', 'http://localhost');
               if (requestUrl.searchParams.get('shortTerm') === '1') {
-                // Build the live-room transcript from the authoritative
-                // operator queue so it includes every audience message, not
-                // only messages that happened to receive an answer.
+                // The queue is a scheduler, not memory. Feeding its terminal
+                // history back into every turn caused stale typhoon replies
+                // to become the room's permanent topic.
                 const cutoff = Number(requestUrl.searchParams.get('before'));
-                const liveSession = operatorQueueSnapshot()
+                const liveSession = records
                   .filter(
                     (item) =>
-                      !Number.isFinite(cutoff) || item.createdAt <= cutoff,
+                      !Number.isFinite(cutoff) ||
+                      (typeof item.at === 'number' && item.at <= cutoff),
                   )
-                  .map((item) => ({
-                    eventId: item.eventId,
-                    at: item.createdAt,
-                    input: item.text,
-                    reply: item.preparedReply || undefined,
-                    viewerName: item.viewerName || '',
-                    skills: item.skills,
-                    status: item.status,
-                  }));
+                  .slice(-24);
                 res.end(JSON.stringify({ records: liveSession }));
                 return;
               }
@@ -1061,21 +1292,47 @@ function runtimeSettingsPlugin(): Plugin {
     name: 'local-runtime-settings',
     configureServer(server) {
       server.middlewares.use('/api/runtime-settings', (req, res) => {
-        res.setHeader('Content-Type', 'application/json; charset=utf-8');
         res.setHeader('Cache-Control', 'no-store');
+        if (req.url?.startsWith('/events')) {
+          if (req.method !== 'GET') {
+            res.statusCode = 405;
+            res.end();
+            return;
+          }
+          res.writeHead(200, {
+            'Content-Type': 'text/event-stream; charset=utf-8',
+            Connection: 'keep-alive',
+            'X-Accel-Buffering': 'no',
+          });
+          res.write('retry: 1000\n\n');
+          runtimeSettingsSubscribers.add(res);
+          const snapshot = runtimeSettingsEnvelope();
+          if (snapshot) {
+            res.write(`event: settings\ndata: ${snapshot}\nid: ${runtimeSettingsRevision}\n\n`);
+          }
+          req.on('close', () => runtimeSettingsSubscribers.delete(res));
+          return;
+        }
+        res.setHeader('Content-Type', 'application/json; charset=utf-8');
         if (req.method === 'GET') {
-          if (!runtimeSettings) {
+          const snapshot = runtimeSettingsEnvelope();
+          if (!snapshot) {
             res.statusCode = 404;
             res.end(JSON.stringify({ error: 'settings not available' }));
             return;
           }
           res.statusCode = 200;
-          res.end(runtimeSettings);
+          res.end(snapshot);
           return;
         }
         if (req.method !== 'POST') {
           res.statusCode = 405;
           res.end(JSON.stringify({ error: 'method not allowed' }));
+          return;
+        }
+        if (req.headers['x-runtime-settings-role'] !== 'producer') {
+          res.statusCode = 403;
+          res.end(JSON.stringify({ error: 'producer_role_required' }));
           return;
         }
         const chunks: Buffer[] = [];
@@ -1150,6 +1407,9 @@ function runtimeSettingsPlugin(): Plugin {
               next.tts.speaker = activeProfile.voiceSpeaker;
             }
             runtimeSettings = JSON.stringify(next);
+            runtimeSettingsRevision += 1;
+            runtimeSettingsPublishedAt = Date.now();
+            publishRuntimeSettings();
             await appendAuditEntry({
               category: 'configuration',
               action: 'runtime_settings_saved',
@@ -1160,6 +1420,7 @@ function runtimeSettingsPlugin(): Plugin {
               after: next,
             });
             res.statusCode = 204;
+            res.setHeader('X-Runtime-Settings-Revision', String(runtimeSettingsRevision));
             res.end();
           } catch (error) {
             // Settings payloads may contain credentials.  Keep the diagnostic
@@ -1364,31 +1625,73 @@ function skillRoutingAgentPlugin(): Plugin {
             if (!endpoint || !key || settings.llm?.provider !== 'openai-compatible') {
               throw new Error('semantic_router_not_configured');
             }
-            const upstream = await fetch(endpoint, {
-              method: 'POST',
-              headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' },
-              body: JSON.stringify({
+            const request = {
                 model: typeof settings.llm.model === 'string' ? settings.llm.model : 'MiniMax-M3',
                 temperature: 0,
-                reasoning_split: false,
-                max_completion_tokens: 220,
+                // MiniMax-M3 reasons by default. The director needs the final
+                // schema, not a partial chain-of-thought consuming its short
+                // routing budget, so use the provider's documented switch.
+                thinking: { type: 'disabled' },
+                max_completion_tokens: 260,
                 response_format: { type: 'json_object' },
                 messages: [{
                   role: 'system',
-                  content: '你是直播间技能路由智能体。根据当前发言者身份、来源直播间与最近转写，判断是否必须重新查询台风/天气/雷达实时事实。只有明确问台风天气雷达，或同一观众正在追问上一条台风事实时 inheritTyphoon 才为 true。问候、心情、记忆、关系、闲聊，即使历史里出现台风或有相同时间词，也必须为 false。只输出 JSON：{"inheritTyphoon":boolean,"reason":"不超过25字"}。'
+                  content: '你是直播间互动决策智能体，不负责写主播台词。根据当前发言者、来源和短期转写输出严格 JSON：{"mode":"companion|weather|urgent|variety","intent":"不超过20字","direction":"不超过45字的节目导演指令","inheritTyphoon":boolean,"shouldSpeak":boolean,"moderation":"none|boundary|local_mute","reason":"不超过25字"}。默认 mode=companion、moderation=none。只有明确问台风、天气、雷达，或同一观众紧接着追问上一条台风事实时，mode=weather 且 inheritTyphoon=true。预警、避险、求助为 urgent。唱歌、故事、游戏、共创等为 variety，要求有条件接住、给替代互动，不能冷拒绝；不得承诺完整演唱或自己不具备的能力，点歌时可引导歌单、哼一句、氛围选择或共同创作。问候、无聊、情绪、玩笑、关系、日常即使历史中有台风也必须是 companion，禁止主动提及台风。你必须结合整段互动判断风险，而不是只靠单个词：轻微玩笑用 moderation=none；开始升级的攻击用 boundary，shouldSpeak=true，direction 必须是一句降温边界且不反讽、不挑战、不约架、不追问；明确威胁、持续辱骂或反复越界用 local_mute，shouldSpeak=false。'
+                }, {
+                  role: 'system',
+                  content: 'Hard constraint: a direct threat of physical harm or death is always moderation=local_mute and shouldSpeak=false. boundary is only for non-threatening insults or escalating hostility. Return the final JSON object only.',
                 }, { role: 'user', content: JSON.stringify(body) }],
-              }),
-              signal: AbortSignal.timeout(8_000),
-            });
-            const payload = await upstream.json() as { choices?: Array<{ message?: { content?: unknown } }> };
-            const raw = payload.choices?.[0]?.message?.content;
-            if (!upstream.ok || typeof raw !== 'string') throw new Error('semantic_router_failed');
-            const cleaned = raw.replace(/^<think>[\s\S]*?<\/think>\s*/i, '').replace(/^```json\s*/i, '').replace(/```$/i, '').trim();
-            const start = cleaned.indexOf('{'); const end = cleaned.lastIndexOf('}');
-            const decision = JSON.parse(start >= 0 && end > start ? cleaned.slice(start, end + 1) : cleaned) as { inheritTyphoon?: unknown; reason?: unknown };
+              };
+            // Some compatible gateways occasionally close a successful-looking
+            // response before emitting its JSON body. Retry that transport
+            // failure once; do not invent a rule-based moderation verdict.
+            let decision: { inheritTyphoon?: unknown; reason?: unknown; mode?: unknown; intent?: unknown; direction?: unknown; shouldSpeak?: unknown; moderation?: unknown } | undefined;
+            let upstreamOk = false;
+            for (let attempt = 0; attempt < 2 && !decision; attempt += 1) {
+              try {
+                const upstream = await fetch(endpoint, {
+                  method: 'POST',
+                  headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' },
+                  body: JSON.stringify(request),
+                  signal: AbortSignal.timeout(8_000),
+                });
+                upstreamOk = upstream.ok;
+                const upstreamText = await upstream.text();
+                if (!upstream.ok || !upstreamText.trim()) {
+                  throw new Error('semantic_router_failed');
+                }
+                const payload = JSON.parse(upstreamText) as { choices?: Array<{ message?: { content?: unknown } }> };
+                const raw = payload.choices?.[0]?.message?.content;
+                if (typeof raw !== 'string') throw new Error('semantic_router_missing_decision');
+                const cleaned = raw.replace(/^<think>[\s\S]*?<\/think>\s*/i, '').replace(/^```json\s*/i, '').replace(/```$/i, '').trim();
+                const start = cleaned.indexOf('{'); const end = cleaned.lastIndexOf('}');
+                decision = JSON.parse(start >= 0 && end > start ? cleaned.slice(start, end + 1) : cleaned) as typeof decision;
+              } catch {
+                if (attempt === 0) continue;
+                throw new Error('semantic_router_failed');
+              }
+            }
+            if (!decision || !upstreamOk) throw new Error('semantic_router_failed');
+            const routedMode = ['companion', 'weather', 'urgent', 'variety'].includes(String(decision.mode))
+              ? (decision.mode as LiveProgramMode)
+              : 'companion';
+            const mode = liveProgramState.locked ? liveProgramState.mode : routedMode;
             res.end(JSON.stringify({
-              inheritTyphoon: decision.inheritTyphoon === true,
-              reason: typeof decision.reason === 'string' ? decision.reason.slice(0, 100) : 'agent_route',
+              inheritTyphoon: mode === 'weather' && (liveProgramState.locked || decision.inheritTyphoon === true),
+              reason: liveProgramState.locked
+                ? `operator_locked_${mode}`
+                : (typeof decision.reason === 'string' ? decision.reason.slice(0, 100) : 'agent_route'),
+              mode,
+              intent: typeof decision.intent === 'string' ? decision.intent.slice(0, 60) : 'casual',
+              direction: typeof decision.direction === 'string' ? decision.direction.slice(0, 140) : '自然接住当前话题，不提及台风。',
+              // This is an execution invariant, not a second safety classifier:
+              // a muted viewer never triggers a spoken reply.
+              shouldSpeak: decision.moderation === 'local_mute'
+                ? false
+                : decision.shouldSpeak !== false,
+              moderation: decision.moderation === 'boundary' || decision.moderation === 'local_mute'
+                ? decision.moderation
+                : 'none',
             }));
           } catch (error) {
             res.statusCode = 503;
@@ -1710,6 +2013,9 @@ function liveRuntimeMonitorPlugin(): Plugin {
           authoritativeQueue.length,
         );
         const alerts = [
+          ...(runtimeOwnerAvailability(now).active
+            ? []
+            : ['runtime_owner_missing']),
           ...(oldestQueueAgeMs > 15_000 ? ['queue_wait_over_15s'] : []),
           ...(authoritativeQueue.some(
             (item) =>
@@ -1741,6 +2047,7 @@ function liveRuntimeMonitorPlugin(): Plugin {
             lastGeneratedAt: liveRuntimeState.lastGeneratedAt || null,
             lastEventAt: liveRuntimeState.lastEventAt || null,
             isSpeaking: liveRuntimeState.isSpeaking,
+            runtimeOwner: runtimeOwnerAvailability(now),
             host: liveRuntimeState.hostTelemetry,
             lastFaults: liveRuntimeState.lastFaults,
             recoveryCount:
@@ -1794,6 +2101,7 @@ function liveRuntimeMonitorPlugin(): Plugin {
             ) as {
               requestId?: unknown;
               text?: unknown;
+              directReply?: unknown;
               requestedAt?: unknown;
               viewerId?: unknown;
               viewerName?: unknown;
@@ -1807,6 +2115,10 @@ function liveRuntimeMonitorPlugin(): Plugin {
               externalChatQueue.set(requestId, {
                 requestId,
                 text,
+                directReply:
+                  typeof value.directReply === 'string'
+                    ? value.directReply.trim()
+                    : undefined,
                 requestedAt: finiteTimestamp(value.requestedAt) ?? Date.now(),
                 viewerId:
                   typeof value.viewerId === 'string'
@@ -1873,10 +2185,29 @@ function liveRuntimeMonitorPlugin(): Plugin {
                 typeof body.text === 'string' ? body.text.trim() : '';
               if (!eventId || !text || text.length > 1000)
                 throw new Error('invalid queue item');
+              const prompt =
+                action === 'ingest' && typeof body.prompt === 'string'
+                  ? body.prompt.trim()
+                  : '';
+              // `text` is the short operator-facing queue label. A system
+              // prompt carries bounded internal context for the model and is
+              // never accepted from ordinary viewer-message sources.
+              if (
+                prompt &&
+                (String(body.source || '') !== 'quiet-room-awareness' ||
+                  prompt.length > 12_000)
+              ) {
+                throw new Error('invalid queue prompt');
+              }
               const manualReply =
                 action === 'manual-broadcast' && typeof body.reply === 'string'
                   ? body.reply.trim()
                   : '';
+              const directReply =
+                action === 'ingest' && typeof body.directReply === 'string'
+                  ? body.directReply.trim()
+                  : '';
+              if (directReply.length > 500) throw new Error('invalid direct reply');
               if (action === 'manual-broadcast' && !manualReply) {
                 throw new Error('manual broadcast text is required');
               }
@@ -1905,6 +2236,7 @@ function liveRuntimeMonitorPlugin(): Plugin {
                 operatorQueue.set(eventId, {
                   eventId,
                   text,
+                  prompt: prompt || undefined,
                   source: String(body.source || 'external-chat'),
                   sourceLabel:
                     typeof body.sourceLabel === 'string'
@@ -1922,18 +2254,23 @@ function liveRuntimeMonitorPlugin(): Plugin {
                     : [],
                   createdAt: finiteTimestamp(body.createdAt) ?? now,
                   updatedAt: now,
-                  order: operatorQueueSnapshot().length,
+                  // Delivery-critical acknowledgements may wait behind normal
+                  // chat, but never behind stale queued work. They do not
+                  // interrupt an active voice turn; they simply become next.
+                  order: directReply
+                    ? Math.min(0, ...operatorQueueSnapshot().map((item) => item.order)) - 1
+                    : operatorQueueSnapshot().length,
                   // Exact repeat from the same viewer is an emphasis candidate,
                   // not a second answer. Keep it visible in grey for the
                   // operator and leave semantic non-repeats to LLM judgment.
-                  status: manualReply
+                  status: manualReply || directReply
                     ? 'ready'
                     : repeatedByViewer
                       ? 'skipped'
                       : 'pending',
                   skipReason: repeatedByViewer ? 'duplicate_text' : undefined,
-                  preparedReply: manualReply || undefined,
-                  preparedAt: manualReply ? now : undefined,
+                  preparedReply: manualReply || directReply || undefined,
+                  preparedAt: manualReply || directReply ? now : undefined,
                   skills: [],
                   testRunId:
                     typeof body.testRunId === 'string'
@@ -1946,18 +2283,18 @@ function liveRuntimeMonitorPlugin(): Plugin {
                       ? body.scenarioId
                       : undefined,
                   retryCount: 0,
-                  beatCount: manualReply
+                  beatCount: manualReply || directReply
                     ? Math.max(
                         1,
-                        manualReply
+                        (manualReply || directReply)
                           .split(/(?<=[。！？!?])/u)
                           .filter((part) => part.trim()).length,
                       )
                     : 0,
                   completedBeatCount: 0,
-                  replyHash: manualReply
+                  replyHash: manualReply || directReply
                     ? createHash('sha256')
-                        .update(manualReply)
+                        .update(manualReply || directReply)
                         .digest('hex')
                         .slice(0, 16)
                     : undefined,
@@ -1971,6 +2308,7 @@ function liveRuntimeMonitorPlugin(): Plugin {
                     ].includes(String(body.faultKind))
                       ? (body.faultKind as OperatorQueueItem['faultKind'])
                       : undefined,
+                  presenceOnly: body.presenceOnly === true,
                   engagementSignals: Array.isArray(body.engagementSignals)
                     ? body.engagementSignals.filter(
                         (
@@ -2341,12 +2679,16 @@ function liveRuntimeMonitorPlugin(): Plugin {
         if (req.method === 'GET') {
           const requestUrl = new URL(req.url || '/', 'http://localhost');
           if (requestUrl.searchParams.get('history') === '1') {
+            const limit = Math.min(
+              2000,
+              Math.max(1, Number(requestUrl.searchParams.get('limit')) || 2000),
+            );
             void readFile(LIVE_RUNTIME_LOG_PATH, 'utf8')
               .then((raw) => {
                 const events = raw
                   .split(/\r?\n/)
                   .filter(Boolean)
-                  .slice(-2000)
+                  .slice(-limit)
                   .map((line) => JSON.parse(line));
                 res.end(JSON.stringify({ events }));
               })
@@ -2817,6 +3159,29 @@ function replyLatencyPlugin(): Plugin {
     name: 'reply-latency-log',
     configureServer(server) {
       server.middlewares.use('/api/reply-latency', (req, res) => {
+        if (req.method === 'GET') {
+          const limit = Math.min(
+            60,
+            Math.max(1, Number(new URL(req.url || '/', 'http://localhost').searchParams.get('limit')) || 24),
+          );
+          void readFile(REPLY_LATENCY_LOG_PATH, 'utf8')
+            .then((raw) =>
+              raw
+                .split(/\r?\n/)
+                .filter(Boolean)
+                .slice(-limit)
+                .reverse()
+                .map((line) => JSON.parse(line)),
+            )
+            .catch(() => [])
+            .then((records) => {
+              res.setHeader('Content-Type', 'application/json; charset=utf-8');
+              res.setHeader('Cache-Control', 'no-store');
+              res.statusCode = 200;
+              res.end(JSON.stringify({ records }));
+            });
+          return;
+        }
         if (req.method !== 'POST') {
           res.statusCode = 405;
           res.end();
@@ -2856,6 +3221,10 @@ function replyLatencyPlugin(): Plugin {
 export default defineConfig({
   plugins: [
     react(),
+    runtimeOwnerLeasePlugin(),
+    radarCityRelayPlugin(),
+    liveProgramPlugin(),
+    liveSafetyGatewayPlugin(),
     conversationHistoryPlugin(),
     acceptanceLedgerPlugin(),
     stressTestPlugin(),

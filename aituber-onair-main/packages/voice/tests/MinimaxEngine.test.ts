@@ -6,6 +6,7 @@ import {
 import { MinimaxEngine, type MinimaxModel } from '../src/engines/MinimaxEngine';
 
 afterEach(() => {
+  vi.useRealTimers();
   vi.restoreAllMocks();
 });
 
@@ -36,7 +37,7 @@ describe('MinimaxEngine', () => {
       }
 
       expect(chunks.map((chunk) => chunk.byteLength)).toEqual([
-        32_768, 32_768, 4_464,
+        16_384, 32_768, 20_848,
       ]);
       expect(
         new Uint8Array(chunks.flatMap((chunk) => Array.from(chunk))),
@@ -71,6 +72,95 @@ describe('MinimaxEngine', () => {
 
       expect(chunks).toHaveLength(1);
       expect(chunks[0]).toEqual(new Uint8Array([1, 2, 3, 4]));
+    });
+
+    it('stops at terminal status even when the SSE transport stays open', async () => {
+      const engine = new MinimaxEngine();
+      const encoder = new TextEncoder();
+      const cancelled = vi.fn();
+      const body = new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(
+            encoder.encode(
+              `data: ${JSON.stringify({ data: { audio: '01020304', status: 1 } })}\n\n` +
+                `data: ${JSON.stringify({ data: { audio: '01020304', status: 2 } })}\n\n`,
+            ),
+          );
+        },
+        cancel: cancelled,
+      });
+      vi.stubGlobal(
+        'fetch',
+        vi.fn().mockResolvedValue(
+          new Response(body, {
+            status: 200,
+            headers: { 'Content-Type': 'text/event-stream' },
+          }),
+        ),
+      );
+
+      const chunks: Uint8Array[] = [];
+      for await (const chunk of engine.fetchAudioStream(
+        { style: 'talk', message: 'test' },
+        'voice-id',
+        'api-key',
+      )) {
+        chunks.push(new Uint8Array(chunk));
+      }
+
+      expect(cancelled).toHaveBeenCalledOnce();
+      expect(chunks).toEqual([new Uint8Array([1, 2, 3, 4])]);
+    });
+
+    it('aborts a status=1 stream that stops making audio progress', async () => {
+      vi.useFakeTimers();
+      const engine = new MinimaxEngine();
+      const encoder = new TextEncoder();
+      const cancelled = vi.fn();
+      const audio = new Uint8Array(17_000).fill(7);
+      const hex = Array.from(audio, (value) =>
+        value.toString(16).padStart(2, '0'),
+      ).join('');
+      const body = new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(
+            encoder.encode(
+              `data: ${JSON.stringify({ data: { audio: hex, status: 1 } })}\n\n`,
+            ),
+          );
+        },
+        cancel: cancelled,
+      });
+      let requestSignal: AbortSignal | null = null;
+      vi.stubGlobal(
+        'fetch',
+        vi.fn().mockImplementation((_input, init: RequestInit) => {
+          requestSignal = init.signal as AbortSignal;
+          return Promise.resolve(
+            new Response(body, {
+              status: 200,
+              headers: { 'Content-Type': 'text/event-stream' },
+            }),
+          );
+        }),
+      );
+
+      const iterator = engine.fetchAudioStream(
+        { style: 'talk', message: 'test' },
+        'voice-id',
+        'api-key',
+      );
+      const first = await iterator.next();
+      expect(first.value?.byteLength).toBe(16_384);
+
+      const tailPromise = iterator.next();
+      await vi.advanceTimersByTimeAsync(8_001);
+      const tail = await tailPromise;
+
+      expect(tail.value?.byteLength).toBe(616);
+      expect(requestSignal?.aborted).toBe(true);
+      expect(cancelled).toHaveBeenCalledOnce();
+      await expect(iterator.next()).resolves.toMatchObject({ done: true });
     });
 
     it('keeps status=2 audio when it is the only audio response', async () => {

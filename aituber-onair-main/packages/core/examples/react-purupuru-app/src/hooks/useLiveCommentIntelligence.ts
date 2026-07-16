@@ -110,6 +110,8 @@ export function useLiveCommentIntelligence({
   const [lastAnalysis, setLastAnalysis] =
     useState<CommentIntelligenceResult | null>(null);
   const schedulerRef = useRef<LiveResponseScheduler | null>(null);
+  const flushRef = useRef<() => Promise<void>>(async () => undefined);
+  const scheduledFlushTimerRef = useRef<number | null>(null);
   const onTransitionRef = useRef(onTransition);
 
   useEffect(() => {
@@ -119,6 +121,9 @@ export function useLiveCommentIntelligence({
   if (!schedulerRef.current) {
     schedulerRef.current = new LiveResponseScheduler({
       maxGroups: Math.max(1, Math.min(12, maxCommentsPerBatch)),
+      // A single viewer should not pay the old 1.5 s burst-settle tax.  The
+      // event-driven flush below still groups messages arriving together.
+      settleWindowMs: 400,
       onTransition: (transition) => {
         setQueueDepth(transition.queueDepth);
         onTransitionRef.current?.(transition);
@@ -191,6 +196,12 @@ export function useLiveCommentIntelligence({
   const enqueue = useCallback((comments: LiveComment[]) => {
     schedulerRef.current?.enqueue(comments);
     setQueueDepth(schedulerRef.current?.size ?? 0);
+    if (scheduledFlushTimerRef.current === null) {
+      scheduledFlushTimerRef.current = window.setTimeout(() => {
+        scheduledFlushTimerRef.current = null;
+        void flushRef.current();
+      }, 500);
+    }
   }, []);
 
   const enqueueYouTubeComments = useCallback(
@@ -367,6 +378,16 @@ export function useLiveCommentIntelligence({
     streamTopic,
     profile.fullName,
   ]);
+  flushRef.current = flush;
+
+  useEffect(
+    () => () => {
+      if (scheduledFlushTimerRef.current !== null) {
+        window.clearTimeout(scheduledFlushTimerRef.current);
+      }
+    },
+    [],
+  );
 
   useInterval(
     () => {
