@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
   hasCompleteDeliveryEvidence,
   isLiveHostCoordinatorRequired,
+  resolveAuthoritativeSpeechHints,
   resolveIncompleteDelivery,
 } from '../../examples/react-purupuru-app/src/lib/liveHostDelivery';
 
@@ -55,5 +56,20 @@ describe('live host delivery authority', () => {
         audioByteLength: 8_000,
       }),
     ).toBe(false);
+  });
+
+  it('does not turn every authoritative weather answer into an alert', () => {
+    const soulHints = {
+      emotion: 'happy',
+      delivery: 'warm',
+      motion: 'idle_cold',
+    };
+
+    expect(resolveAuthoritativeSpeechHints(soulHints, false)).toBe(soulHints);
+    expect(resolveAuthoritativeSpeechHints(soulHints, true)).toEqual({
+      emotion: 'neutral',
+      delivery: 'serious',
+      motion: 'serious_report',
+    });
   });
 });

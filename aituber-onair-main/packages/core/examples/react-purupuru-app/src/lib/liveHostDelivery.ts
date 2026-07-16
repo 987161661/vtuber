@@ -1,3 +1,5 @@
+import type { SpeechPlanV2BuilderHints } from '@aituber-onair/core';
+
 export type IncompleteDeliveryStatus = 'partial' | 'interrupted' | 'failed';
 
 export type IncompleteDeliveryEvidence = {
@@ -57,4 +59,22 @@ export function hasCompleteDeliveryEvidence(
     evidence.completedBeatCount >= evidence.beatCount &&
     evidence.audioByteLength > 0
   );
+}
+
+/**
+ * Authoritative text and vocal urgency are separate concerns. Routine grounded
+ * answers should keep the Soul decision's delivery; only genuinely urgent
+ * routing receives the restrained alert cadence.
+ */
+export function resolveAuthoritativeSpeechHints(
+  hints: SpeechPlanV2BuilderHints,
+  urgent: boolean,
+): SpeechPlanV2BuilderHints {
+  if (!urgent) return hints;
+  return {
+    ...hints,
+    emotion: 'neutral',
+    delivery: 'serious',
+    motion: 'serious_report',
+  };
 }

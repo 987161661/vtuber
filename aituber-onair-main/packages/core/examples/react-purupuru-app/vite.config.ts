@@ -4882,6 +4882,12 @@ function liveRuntimeMonitorPlugin(): Plugin {
               'local-safety-mute',
             ]);
             if (
+              stage === 'soul_shadow_decision' &&
+              event.fallback !== true
+            ) {
+              delete liveRuntimeState.lastFaults.soul;
+            }
+            if (
               (stage.startsWith('soul_') &&
                 /failed|failure|timeout|error/.test(stage)) ||
               (stage === 'soul_shadow_decision' &&
@@ -5586,6 +5592,10 @@ export default defineConfig({
     createSoulRuntimePlugin({
       getRuntimeSettings: () =>
         runtimeSettings ? JSON.parse(runtimeSettings) : null,
+      // The provider's observed tail occasionally exceeds the former 5.5s
+      // cutoff even with thinking disabled. This remains below the plugin's
+      // absolute 10s safety bound and does not add a retry/model call.
+      fastTimeoutMs: 8_000,
       fastMaxCompletionTokens: 420,
       paths: {
         ledgerPath: join(APP_ROOT, '.runtime', 'soul', 'ledger.jsonl'),

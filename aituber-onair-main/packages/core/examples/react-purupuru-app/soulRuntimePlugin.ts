@@ -27,7 +27,12 @@ import type { Plugin } from 'vite';
 
 const FAST_MODEL_PROFILE_ID = 'minimax-m3-soul-fast-v1';
 const SLOW_MODEL_PROFILE_ID = 'minimax-m3-soul-reflect-v1';
-const DEFAULT_FAST_TIMEOUT_MS = 5_500;
+// MiniMax M3 normally completes the compact fast proposal within five seconds,
+// but production-equivalent traces show a real long tail just beyond 5.5s.
+// Keep the path bounded while leaving enough headroom to avoid turning normal
+// provider jitter into a deterministic fallback.
+const DEFAULT_FAST_TIMEOUT_MS = 8_000;
+const MAX_FAST_TIMEOUT_MS = 10_000;
 const DEFAULT_REFLECT_TIMEOUT_MS = 30_000;
 const DEFAULT_FAST_BODY_BYTES = 64 * 1024;
 const DEFAULT_REFLECT_BODY_BYTES = 256 * 1024;
@@ -354,9 +359,16 @@ export function normalizeSemanticProposal(
 ): SemanticProposalV1 {
   const container = recordValue(raw.semanticProposal) ?? raw;
   const evidenceSource =
-    arrayValue(container.evidence) ?? arrayValue(container.signals) ?? [];
+    arrayOrSingleRecord(container.evidence) ??
+    arrayOrSingleRecord(container.signals) ??
+    arrayOrSingleRecord(container.signal) ??
+    [];
   const candidateSource =
-    arrayValue(container.candidates) ?? arrayValue(container.actions) ?? [];
+    arrayOrSingleRecord(container.candidates) ??
+    arrayOrSingleRecord(container.actions) ??
+    arrayOrSingleRecord(container.candidate) ??
+    arrayOrSingleRecord(container.actionCandidate) ??
+    (container.action || container.kind ? [container] : []);
   const evidence = evidenceSource
     .slice(0, 12)
     .map(normalizeEvidence)
@@ -634,7 +646,7 @@ export function createSoulRuntimePlugin(
     options.fastTimeoutMs,
     500,
     DEFAULT_FAST_TIMEOUT_MS,
-    5_500,
+    MAX_FAST_TIMEOUT_MS,
   );
   const reflectTimeoutMs = boundedInteger(
     options.reflectTimeoutMs,
@@ -2366,6 +2378,13 @@ function recordValue(value: unknown): Record<string, unknown> | undefined {
 
 function arrayValue(value: unknown): unknown[] | undefined {
   return Array.isArray(value) ? value : undefined;
+}
+
+function arrayOrSingleRecord(value: unknown): unknown[] | undefined {
+  const array = arrayValue(value);
+  if (array) return array;
+  const record = recordValue(value);
+  return record ? [record] : undefined;
 }
 
 function stringValue(value: unknown): string {

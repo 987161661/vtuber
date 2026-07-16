@@ -191,6 +191,45 @@ describe('soul runtime server protocol helpers', () => {
     expect(proposal.repairNotes).toEqual(['json-envelope-repaired']);
   });
 
+  it('repairs a singular candidate envelope without inventing an action', () => {
+    const proposal = normalizeSemanticProposal(
+      {
+        confidence: 0.7,
+        attribution: 'self',
+        signal: {
+          dimension: 'novelty',
+          value: -0.4,
+          confidence: 0.8,
+          reasonCode: 'quiet-room',
+        },
+        candidate: {
+          id: 'open-topic-1',
+          action: 'open_topic',
+          truthMode: 'literal',
+          utterance: '换个轻松的话题吧。',
+          goalEffects: [],
+          relationshipBenefit: 0.2,
+          programValue: 0.4,
+          novelty: 0.6,
+          repetitionCost: 0,
+          interruptionCost: 0,
+          manipulationRisk: 0,
+          factSafetyRisk: 0,
+          socialRisks: [],
+          reasonCodes: ['quiet-room'],
+        },
+      },
+      { eventId: 'event-1', scope },
+    );
+
+    expect(proposal.evidence).toHaveLength(1);
+    expect(proposal.candidates).toHaveLength(1);
+    expect(proposal.candidates[0]).toMatchObject({
+      id: 'open-topic-1',
+      action: 'open-topic',
+    });
+  });
+
   it('builds a causal, non-scenario prompt and keeps credentials out', () => {
     const messages = buildSoulFastMessages(fastRequest());
     const system = SOUL_FAST_SYSTEM_PROMPT.replace(/\s+/gu, ' ');

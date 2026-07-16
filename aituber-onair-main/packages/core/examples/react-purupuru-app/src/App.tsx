@@ -183,6 +183,7 @@ import { evaluateSoulReflectionPolicy } from './lib/soulReflectionPolicy';
 import {
   hasCompleteDeliveryEvidence,
   isLiveHostCoordinatorRequired,
+  resolveAuthoritativeSpeechHints,
   resolveIncompleteDelivery,
 } from './lib/liveHostDelivery';
 
@@ -4781,12 +4782,10 @@ export default function App() {
           const builtSpeechPlan = buildSpeechPlanV2(
             spokenText,
             authoritativeUtterance
-              ? {
-                  ...speechHints,
-                  emotion: 'serious',
-                  delivery: 'serious',
-                  motion: 'serious_report',
-                }
+              ? resolveAuthoritativeSpeechHints(
+                  speechHints,
+                  routing.mode === 'urgent',
+                )
               : speechHints,
           );
           const speechPlan: PreparedSpeechPlan = {
