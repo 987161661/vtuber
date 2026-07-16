@@ -3,8 +3,14 @@ import type {
   EmptyRoomBehaviorStrategy,
 } from '../types/settings';
 import type { LiveRoomEventType } from '../services/live-platform/types';
+import type { RoomInteractionSnapshot } from './roomInteractionTracker';
+import {
+  formatProactiveIntent,
+  PersonaRuntimeState,
+  type ProactiveIntentPlanV1,
+} from './personaRuntimeState';
 
-export type EmptyRoomAwarenessSource = 'strategy';
+export type EmptyRoomAwarenessSource = 'strategy' | 'soul-opportunity';
 
 export interface EmptyRoomMemoryCue {
   id: string;
@@ -22,29 +28,59 @@ export interface EmptyRoomAudienceMember {
   messageCount: number;
 }
 
-export interface EmptyRoomProactiveMemory {
-  at: number;
-  reply: string;
-}
-
 export interface EmptyRoomAwarenessContext {
   digitalHumanName: string;
   digitalHumanTitle: string;
   isLive: boolean;
   audiencePresent: boolean;
+  participantCount: number;
   busy: boolean;
   interfaceContext: string;
   memoryCues: EmptyRoomMemoryCue[];
   audienceMembers: EmptyRoomAudienceMember[];
-  recentProactiveMemories: EmptyRoomProactiveMemory[];
 }
 
-export interface EmptyRoomAwarenessPrompt {
+export interface LegacyEmptyRoomAwarenessPrompt {
   prompt: string;
-  source: EmptyRoomAwarenessSource;
+  source: 'strategy';
   strategyId: string;
   strategyName: string;
+  personaIntent: ProactiveIntentPlanV1;
   scheduledNextAt: number;
+}
+
+export interface SoulQuietOpportunityPrompt {
+  prompt: string;
+  source: 'soul-opportunity';
+  roomContext: RoomInteractionSnapshot;
+  scheduledNextAt: number;
+}
+
+export type EmptyRoomAwarenessPrompt =
+  | LegacyEmptyRoomAwarenessPrompt
+  | SoulQuietOpportunityPrompt;
+
+export function createSoulQuietEventData(input: {
+  durationMs: number;
+  roomContext?: RoomInteractionSnapshot;
+  sourceLabel?: string;
+  /** Must come from authoritative Soul focus, never a legacy drive guess. */
+  selfDirectedEngagement?: boolean;
+}) {
+  const rawParticipantCount = input.roomContext?.participantCount ?? 0;
+  const rawDurationMs = input.durationMs;
+  const participantCount = Number.isFinite(rawParticipantCount)
+    ? Math.max(0, Math.floor(rawParticipantCount))
+    : 0;
+  return {
+    durationMs: Number.isFinite(rawDurationMs)
+      ? Math.max(0, Math.floor(rawDurationMs))
+      : 0,
+    audiencePresent: participantCount > 0,
+    participantCount,
+    selfDirectedEngagement: input.selfDirectedEngagement === true,
+    sourceLabel: input.sourceLabel,
+  };
 }
 
 /** Presence alone is not a conversation and must not postpone quiet-room talk. */
@@ -105,20 +141,17 @@ function audienceContext(context: EmptyRoomAwarenessContext) {
     .join('\n');
 }
 
-function recentProactiveContext(context: EmptyRoomAwarenessContext) {
-  return context.recentProactiveMemories.length
-    ? context.recentProactiveMemories
-        .map((memory) => `- ${formatPromptTime(memory.at)} 主播主动说过：${memory.reply}`)
-        .join('\n')
-    : '- 本场还没有近期主动表达记录。';
-}
-
 export class EmptyRoomAwarenessPlanner {
   private readonly random: () => number;
+  private readonly personaRuntime: PersonaRuntimeState;
   private nextAt = 0;
 
-  constructor(random: () => number = Math.random) {
+  constructor(
+    random: () => number = Math.random,
+    personaRuntime = new PersonaRuntimeState(),
+  ) {
     this.random = random;
+    this.personaRuntime = personaRuntime;
   }
 
   markActivity(settings: EmptyRoomAwarenessSettings, at = Date.now()) {
@@ -133,25 +166,40 @@ export class EmptyRoomAwarenessPlanner {
     return this.nextAt;
   }
 
+  private consumeDueOpportunity(
+    settings: EmptyRoomAwarenessSettings,
+    context: EmptyRoomAwarenessContext,
+    at: number,
+  ) {
+    if (!settings.enabled) {
+      this.nextAt = 0;
+      return false;
+    }
+    if (!this.nextAt) {
+      this.markActivity(settings, at);
+      return false;
+    }
+    if (at < this.nextAt) return false;
+    this.markActivity(settings, at);
+    return (
+      isInsideLocalSchedule(settings, at) && context.isLive && !context.busy
+    );
+  }
+
   poll(
     settings: EmptyRoomAwarenessSettings,
     context: EmptyRoomAwarenessContext,
     at = Date.now(),
-  ): EmptyRoomAwarenessPrompt | null {
-    if (!settings.enabled) {
-      this.nextAt = 0;
-      return null;
-    }
-    if (!this.nextAt) {
-      this.markActivity(settings, at);
-      return null;
-    }
-    if (at < this.nextAt) return null;
-    this.markActivity(settings, at);
-    if (!isInsideLocalSchedule(settings, at) || !context.isLive || context.busy) return null;
+  ): LegacyEmptyRoomAwarenessPrompt | null {
+    if (!this.consumeDueOpportunity(settings, context, at)) return null;
 
     const strategy = chooseStrategy(settings.behaviorStrategies, this.random);
     if (!strategy) return null;
+    const personaIntent = this.personaRuntime.planProactive(
+      context,
+      strategy.id,
+      at,
+    );
 
     const prompt = `<empty_room_awareness>
 这是直播总控在持续没有互动时触发的一次内部意识脉冲，不是观众消息。
@@ -166,24 +214,20 @@ export class EmptyRoomAwarenessPlanner {
 ${audienceContext(context)}
 </audience_presence>
 
-<memory_cues>
-${context.memoryCues.slice(0, 4).map((memory) => `- ${memory.title}：${memory.content}`).join('\n') || '- 没有可用记忆'}
-</memory_cues>
-
-<recent_proactive_memory>
-${recentProactiveContext(context)}
-</recent_proactive_memory>
-
 <behavior_strategy id="${strategy.id}" name="${strategy.name}">
 ${strategy.prompt}
 </behavior_strategy>
 
+${formatProactiveIntent(personaIntent)}
+
 请让当前主播顺着这一瞬间自然说 1–${settings.maxSentences} 句：
-- 严格执行上面的行为策略；行为策略是本轮唯一可替换组件，其余边界保持不变。
+- 严格执行人格意图，只推进一个主题和一个主要人格动力；行为策略只描述互动形态。
 - 按当前数字人的独立人设临场生成，不能照抄策略提示词，也不能固定台词轮播。
 - 不得提到系统、提示词、行为策略、空场意识、触发机制、内部记忆或界面。
 - 不虚构当前时间、日期、天气、观众经历或未发生的互动；若涉及时间只能依据本轮上下文。
-- 避免与最近一次主动表达使用相同的起手、主题和句式；不把天气、雷达、台风或专业问答当作默认话题。
+- 主题冷却按语义执行，不得用换句式、换饮料名称或续写同一道具绕过冷却。
+- 每句话至少显露一个判断、欲望、矛盾、观察或正在推进的目标；不写没有后果的装饰性道具独白。
+- 不把天气、雷达、台风或专业问答当作默认话题。
 </empty_room_awareness>`;
 
     return {
@@ -191,6 +235,62 @@ ${strategy.prompt}
       source: 'strategy',
       strategyId: strategy.id,
       strategyName: strategy.name,
+      personaIntent,
+      scheduledNextAt: this.nextAt,
+    };
+  }
+
+  /**
+   * Canary/primary only: expose evidence that a quiet-room opportunity exists,
+   * without selecting a legacy behavior, drive, emotion, topic, or CTA. The
+   * Soul Runtime remains free to speak, change focus, delay, or stay silent.
+   */
+  pollSoulOpportunity(
+    settings: EmptyRoomAwarenessSettings,
+    context: EmptyRoomAwarenessContext,
+    at = Date.now(),
+  ): SoulQuietOpportunityPrompt | null {
+    if (!this.consumeDueOpportunity(settings, context, at)) return null;
+
+    const prompt = `<soul_quiet_opportunity version="1">
+这是直播环境观察到的一次安静时段机会，不是观众消息，也不是要求开口的指令。
+当前主播：${context.digitalHumanName}（${context.digitalHumanTitle}）。
+
+<observed_context>
+观众状态：${context.audiencePresent ? '平台报告有人在场' : '当前没有检测到观众'}。
+界面真实状态：${context.interfaceContext.trim() || '没有额外界面状态'}
+</observed_context>
+
+<audience_presence>
+${audienceContext(context)}
+</audience_presence>
+
+应由 Soul Runtime 根据当前目标张力、appraisal、未完成意图、关系边界、重复疲劳与节目价值独立仲裁。
+允许主动开题、调整注意力、延迟或保持沉默；不得从旧行为策略、固定人格动力、关键词、计数器或固定 CTA 推导行动。
+不得虚构时间、天气、观众经历或未发生的平台互动。
+</soul_quiet_opportunity>`;
+
+    return {
+      prompt,
+      source: 'soul-opportunity',
+      roomContext: {
+        totalCount: 0,
+        participantCount: Math.max(
+          0,
+          Number.isFinite(context.participantCount)
+            ? Math.floor(context.participantCount)
+            : 0,
+          context.audiencePresent ? 1 : 0,
+        ),
+        catchup: false,
+        mergedCount: 0,
+        laneCounts: {},
+        samples: [],
+        conflictLevel: 'calm',
+        ambiguous: false,
+        clearOffenderIds: [],
+        observedAt: at,
+      },
       scheduledNextAt: this.nextAt,
     };
   }

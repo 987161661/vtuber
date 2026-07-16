@@ -63,6 +63,16 @@ describe('PersonaInteractionPlanner', () => {
     expect(plan.mustAvoid.join(' ')).toContain('清单');
   });
 
+  it('does not classify an ordinary pet-memory question as grief', () => {
+    const plan = planPersonaInteraction(
+      input('记得我的猫叫什么名吗'),
+      LINGLAN_PERSONA_POLICY,
+    );
+
+    expect(plan.scene).not.toBe('grief');
+    expect(plan.deliveryTarget.emotion).not.toBe('sad');
+  });
+
   it('does not call the agent for clear scenes and bounds the dynamic block', () => {
     const clear = planPersonaInteraction(input('好无聊'), LINGLAN_PERSONA_POLICY);
     expect(shouldRequestPersonaAgent(clear)).toBe(false);

@@ -1,14 +1,20 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useState } from 'react';
 
 const LEASE_HEARTBEAT_MS = 3_000;
 
+export interface RuntimeOwnerLeaseState {
+  ownsRuntime: boolean;
+  ownerId: string;
+}
+
 /** Serializes every listener/overlay candidate onto one browser runtime. */
-export function useRuntimeOwnerLease(candidate: boolean): boolean {
+export function useRuntimeOwnerLease(
+  candidate: boolean,
+): RuntimeOwnerLeaseState {
   const [ownsRuntime, setOwnsRuntime] = useState(false);
-  const ownerIdRef = useRef(`runtime-lease-${crypto.randomUUID()}`);
+  const [ownerId] = useState(() => `runtime-lease-${crypto.randomUUID()}`);
 
   useEffect(() => {
-    const ownerId = ownerIdRef.current;
     if (!candidate) {
       queueMicrotask(() => setOwnsRuntime(false));
       return;
@@ -44,7 +50,7 @@ export function useRuntimeOwnerLease(candidate: boolean): boolean {
         body: JSON.stringify({ ownerId }),
       }).catch(() => undefined);
     };
-  }, [candidate]);
+  }, [candidate, ownerId]);
 
-  return ownsRuntime;
+  return { ownsRuntime, ownerId };
 }

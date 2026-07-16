@@ -270,6 +270,8 @@ export {
   // Utils
   textToScreenplay as chatTextToScreenplay,
   screenplayToText as chatScreenplayToText,
+  buildSpeechPlanV2,
+  type SpeechPlanV2BuilderHints,
   EmotionParser as ChatEmotionParser,
 } from '@aituber-onair/chat';
 

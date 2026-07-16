@@ -4,6 +4,7 @@
 export * from './chatServiceHttpClient';
 export * from './streamTextAccumulator';
 export * from './screenplay';
+export * from './speechPlanBuilder';
 export * from './emotionParser';
 export * from './runOnce';
 export * from './openaiCompatibleSse';

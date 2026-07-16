@@ -23,6 +23,10 @@ export type LiveResponseContract = {
 
 export type SkillRoutingDecision = {
   inheritTyphoon: boolean;
+  /** Explicit capability selection; avoids overloading weather with typhoon. */
+  skillIds?: string[];
+  /** Normalized query passed to the selected capability. */
+  skillQuery?: string;
   reason: string;
   mode: 'companion' | 'weather' | 'urgent' | 'variety';
   intent: string;
@@ -125,9 +129,11 @@ export function buildLiveResponseContract(
   // An LLM routing turn, not lexical overlap, decides whether a new message
   // truly asks to continue the previous weather investigation.
   const isFollowUp = routing.inheritTyphoon;
-  const inheritedSkills = routing.inheritTyphoon
-    ? ['typhoon-boss-radar']
-    : [];
+  const inheritedSkills = routing.skillIds?.length
+    ? [...routing.skillIds]
+    : routing.inheritTyphoon
+      ? ['typhoon-boss-radar']
+      : [];
   const preferMultipleBeats = Boolean(
     hasPrimaryQuestion &&
       (isFollowUp ||
@@ -165,7 +171,7 @@ export function buildLiveResponseContract(
     // Route inheritance is carried separately. Keep the viewer's exact words
     // for the skill endpoint because its structured query parser understands
     // terse live-room follow-ups better than an explanatory wrapper.
-    skillQuery: input,
+    skillQuery: routing.skillQuery?.trim() || input,
     preferMultipleBeats,
     hasPrimaryQuestion,
   };

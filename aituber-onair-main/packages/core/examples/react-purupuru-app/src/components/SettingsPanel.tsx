@@ -15,6 +15,9 @@ import type { PuruPuruAvatarPackage } from '../lib/purupuruPackage';
 import type { ChatProviderOption, TTSEngineOption } from '../types/settings';
 import type { useSettings } from '../hooks/useSettings';
 import type { useStreamerMemory } from '../hooks/useStreamerMemory';
+import { fetchMinimaxVoiceOptions } from '../lib/minimaxVoicePreview';
+import { isServerManagedCredential } from '../lib/runtimeSettingsSecurity';
+import { ServerManagedCredentialInput } from './ServerManagedCredentialInput';
 
 type SettingsHook = ReturnType<typeof useSettings>;
 type ScreenVisionController = ReturnType<typeof useScreenVisionController>;
@@ -351,6 +354,21 @@ export function SettingsPanel({
         'none'
       : 'none';
   const openRouterApiKey = getApiKeyForProvider('openrouter').trim();
+  const llmCredentialIsServerManaged = isServerManagedCredential(
+    settings.llm.apiKeys[
+      settings.llm.provider as keyof typeof settings.llm.apiKeys
+    ],
+  );
+  const isMiniMaxLlmGateway =
+    settings.llm.provider === 'openai-compatible' &&
+    (/minimax/iu.test(settings.llm.model) ||
+      settings.llm.endpoint?.includes('/api/minimax-chat'));
+  const llmCredentialConfigured =
+    llmCredentialIsServerManaged ||
+    Boolean(getApiKeyForProvider(settings.llm.provider).trim());
+  const minimaxCredentialIsServerManaged = isServerManagedCredential(
+    settings.tts.minimaxApiKey,
+  );
   const openRouterDynamicFreeModels =
     settings.llm.openRouterDynamicFreeModels?.models || [];
   const openRouterFetchedAt =
@@ -464,7 +482,7 @@ export function SettingsPanel({
     updateTTSSpeaker,
   ]);
 
-  // Fetch MiniMax speaker list after API key is entered
+  // Fetch MiniMax speaker list through the same-origin credential gateway.
   useEffect(() => {
     if (settings.tts.engine !== 'minimax') {
       return;
@@ -481,42 +499,10 @@ export function SettingsPanel({
     const fetchMinimaxVoices = async () => {
       setIsFetchingMinimaxVoices(true);
       try {
-        const response = await fetch('https://api.minimaxi.com/v1/get_voice', {
-          method: 'POST',
-          headers: {
-            Authorization: `Bearer ${apiKey}`,
-            'Content-Type': 'application/json',
-          },
-          body: JSON.stringify({ voice_type: 'all' }),
+        const voices = await fetchMinimaxVoiceOptions(apiKey, {
           signal: controller.signal,
         });
-
-        if (!response.ok) {
-          throw new Error(`HTTP ${response.status}`);
-        }
-
-        const payload = (await response.json()) as {
-          base_resp?: { status_code?: number; status_msg?: string };
-          system_voice?: MinimaxVoice[];
-          voice_cloning?: MinimaxVoice[];
-          voice_generation?: MinimaxVoice[];
-        };
         if (controller.signal.aborted) return;
-
-        if (payload.base_resp && payload.base_resp.status_code !== 0) {
-          throw new Error(
-            payload.base_resp.status_msg || 'MiniMax API 返回错误',
-          );
-        }
-
-        const voices = [
-          ...(payload.system_voice || []),
-          ...(payload.voice_cloning || []),
-          ...(payload.voice_generation || []),
-        ].map((voice) => ({
-          voice_id: voice.voice_id,
-          voice_name: voice.voice_name || voice.voice_id,
-        }));
         setMinimaxVoices(voices);
         setFetchError('');
 
@@ -937,24 +923,40 @@ export function SettingsPanel({
                 <div className="settings-field">
                   <label htmlFor="llm-apikey">
                     API 密钥（{settings.llm.provider}）
-                    {settings.llm.provider === 'openai-compatible'
+                    {settings.llm.provider === 'openai-compatible' &&
+                    !isMiniMaxLlmGateway
                       ? '（可选）'
                       : ''}
                   </label>
-                  <input
+                  <ServerManagedCredentialInput
+                    key={settings.llm.provider}
                     id="llm-apikey"
-                    type="password"
                     value={getApiKeyForProvider(settings.llm.provider)}
+                    isServerManaged={llmCredentialIsServerManaged}
                     onChange={(e) =>
-                      updateLLMApiKey(settings.llm.provider, e.target.value)
+                      updateLLMApiKey(settings.llm.provider, e)
                     }
                     placeholder={
-                      settings.llm.provider === 'openai-compatible'
+                      isMiniMaxLlmGateway
+                        ? '必填：请输入原 MiniMax API key'
+                        : settings.llm.provider === 'openai-compatible'
                         ? '仅在服务要求时填写'
                         : 'XXX-...'
                     }
                     disabled={disabled}
                   />
+                  {llmCredentialIsServerManaged && (
+                    <p className="settings-field-hint">
+                      密钥由本机服务托管，浏览器仅显示固定遮罩。
+                    </p>
+                  )}
+                  {isMiniMaxLlmGateway && !llmCredentialConfigured && (
+                    <p className="settings-field-hint">
+                      当前服务端没有 MiniMax 凭据，模型生成会以
+                      generation_auth_failed 终止。重新输入原 key
+                      即可，不需要轮换。
+                    </p>
+                  )}
                 </div>
               )}
           </>
@@ -2131,14 +2133,19 @@ export function SettingsPanel({
               <>
                 <div className="settings-field">
                   <label htmlFor="tts-minimax-apikey">API 密钥</label>
-                  <input
+                  <ServerManagedCredentialInput
                     id="tts-minimax-apikey"
-                    type="password"
                     value={settings.tts.minimaxApiKey || ''}
-                    onChange={(e) => updateMinimaxApiKey(e.target.value)}
+                    isServerManaged={minimaxCredentialIsServerManaged}
+                    onChange={updateMinimaxApiKey}
                     placeholder="请输入 MiniMax API 密钥"
                     disabled={disabled}
                   />
+                  {minimaxCredentialIsServerManaged && (
+                    <p className="settings-field-hint">
+                      Chat/TTS 共用同一个服务端密钥，浏览器不保存原文。
+                    </p>
+                  )}
                 </div>
                 <div className="settings-field">
                   <label htmlFor="tts-minimax-groupid">
@@ -2171,7 +2178,8 @@ export function SettingsPanel({
                     {!settings.tts.minimaxApiKey && (
                       <option value="">输入 API 密钥后获取音色列表</option>
                     )}
-                    {settings.tts.minimaxApiKey && isFetchingMinimaxVoices && (
+                    {settings.tts.minimaxApiKey &&
+                      isFetchingMinimaxVoices && (
                       <option value="">正在获取音色列表……</option>
                     )}
                     {settings.tts.minimaxApiKey &&

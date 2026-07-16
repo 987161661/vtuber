@@ -27,6 +27,13 @@ import type {
   VisualSettings,
 } from '../types/settings';
 import { createPlatformConnection } from '../services/live-platform/connectors';
+import {
+  discardRuntimeCredentialsForBrowser,
+  mergeBrowserOnlyCredentialsAfterPublish,
+  resolveBrowserCredential,
+  sanitizeRuntimeSettingsForBrowser,
+  sanitizeRuntimeSettingsForBrowserStorage,
+} from '../lib/runtimeSettingsSecurity';
 
 type ApiKeyProvider = Exclude<ChatProviderOption, 'gemini-nano'>;
 
@@ -132,58 +139,10 @@ function normalizeEmptyRoomBehaviorStrategies(
   return strategies.slice(0, 12);
 }
 
-function preferLocalCredential(
-  localValue: string | undefined,
-  remoteValue: string | undefined,
-): string {
-  // A listener can safely inherit non-secret runtime settings, but an empty
-  // producer snapshot must never erase a working credential stored by the
-  // browser actually responsible for playback.
-  return localValue?.trim() ? localValue : remoteValue || '';
-}
-
-function retainLocalTtsCredentials(
-  remote: AppSettings,
-  local: AppSettings,
-): AppSettings {
-  return {
-    ...remote,
-    tts: {
-      ...remote.tts,
-      openAiCompatibleApiKey: preferLocalCredential(
-        local.tts.openAiCompatibleApiKey,
-        remote.tts.openAiCompatibleApiKey,
-      ),
-      aivisCloudApiKey: preferLocalCredential(
-        local.tts.aivisCloudApiKey,
-        remote.tts.aivisCloudApiKey,
-      ),
-      minimaxApiKey: preferLocalCredential(
-        local.tts.minimaxApiKey,
-        remote.tts.minimaxApiKey,
-      ),
-      minimaxGroupId: preferLocalCredential(
-        local.tts.minimaxGroupId,
-        remote.tts.minimaxGroupId,
-      ),
-      unrealSpeechApiKey: preferLocalCredential(
-        local.tts.unrealSpeechApiKey,
-        remote.tts.unrealSpeechApiKey,
-      ),
-      elevenLabsApiKey: preferLocalCredential(
-        local.tts.elevenLabsApiKey,
-        remote.tts.elevenLabsApiKey,
-      ),
-      inworldApiKey: preferLocalCredential(
-        local.tts.inworldApiKey,
-        remote.tts.inworldApiKey,
-      ),
-      gradiumApiKey: preferLocalCredential(
-        local.tts.gradiumApiKey,
-        remote.tts.gradiumApiKey,
-      ),
-    },
-  };
+function browserRuntimeOrigin(): string {
+  return typeof window !== 'undefined' && window.location?.origin
+    ? window.location.origin
+    : 'http://127.0.0.1';
 }
 const LEGACY_LINGLAN_DESCRIPTION =
   '台风监测主播 · MiniMax · SoulX-FlashHead Lite';
@@ -384,6 +343,11 @@ function getDefaultSettings(): AppSettings {
         },
       ],
     },
+    soul: {
+      // New cognition starts as an observer. Public behaviour changes only
+      // after the shadow acceptance ledger is explicitly promoted.
+      runtimeMode: 'shadow',
+    },
     llm: {
       provider: 'openai',
       model: 'gpt-4.1-nano',
@@ -570,11 +534,23 @@ function getDefaultSettings(): AppSettings {
   };
 }
 
-function loadSettings(): AppSettings {
+function loadSettings(allowTransientCredentialMigration = false): AppSettings {
   try {
     const raw = localStorage.getItem(STORAGE_KEY);
     if (raw) {
-      const saved = JSON.parse(raw) as Partial<AppSettings>;
+      const parsed = JSON.parse(raw) as Partial<AppSettings>;
+      const browserSafe = sanitizeRuntimeSettingsForBrowserStorage(
+        parsed,
+        browserRuntimeOrigin(),
+      );
+      const browserSafeSerialized = JSON.stringify(browserSafe);
+      if (browserSafeSerialized !== raw) {
+        // Synchronous migration: a legacy raw credential is removed before
+        // React mounts. A producer may retain the parsed value only long
+        // enough to hand it to the local server once.
+        localStorage.setItem(STORAGE_KEY, browserSafeSerialized);
+      }
+      const saved = allowTransientCredentialMigration ? parsed : browserSafe;
       const defaults = getDefaultSettings();
       const tts = { ...defaults.tts, ...saved.tts };
       if (
@@ -723,6 +699,13 @@ function loadSettings(): AppSettings {
       }
       return {
         digitalHumans,
+        soul: {
+          runtimeMode: ['legacy', 'shadow', 'canary', 'primary'].includes(
+            String(saved.soul?.runtimeMode),
+          )
+            ? saved.soul!.runtimeMode
+            : defaults.soul.runtimeMode,
+        },
         llm: {
           ...defaults.llm,
           ...saved.llm,
@@ -812,7 +795,15 @@ function loadSettings(): AppSettings {
 }
 
 function saveSettings(settings: AppSettings) {
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(settings));
+  localStorage.setItem(
+    STORAGE_KEY,
+    JSON.stringify(
+      sanitizeRuntimeSettingsForBrowserStorage(
+        settings,
+        browserRuntimeOrigin(),
+      ),
+    ),
+  );
 }
 
 type RuntimeSettingsRole = 'producer' | 'consumer' | 'standalone';
@@ -836,7 +827,9 @@ function isRuntimeSettingsEnvelope(value: unknown): value is RuntimeSettingsEnve
 }
 
 export function useSettings(runtimeRole: RuntimeSettingsRole = 'standalone') {
-  const [settings, setSettings] = useState<AppSettings>(loadSettings);
+  const [settings, setSettings] = useState<AppSettings>(() =>
+    loadSettings(runtimeRole === 'producer'),
+  );
   const [openRouterRefreshError, setOpenRouterRefreshError] = useState('');
   const [
     isRefreshingOpenRouterFreeModels,
@@ -861,19 +854,74 @@ export function useSettings(runtimeRole: RuntimeSettingsRole = 'standalone') {
     return [DEFAULT_OPENAI_COMPATIBLE_MODEL];
   }, [settings.llm.provider, settings.llm.model, openRouterDynamicModels]);
 
-  // Persist settings on change
+  // Browser persistence is always public. A producer can transiently hold a
+  // newly entered credential only until this same-origin handoff completes.
   useEffect(() => {
     saveSettings(settings);
-    if (runtimeRole === 'producer') {
-      void fetch('/api/runtime-settings', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'X-Runtime-Settings-Role': 'producer',
-        },
-        body: JSON.stringify(settings),
-      }).catch(() => undefined);
-    }
+    if (runtimeRole !== 'producer') return;
+
+    let cancelled = false;
+    const publish = async () => {
+      let publishedSettings: AppSettings | null = null;
+      let accepted = false;
+      try {
+        const response = await fetch('/api/runtime-settings', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'X-Runtime-Settings-Role': 'producer',
+          },
+          body: JSON.stringify(settings),
+        });
+        accepted = response.ok;
+        if (response.ok && response.status !== 204) {
+          const payload: unknown = await response.json();
+          if (isRuntimeSettingsEnvelope(payload)) {
+            publishedSettings = payload.settings;
+          }
+        }
+        if (response.ok && !publishedSettings) {
+          const snapshotResponse = await fetch('/api/runtime-settings', {
+            cache: 'no-store',
+          });
+          if (snapshotResponse.ok) {
+            const payload: unknown = await snapshotResponse.json();
+            if (isRuntimeSettingsEnvelope(payload)) {
+              publishedSettings = payload.settings;
+            }
+          }
+        }
+      } catch {
+        // Fail closed below: a key that was not accepted by the local server
+        // is discarded from browser state and must be entered again.
+      }
+
+      if (cancelled) return;
+      const publicSettings = accepted
+        ? (sanitizeRuntimeSettingsForBrowser(
+            publishedSettings ?? settings,
+            browserRuntimeOrigin(),
+          ) as AppSettings)
+        : discardRuntimeCredentialsForBrowser(settings);
+      const browserState = accepted
+        ? mergeBrowserOnlyCredentialsAfterPublish(publicSettings, settings)
+        : publicSettings;
+      setSettings((current) =>
+        JSON.stringify(current) === JSON.stringify(browserState)
+          ? current
+          : browserState,
+      );
+    };
+
+    // Avoid publishing every partial character while an operator types or
+    // pastes a replacement credential.
+    const timer = window.setTimeout(() => {
+      void publish();
+    }, 500);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
   }, [runtimeRole, settings]);
 
   useEffect(() => {
@@ -884,11 +932,7 @@ export function useSettings(runtimeRole: RuntimeSettingsRole = 'standalone') {
     const applySnapshot = (envelope: RuntimeSettingsEnvelope) => {
       if (cancelled || envelope.revision <= latestRevision) return;
       latestRevision = envelope.revision;
-      const local = loadSettings();
-      const runtimeSettings: AppSettings = retainLocalTtsCredentials(
-        envelope.settings,
-        local,
-      );
+      const runtimeSettings = envelope.settings;
       const normalizedRuntimeSettings: AppSettings = {
         ...runtimeSettings,
         visual: {
@@ -898,7 +942,7 @@ export function useSettings(runtimeRole: RuntimeSettingsRole = 'standalone') {
           avatarViewScale: 1,
         },
       };
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(normalizedRuntimeSettings));
+      saveSettings(normalizedRuntimeSettings);
       setSettings(loadSettings());
     };
     const sync = async () => {
@@ -2103,12 +2147,24 @@ export function useSettings(runtimeRole: RuntimeSettingsRole = 'standalone') {
     [],
   );
 
+  const updateSoulRuntimeMode = useCallback(
+    (runtimeMode: AppSettings['soul']['runtimeMode']) => {
+      setSettings((prev) => ({
+        ...prev,
+        soul: { runtimeMode },
+      }));
+    },
+    [],
+  );
+
   const getApiKeyForProvider = useCallback(
     (provider: ChatProviderOption): string => {
       if (provider === 'gemini-nano') {
         return '';
       }
-      return settings.llm.apiKeys[provider as ApiKeyProvider] || '';
+      return resolveBrowserCredential(
+        settings.llm.apiKeys[provider as ApiKeyProvider],
+      );
     },
     [settings.llm.apiKeys],
   );
@@ -2202,6 +2258,7 @@ export function useSettings(runtimeRole: RuntimeSettingsRole = 'standalone') {
     updateManneriInterventionCooldownMs,
     updateManneriMinMessageLength,
     updateEmptyRoomAwareness,
+    updateSoulRuntimeMode,
     getApiKeyForProvider,
   };
 }

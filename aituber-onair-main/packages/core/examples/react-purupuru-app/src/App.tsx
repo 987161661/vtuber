@@ -25,6 +25,16 @@ import { useTwitchComments } from './hooks/useTwitchComments';
 import { useYoutubeComments } from './hooks/useYoutubeComments';
 import { digitalHumanAvatarStore } from './lib/digitalHumanAvatarStore';
 import {
+  isCityReportEngagementPayload,
+  normalizeCityReportEngagementPayload,
+} from './lib/cityReportEngagementPolicy';
+import {
+  hasSoulPrimaryEvidence,
+  type AcceptanceFingerprint,
+  type AcceptanceLedger,
+} from './lib/acceptanceLedger';
+import {
+  createSoulQuietEventData,
   EmptyRoomAwarenessPlanner,
   isQuietRoomInteraction,
 } from './lib/emptyRoomAwareness';
@@ -52,6 +62,7 @@ import {
 } from './lib/radarCityBridge';
 import {
   getWeatherLocationClarification,
+  routeSoulSkillDeterministically,
   routeTyphoonSkillWithAgent,
 } from './lib/skillRoutingAgent';
 import {
@@ -62,10 +73,16 @@ import {
 import { refinePersonaPlanWithAgent } from './lib/personaPlanningAgent';
 import { LINGLAN_PERSONA_POLICY } from './lib/linglanPersonaPolicy';
 import {
+  PersonaRuntimeState,
+  type PersonaRuntimeTransition,
+  type ProactiveIntentPlanV1,
+} from './lib/personaRuntimeState';
+import {
   buildViewerEntryWelcomePrompt,
   shouldWelcomeViewerEntry,
 } from './lib/viewerEntryWelcome';
 import { previewMinimaxVoice } from './lib/minimaxVoicePreview';
+import { guardViewerResponse } from './lib/responseGuard';
 import type { PuruPuruAvatarPackage } from './lib/purupuruPackage';
 import { loadPuruPuruPackage } from './lib/purupuruPackage';
 import type {
@@ -108,6 +125,14 @@ import {
   buildLiveRoomTranscript,
   mergeRecentLiveTurns,
 } from './lib/liveConversationContext';
+import {
+  ROOM_ACTOR_ID,
+  appendConversationHistoryScopeQuery,
+  classifyLegacyMemoryMigration,
+  classifyLegacyRelationshipMigration,
+  type ConversationDeliveryStatus,
+  type ConversationHistoryScope,
+} from './lib/conversationHistory';
 import type { LiveLifecycleTransition } from './lib/liveResponseScheduler';
 import type { RoomInteractionSnapshot } from './lib/roomInteractionTracker';
 import {
@@ -122,6 +147,44 @@ import {
   createAvatarBehaviorEvent,
   type AvatarAction,
 } from '@aituber-onair/live-companion';
+import {
+  buildSpeechPlanV2,
+  type SpeechPlanV2BuilderHints,
+} from '@aituber-onair/core';
+import type {
+  CanonRevisionV1,
+  SoulEventKind,
+  SoulOutcomeStatus,
+  SoulScopeV1,
+  SubjectiveFactV1,
+  SubjectiveMemoryRefV1,
+} from '@aituber-onair/soul';
+import {
+  LINGLAN_SOUL_CONSTITUTION,
+  LINGLAN_SOUL_PROFILE,
+  createLinglanSoulEvent,
+  speechPlanHintsForSoulDecision,
+} from './lib/linglanSoul';
+import { BrowserSoulRuntimeSession } from './lib/soulRuntimeClient';
+import {
+  projectSoulEvaluation,
+  projectSoulState,
+  type SoulInspectorTraceV1,
+} from './lib/soulInspectorProjection';
+import {
+  requestSoulReflection,
+  type SoulReflectionLedgerSummaryV1,
+} from './lib/soulReflectionClient';
+import {
+  SoulCanonRepository,
+  type SoulCanonProjectionV1,
+} from './lib/soulCanonRepository';
+import { evaluateSoulReflectionPolicy } from './lib/soulReflectionPolicy';
+import {
+  hasCompleteDeliveryEvidence,
+  isLiveHostCoordinatorRequired,
+  resolveIncompleteDelivery,
+} from './lib/liveHostDelivery';
 
 type AvatarPackageSource = 'default' | 'user';
 const EMPTY_STRESS_RUN: StressRunState = {
@@ -134,12 +197,183 @@ const EMPTY_STRESS_RUN: StressRunState = {
 };
 type StressApiRecord = Record<string, unknown>;
 
+type SoulCanaryActiveSummary = {
+  runId: string;
+  scope: SoulScopeV1;
+  startedAt: number;
+  runtimeOwnerClaimedAt?: number;
+};
+
+type SoulCanaryOperatorCredential = SoulCanaryActiveSummary & {
+  version: 1;
+  operatorToken: string;
+};
+
+type SoulCanaryRuntimeCredential = SoulCanaryActiveSummary & {
+  eventToken: string;
+  ownerId: string;
+};
+
+const SOUL_CANARY_OPERATOR_SESSION_KEY =
+  'aituber:soul-canary-operator:v1';
+const SOUL_CANARY_MIN_DURATION_MS = 2 * 60 * 60_000;
+
+function sameSoulScope(left: SoulScopeV1, right: SoulScopeV1): boolean {
+  return (
+    left.personaId === right.personaId &&
+    left.platform === right.platform &&
+    left.roomId === right.roomId &&
+    left.sessionId === right.sessionId
+  );
+}
+
+function readSoulCanaryOperatorCredential(): SoulCanaryOperatorCredential | null {
+  try {
+    const parsed = JSON.parse(
+      sessionStorage.getItem(SOUL_CANARY_OPERATOR_SESSION_KEY) || 'null',
+    ) as Partial<SoulCanaryOperatorCredential> | null;
+    if (
+      parsed?.version !== 1 ||
+      typeof parsed.runId !== 'string' ||
+      typeof parsed.operatorToken !== 'string' ||
+      !/^[a-f0-9]{64}$/u.test(parsed.operatorToken) ||
+      typeof parsed.startedAt !== 'number' ||
+      !parsed.scope ||
+      typeof parsed.scope.personaId !== 'string' ||
+      typeof parsed.scope.platform !== 'string' ||
+      typeof parsed.scope.roomId !== 'string' ||
+      typeof parsed.scope.sessionId !== 'string'
+    ) {
+      return null;
+    }
+    return parsed as SoulCanaryOperatorCredential;
+  } catch {
+    return null;
+  }
+}
+
+function persistSoulCanaryOperatorCredential(
+  credential: SoulCanaryOperatorCredential | null,
+): void {
+  try {
+    if (credential) {
+      sessionStorage.setItem(
+        SOUL_CANARY_OPERATOR_SESSION_KEY,
+        JSON.stringify(credential),
+      );
+    } else {
+      sessionStorage.removeItem(SOUL_CANARY_OPERATOR_SESSION_KEY);
+    }
+  } catch {
+    // A private browsing/storage failure must not weaken server validation.
+  }
+}
+
 function scopedViewerId(
   viewerId?: string,
   platform?: string,
 ): string | undefined {
   if (!viewerId) return undefined;
   return `${platform?.trim() || 'unknown'}:${viewerId}`;
+}
+
+function getOrCreateSoulSessionId(
+  personaId: string,
+  platform: string,
+  roomId: string,
+): string {
+  const storageKey = `aituber:soul-session:${personaId}:${platform}:${roomId}`;
+  try {
+    const existing = localStorage.getItem(storageKey)?.trim();
+    if (existing) return existing;
+    const created = `soul-session:${crypto.randomUUID()}`;
+    localStorage.setItem(storageKey, created);
+    return created;
+  } catch {
+    return `soul-session:${crypto.randomUUID()}`;
+  }
+}
+
+function soulEvidenceLevel(options: {
+  testRunId?: string;
+  sourceLabel?: string;
+  sourcesSeen?: string[];
+}) {
+  const sources = [options.sourceLabel, ...(options.sourcesSeen ?? [])]
+    .filter(Boolean)
+    .join(' ')
+    .toLowerCase();
+  if (options.testRunId || /simulator|stress|synthetic/u.test(sources)) {
+    return 'synthetic' as const;
+  }
+  if (/bilibili|douyin|youtube|twitch|ordinaryroad/u.test(sources)) {
+    return 'production' as const;
+  }
+  return 'production-equivalent' as const;
+}
+
+function soulEventKindForTurn(
+  isProactive: boolean,
+  engagementSignals?: OperatorQueueItem['engagementSignals'],
+): SoulEventKind {
+  if (isProactive) return 'silence-tick';
+  if (engagementSignals?.includes('follow')) return 'follow';
+  if (engagementSignals?.includes('like')) return 'like-batch';
+  if (
+    engagementSignals?.some((signal) =>
+      ['gift', 'superchat', 'guard'].includes(signal),
+    )
+  ) {
+    return 'gift';
+  }
+  return 'audience-message';
+}
+
+function canaryOwnsSoulTurn(
+  isProactive: boolean,
+  engagementSignals: OperatorQueueItem['engagementSignals'] | undefined,
+  moderation: string,
+): boolean {
+  return (
+    isProactive ||
+    Boolean(engagementSignals?.length) ||
+    moderation === 'boundary' ||
+    moderation === 'local_mute'
+  );
+}
+
+function boundedSoulFactContent(value: unknown): string {
+  if (typeof value === 'string') return value.trim().slice(0, 1_200);
+  try {
+    return JSON.stringify(value).slice(0, 1_200);
+  } catch {
+    return String(value).slice(0, 1_200);
+  }
+}
+
+function soulCanonMemoryRefs(
+  revisions: readonly CanonRevisionV1[],
+  actorId?: string,
+): SubjectiveMemoryRefV1[] {
+  return [...revisions]
+    .filter(
+      (revision) =>
+        revision.status === 'active' &&
+        (revision.involvesViewerIds.length === 0 ||
+          (actorId !== undefined &&
+            revision.involvesViewerIds.includes(actorId))),
+    )
+    .sort(
+      (left, right) =>
+        right.updatedAt - left.updatedAt || left.id.localeCompare(right.id),
+    )
+    .slice(0, 6)
+    .map((revision) => ({
+      id: revision.id,
+      content: `[character-canon; realityClass=${revision.realityClass}; disclose this class literally if asked whether it happened in the physical world] ${revision.content}`,
+      provenance: `character-canon:${revision.realityClass}:${revision.contentHash}`,
+      confidence: 1,
+    }));
 }
 
 function parseStressDiagnostics(value: unknown): StressRunState['diagnostics'] {
@@ -193,6 +427,25 @@ type ActiveLifecycle = ConversationOrigin & {
   testRunId?: string;
   stepId?: string;
   scenarioId?: string;
+};
+type PendingPersonaRuntimeCommit = {
+  interaction?: PersonaRuntimeTransition;
+  proactive?: ProactiveIntentPlanV1;
+};
+type PendingDeliveredInteraction = {
+  input: string;
+  reply: string;
+  eventId: string;
+  viewerId?: string;
+  viewerName?: string;
+  source?: 'chat' | 'live' | 'vision';
+  sourceLabel?: string;
+  sourcesSeen?: string[];
+};
+type PendingGenerationFailure = {
+  reason: 'generation_auth_failed' | 'generation_truncated' | 'generation_failed';
+  error: string;
+  retryable: boolean;
 };
 type ReplyLatencyTrace = {
   requestId: string;
@@ -338,7 +591,10 @@ async function getAudioPlaybackTimeoutMs(arrayBuffer: ArrayBuffer) {
 
 export default function App() {
   const query = new URLSearchParams(window.location.search);
-  const hostCoordinatorV2Enabled = query.get('hostCoordinatorV2') !== '0';
+  // The coordinator owns every public speech turn. This is intentionally not
+  // derived from URL/settings state; `?hostCoordinatorV2=0` is no longer an
+  // execution bypass.
+  const hostCoordinatorV2Enabled = isLiveHostCoordinatorRequired();
   const speechPlanV2Enabled = query.get('speechPlanV2') !== '0';
   const personaPlannerEnabled = query.get('personaPlanner') !== '0';
   // Affine reactions are useful for renderer diagnostics, but they are not a
@@ -346,6 +602,49 @@ export default function App() {
   const debugAffineAvatarMotion = query.get('debugAffineAvatarMotion') === '1';
   const isObsOverlay = query.get('overlay') === '1';
   const settingsHook = useSettings(isObsOverlay ? 'consumer' : 'producer');
+  const requestedSoulMode = query.get('soulMode');
+  const configuredSoulRuntimeMode =
+    requestedSoulMode === 'legacy' ||
+    requestedSoulMode === 'shadow' ||
+    requestedSoulMode === 'canary' ||
+    requestedSoulMode === 'primary'
+      ? requestedSoulMode
+      : settingsHook.settings.soul.runtimeMode;
+  const [soulPrimaryGatePassed, setSoulPrimaryGatePassed] = useState(false);
+  const refreshSoulPrimaryGate = useCallback(async () => {
+    const response = await fetch('/api/acceptance-ledger', {
+      cache: 'no-store',
+    });
+    if (!response.ok) return false;
+    const ledger = (await response.json()) as AcceptanceLedger & {
+      currentFingerprint?: AcceptanceFingerprint;
+      primaryEligible?: boolean;
+    };
+    const passed =
+      ledger.primaryEligible === true &&
+      hasSoulPrimaryEvidence(ledger, ledger.currentFingerprint);
+    setSoulPrimaryGatePassed(passed);
+    return passed;
+  }, []);
+  useEffect(() => {
+    let cancelled = false;
+    void refreshSoulPrimaryGate()
+      .then((passed) => {
+        if (!cancelled) setSoulPrimaryGatePassed(passed);
+      })
+      .catch(() => undefined);
+    return () => {
+      cancelled = true;
+    };
+  }, [refreshSoulPrimaryGate]);
+  const soulRuntimeMode =
+    configuredSoulRuntimeMode === 'primary' && !soulPrimaryGatePassed
+      ? 'canary'
+      : configuredSoulRuntimeMode;
+  const soulPublicBehaviorEnabled =
+    (soulRuntimeMode === 'canary' || soulRuntimeMode === 'primary') &&
+    settingsHook.settings.digitalHumans.activeId ===
+      LINGLAN_SOUL_CONSTITUTION.personaId;
   const activeBroadcastPolicy = useMemo(
     () => ({
       quietThresholdMs: settingsHook.settings.emptyRoomAwareness.minIntervalMs,
@@ -360,12 +659,13 @@ export default function App() {
       settingsHook.settings.emptyRoomAwareness.proactiveCooldownMs,
     ],
   );
-  const { dispatch: dispatchLiveHostEvent, snapshot: liveHostSnapshot } =
-    useLiveHostCoordinator(hostCoordinatorV2Enabled, activeBroadcastPolicy);
   const [isTemporaryStressOwner, setIsTemporaryStressOwner] = useState(false);
   const isLiveRuntimeCandidate =
     isObsOverlay || query.get('listener') === '1' || isTemporaryStressOwner;
-  const isLiveRuntimeOwner = useRuntimeOwnerLease(isLiveRuntimeCandidate);
+  const {
+    ownsRuntime: isLiveRuntimeOwner,
+    ownerId: runtimeOwnerId,
+  } = useRuntimeOwnerLease(isLiveRuntimeCandidate);
   // FlashHead is the production audio-driven avatar renderer. Set
   // ?avatar=purupuru to disable rendered speaking video for troubleshooting.
   const useSpeakingAvatar = query.get('avatar') !== 'purupuru';
@@ -387,6 +687,27 @@ export default function App() {
     isSpeaking,
     smoothedValue,
   } = useAudioLipsync();
+
+  useEffect(() => {
+    const unlockFromUserGesture = () => {
+      void unlock().catch(() => undefined);
+    };
+    // Some control-room inputs (for example the embedded radar console) hand
+    // their event to the runtime through a local bridge. By the time the
+    // runtime receives it, the original click is no longer on the call stack
+    // and Web Audio cannot be resumed. Capture any genuine operator gesture at
+    // the window boundary so later live comments can use the already-running
+    // shared AudioContext.
+    window.addEventListener('pointerdown', unlockFromUserGesture, {
+      capture: true,
+      passive: true,
+    });
+    window.addEventListener('keydown', unlockFromUserGesture, true);
+    return () => {
+      window.removeEventListener('pointerdown', unlockFromUserGesture, true);
+      window.removeEventListener('keydown', unlockFromUserGesture, true);
+    };
+  }, [unlock]);
   const {
     items: interactionEvents,
     record: recordInteraction,
@@ -394,11 +715,17 @@ export default function App() {
     summary: interactionSummary,
   } = useInteractionFeed();
   const [operatorQueue, setOperatorQueue] = useState<OperatorQueueItem[]>([]);
+  const operatorQueueRef = useRef<OperatorQueueItem[]>([]);
+  operatorQueueRef.current = operatorQueue;
   const [stressRun, setStressRun] = useState<StressRunState>(EMPTY_STRESS_RUN);
   const recentLiveTurnsRef = useRef<RecentLiveTurn[]>([]);
   const processingLiveEventIdsRef = useRef(new Set<string>());
   const radarCityCommandRouterRef = useRef(createRadarCityCommandRouter());
   const preparingOperatorTaskRef = useRef<string | null>(null);
+  const generationFailureByEventIdRef = useRef(
+    new Map<string, PendingGenerationFailure>(),
+  );
+  const generationFailureQueueMutationRef = useRef(new Set<string>());
   const speakingOperatorTaskRef = useRef<string | null>(null);
   const runtimeOwnerIdRef = useRef(`runtime-${crypto.randomUUID()}`);
   const operatorPlaybackObservedRef = useRef(false);
@@ -425,6 +752,204 @@ export default function App() {
         : LINGLAN_PROFILE,
     [activeDigitalHuman],
   );
+  const soulScope = useMemo<SoulScopeV1>(() => {
+    const platform =
+      settingsHook.settings.stream.platform === 'none'
+        ? 'local'
+        : settingsHook.settings.stream.platform;
+    const roomId =
+      settingsHook.settings.stream.youtubeLiveId.trim() ||
+      settingsHook.settings.stream.twitchChannel.trim() ||
+      settingsHook.settings.socialStream.sessionId.trim() ||
+      'default-room';
+    return {
+      personaId: runtimeProfile.id,
+      platform,
+      roomId,
+      sessionId: getOrCreateSoulSessionId(runtimeProfile.id, platform, roomId),
+    };
+  }, [
+    runtimeProfile.id,
+    settingsHook.settings.socialStream.sessionId,
+    settingsHook.settings.stream.platform,
+    settingsHook.settings.stream.twitchChannel,
+    settingsHook.settings.stream.youtubeLiveId,
+  ]);
+  const conversationHistoryScopeFor = useCallback(
+    (viewerId?: string, eventPlatform?: string): ConversationHistoryScope => {
+      const scopedViewerId = viewerId?.trim() || ROOM_ACTOR_ID;
+      const platform = eventPlatform?.trim() || soulScope.platform;
+      const roomId =
+        platform === 'youtube'
+          ? settingsHook.settings.stream.youtubeLiveId.trim() ||
+            soulScope.roomId
+          : platform === 'twitch'
+            ? settingsHook.settings.stream.twitchChannel.trim() ||
+              soulScope.roomId
+            : platform === soulScope.platform
+              ? soulScope.roomId
+              : settingsHook.settings.socialStream.sessionId.trim() ||
+                'default-room';
+      const sessionId =
+        platform === soulScope.platform && roomId === soulScope.roomId
+          ? soulScope.sessionId
+          : getOrCreateSoulSessionId(soulScope.personaId, platform, roomId);
+      return {
+        personaId: soulScope.personaId,
+        platform,
+        roomId,
+        sessionId,
+        actorId: scopedViewerId,
+        viewerId: scopedViewerId,
+      };
+    },
+    [
+      settingsHook.settings.socialStream.sessionId,
+      settingsHook.settings.stream.twitchChannel,
+      settingsHook.settings.stream.youtubeLiveId,
+      soulScope,
+    ],
+  );
+  const liveHostScope = useMemo(
+    () => ({
+      profileId: soulScope.personaId,
+      sessionId: soulScope.sessionId,
+      streamId: `${soulScope.platform}:${soulScope.roomId}`,
+    }),
+    [soulScope],
+  );
+  const soulScopeKey = `${soulScope.personaId}\u0000${soulScope.platform}\u0000${soulScope.roomId}\u0000${soulScope.sessionId}`;
+  const [soulCanaryOperatorCredential, setSoulCanaryOperatorCredential] =
+    useState<SoulCanaryOperatorCredential | null>(() =>
+      readSoulCanaryOperatorCredential(),
+    );
+  const [activeSoulCanary, setActiveSoulCanary] =
+    useState<SoulCanaryActiveSummary | null>(null);
+  const [soulCanaryBusy, setSoulCanaryBusy] = useState<
+    'starting' | 'finishing' | 'aborting' | undefined
+  >();
+  const [soulCanaryError, setSoulCanaryError] = useState('');
+  const [soulCanaryClock, setSoulCanaryClock] = useState(Date.now());
+  const soulCanaryRuntimeCredentialRef =
+    useRef<SoulCanaryRuntimeCredential | null>(null);
+  const {
+    dispatch: dispatchLiveHostEvent,
+    snapshot: liveHostSnapshot,
+    claimSpeechPermission,
+    pendingActions: pendingLiveHostActions,
+    acknowledgeActions: acknowledgeLiveHostActions,
+  } = useLiveHostCoordinator(
+    activeBroadcastPolicy,
+    liveHostScope,
+  );
+  const baseSoulSession = useMemo(
+    () =>
+      runtimeProfile.id === LINGLAN_SOUL_CONSTITUTION.personaId
+        ? new BrowserSoulRuntimeSession({
+            constitution: LINGLAN_SOUL_CONSTITUTION,
+            profile: LINGLAN_SOUL_PROFILE,
+            scope: soulScope,
+          })
+        : null,
+    [runtimeProfile.id, soulScope],
+  );
+  const [recoveredSoulSession, setRecoveredSoulSession] = useState<{
+    scopeKey: string;
+    session: BrowserSoulRuntimeSession;
+  } | null>(null);
+  const soulSession =
+    recoveredSoulSession?.scopeKey === soulScopeKey
+      ? recoveredSoulSession.session
+      : baseSoulSession;
+  const soulCanonRepository = useMemo(
+    () =>
+      runtimeProfile.id === LINGLAN_SOUL_CONSTITUTION.personaId
+        ? new SoulCanonRepository({
+            scope: soulScope,
+            constitution: LINGLAN_SOUL_CONSTITUTION,
+          })
+        : null,
+    [runtimeProfile.id, soulScope],
+  );
+  const [soulCanonProjection, setSoulCanonProjection] = useState<{
+    scopeKey: string;
+    projection: SoulCanonProjectionV1;
+  } | null>(null);
+  const activeSoulCanon = useMemo(
+    () =>
+      soulCanonProjection?.scopeKey === soulScopeKey
+        ? soulCanonProjection.projection.active
+        : [],
+    [soulCanonProjection, soulScopeKey],
+  );
+  const soulSessionByEventIdRef = useRef(
+    new Map<string, BrowserSoulRuntimeSession>(),
+  );
+  const soulOutcomePromiseByEventIdRef = useRef(
+    new Map<string, Promise<void>>(),
+  );
+  const soulOutcomeFinalizerRef = useRef<
+    (
+      eventId: string,
+      status: SoulOutcomeStatus,
+      options?: { deliveredFraction?: number; reasonCode?: string },
+    ) => Promise<void>
+  >(async () => undefined);
+  const activeSoulScopeContextRef = useRef({
+    scopeKey: soulScopeKey,
+    session: soulSession,
+  });
+  const scopeTransitionChainRef = useRef(Promise.resolve());
+  const scopeTransitionEventIdsRef = useRef(new Set<string>());
+  const runtimeScopeEpochRef = useRef(0);
+  const runtimeScopeActivatedAtRef = useRef(Date.now());
+  const [runtimeScopeReadyKey, setRuntimeScopeReadyKey] =
+    useState(soulScopeKey);
+  const soulReflectionEvidenceRef = useRef<
+    SoulReflectionLedgerSummaryV1[]
+  >([]);
+  const soulReflectionInFlightRef = useRef(false);
+  const soulLastReflectionAtRef = useRef(0);
+  const soulPreviousHostPhaseRef = useRef(liveHostSnapshot.phase);
+  const [soulInspectorTrace, setSoulInspectorTrace] =
+    useState<SoulInspectorTraceV1 | null>(null);
+  const [soulControlState, setSoulControlState] = useState({
+    cognitionFrozen: false,
+    cognitionFreezeOrigin: undefined as
+      | 'operator'
+      | 'state-persistence-failure'
+      | 'snapshot-recovery'
+      | undefined,
+    memoryIsolated: false,
+    neutralFallbackActive: false,
+    operatorHasControl: false,
+    snapshotRecoveryAvailable: true,
+    busyControl: undefined as
+      | 'cognition'
+      | 'memory'
+      | 'fallback'
+      | 'snapshot'
+      | 'operator'
+      | undefined,
+  });
+  useEffect(() => {
+    if (
+      soulControlState.cognitionFrozen &&
+      !soulControlState.cognitionFreezeOrigin
+    ) {
+      // Fast Refresh can preserve the pre-origin state shape in the OBS
+      // runtime. That legacy state was produced by the rejected-reflection
+      // bug above; migrate it once instead of requiring an OBS restart.
+      setSoulControlState((state) => ({
+        ...state,
+        cognitionFrozen: false,
+        neutralFallbackActive: false,
+      }));
+    }
+  }, [
+    soulControlState.cognitionFreezeOrigin,
+    soulControlState.cognitionFrozen,
+  ]);
   const replyModelTrace = useMemo<ReplyLatencyTrace['models']>(
     () => ({
       llm: {
@@ -541,11 +1066,80 @@ export default function App() {
   const speechReactionRef = useRef<PuruPuruReactionDraft | null>(null);
   const proactiveSpeechRef = useRef(false);
   const proactiveEventIdRef = useRef<string | null>(null);
+  const personaRuntimeStateRef = useRef<PersonaRuntimeState | null>(null);
+  if (!personaRuntimeStateRef.current) {
+    personaRuntimeStateRef.current = new PersonaRuntimeState();
+  }
+  const pendingPersonaRuntimeCommitsRef = useRef<
+    Map<string, PendingPersonaRuntimeCommit>
+  >(new Map());
+  const pendingDeliveredInteractionsRef = useRef<
+    Map<string, PendingDeliveredInteraction>
+  >(new Map());
+  const conversationHistoryScopeByEventIdRef = useRef<
+    Map<string, ConversationHistoryScope>
+  >(new Map());
+  const completedSpeechBeatTextByEventIdRef = useRef<
+    Map<string, Map<number, string>>
+  >(new Map());
+  const commitConversationHistoryOutcome = useCallback(
+    (
+      eventId: string,
+      deliveryStatus: Exclude<ConversationDeliveryStatus, 'generated'>,
+      options: {
+        viewerId?: string;
+        deliveredFraction?: number;
+        reasonCode?: string;
+        ttsStartAt?: number;
+        ttsEndAt?: number;
+      } = {},
+    ) => {
+      const scope =
+        conversationHistoryScopeByEventIdRef.current.get(eventId) ??
+        conversationHistoryScopeFor(options.viewerId);
+      const deliveredReply =
+        deliveryStatus === 'partial'
+          ? [
+              ...(completedSpeechBeatTextByEventIdRef.current.get(eventId) ??
+                new Map<number, string>()),
+            ]
+              .sort(([left], [right]) => left - right)
+              .map(([, text]) => text)
+              .join('')
+              .trim() || undefined
+          : undefined;
+      void fetch('/api/conversation-history', {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          eventId,
+          scope,
+          deliveryStatus,
+          deliveredFraction: options.deliveredFraction,
+          deliveredReply,
+          reasonCode: options.reasonCode,
+          ttsStartAt: options.ttsStartAt,
+          ttsEndAt: options.ttsEndAt,
+        }),
+      })
+        .then((response) => {
+          if (response.ok) {
+            conversationHistoryScopeByEventIdRef.current.delete(eventId);
+            completedSpeechBeatTextByEventIdRef.current.delete(eventId);
+          }
+        })
+        .catch(() => undefined);
+    },
+    [conversationHistoryScopeFor],
+  );
   const emptyRoomAwarenessPlannerRef = useRef<EmptyRoomAwarenessPlanner | null>(
     null,
   );
   if (!emptyRoomAwarenessPlannerRef.current) {
-    emptyRoomAwarenessPlannerRef.current = new EmptyRoomAwarenessPlanner();
+    emptyRoomAwarenessPlannerRef.current = new EmptyRoomAwarenessPlanner(
+      Math.random,
+      personaRuntimeStateRef.current,
+    );
   }
   const activeLifecycleRef = useRef<ActiveLifecycle | null>(null);
   const speechRenderTraceRef = useRef<SpeechRenderTrace | null>(null);
@@ -564,14 +1158,360 @@ export default function App() {
       const transition = toInteractionTransition(event);
       if (transition) recordInteraction(transition);
 
+      const runtimeEvent = {
+        ...event,
+        scope: event.scope ?? soulScope,
+        runtimeMode: event.runtimeMode ?? soulRuntimeMode,
+      };
+      const headers: Record<string, string> = {
+        'Content-Type': 'application/json',
+      };
+      const canaryCredential = soulCanaryRuntimeCredentialRef.current;
+      if (
+        isLiveRuntimeOwner &&
+        soulRuntimeMode === 'canary' &&
+        canaryCredential?.ownerId === runtimeOwnerId &&
+        sameSoulScope(canaryCredential.scope, soulScope)
+      ) {
+        headers['X-Soul-Canary-Run'] = canaryCredential.runId;
+        headers['X-Soul-Canary-Token'] = canaryCredential.eventToken;
+        headers['X-Runtime-Owner-Id'] = runtimeOwnerId;
+      }
       void fetch('/api/live-runtime-events', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(event),
+        headers,
+        body: JSON.stringify(runtimeEvent),
       }).catch(() => undefined);
     },
-    [recordInteraction],
+    [
+      isLiveRuntimeOwner,
+      recordInteraction,
+      runtimeOwnerId,
+      soulRuntimeMode,
+      soulScope,
+    ],
   );
+  useEffect(() => {
+    let cancelled = false;
+    const refresh = async () => {
+      const response = await fetch(
+        '/api/acceptance-ledger?activeCanary=1',
+        { cache: 'no-store' },
+      );
+      if (!response.ok) return;
+      const payload = (await response.json()) as {
+        activeCanaries?: SoulCanaryActiveSummary[];
+      };
+      if (cancelled) return;
+      const active = Array.isArray(payload.activeCanaries)
+        ? payload.activeCanaries[0] ?? null
+        : null;
+      setActiveSoulCanary(active);
+      setSoulCanaryOperatorCredential((current) => {
+        if (!current || active?.runId === current.runId) return current;
+        persistSoulCanaryOperatorCredential(null);
+        return null;
+      });
+    };
+    void refresh().catch(() => undefined);
+    const timer = window.setInterval(
+      () => void refresh().catch(() => undefined),
+      5_000,
+    );
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, []);
+  useEffect(() => {
+    if (!activeSoulCanary) return;
+    setSoulCanaryClock(Date.now());
+    const timer = window.setInterval(
+      () => setSoulCanaryClock(Date.now()),
+      30_000,
+    );
+    return () => window.clearInterval(timer);
+  }, [activeSoulCanary]);
+  useEffect(() => {
+    if (!isLiveRuntimeOwner || soulRuntimeMode !== 'canary') {
+      soulCanaryRuntimeCredentialRef.current = null;
+      return;
+    }
+    let cancelled = false;
+    const claimActiveCanary = async () => {
+      const activeResponse = await fetch(
+        '/api/acceptance-ledger?activeCanary=1',
+        { cache: 'no-store' },
+      );
+      if (!activeResponse.ok) return;
+      const activePayload = (await activeResponse.json()) as {
+        activeCanaries?: SoulCanaryActiveSummary[];
+      };
+      const active = activePayload.activeCanaries?.find((candidate) =>
+        sameSoulScope(candidate.scope, soulScope),
+      );
+      if (!active) {
+        soulCanaryRuntimeCredentialRef.current = null;
+        return;
+      }
+      const current = soulCanaryRuntimeCredentialRef.current;
+      if (
+        current?.runId === active.runId &&
+        current.ownerId === runtimeOwnerId
+      ) {
+        return;
+      }
+      const response = await fetch('/api/acceptance-ledger', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Runtime-Owner-Id': runtimeOwnerId,
+        },
+        body: JSON.stringify({
+          action: 'claim-soul-canary-runtime',
+          scope: soulScope,
+        }),
+      });
+      if (!response.ok) return;
+      const claimed = (await response.json()) as {
+        runId?: unknown;
+        eventToken?: unknown;
+        scope?: SoulScopeV1;
+        startedAt?: unknown;
+      };
+      if (
+        cancelled ||
+        typeof claimed.runId !== 'string' ||
+        typeof claimed.eventToken !== 'string' ||
+        !/^[a-f0-9]{64}$/u.test(claimed.eventToken) ||
+        typeof claimed.startedAt !== 'number' ||
+        !claimed.scope
+      ) {
+        return;
+      }
+      soulCanaryRuntimeCredentialRef.current = {
+        runId: claimed.runId,
+        eventToken: claimed.eventToken,
+        scope: claimed.scope,
+        startedAt: claimed.startedAt,
+        ownerId: runtimeOwnerId,
+      };
+      emitRuntimeEvent({
+        stage: 'soul_canary_runtime_claimed',
+        at: Date.now(),
+        runId: claimed.runId,
+      });
+    };
+    void claimActiveCanary().catch(() => undefined);
+    const timer = window.setInterval(
+      () => void claimActiveCanary().catch(() => undefined),
+      5_000,
+    );
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [
+    emitRuntimeEvent,
+    isLiveRuntimeOwner,
+    runtimeOwnerId,
+    soulRuntimeMode,
+    soulScope,
+  ]);
+  const startSoulCanary = useCallback(async () => {
+    if (soulRuntimeMode !== 'canary') {
+      setSoulCanaryError('请先将 Soul Runtime 切换为 Canary。');
+      return;
+    }
+    setSoulCanaryBusy('starting');
+    setSoulCanaryError('');
+    try {
+      const response = await fetch('/api/acceptance-ledger', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Runtime-Settings-Role': 'producer',
+        },
+        body: JSON.stringify({
+          action: 'start-soul-canary',
+          scope: soulScope,
+        }),
+      });
+      const payload = (await response.json().catch(() => ({}))) as {
+        runId?: unknown;
+        operatorToken?: unknown;
+        scope?: SoulScopeV1;
+        startedAt?: unknown;
+        error?: unknown;
+      };
+      if (
+        !response.ok ||
+        typeof payload.runId !== 'string' ||
+        typeof payload.operatorToken !== 'string' ||
+        !/^[a-f0-9]{64}$/u.test(payload.operatorToken) ||
+        typeof payload.startedAt !== 'number' ||
+        !payload.scope
+      ) {
+        throw new Error(
+          typeof payload.error === 'string'
+            ? payload.error
+            : 'soul_canary_start_failed',
+        );
+      }
+      const credential: SoulCanaryOperatorCredential = {
+        version: 1,
+        runId: payload.runId,
+        operatorToken: payload.operatorToken,
+        scope: payload.scope,
+        startedAt: payload.startedAt,
+      };
+      persistSoulCanaryOperatorCredential(credential);
+      setSoulCanaryOperatorCredential(credential);
+      setActiveSoulCanary(credential);
+      setSoulCanaryClock(Date.now());
+      emitRuntimeEvent({
+        stage: 'soul_canary_started',
+        at: Date.now(),
+        runId: credential.runId,
+      });
+    } catch (error) {
+      setSoulCanaryError(
+        error instanceof Error ? error.message : 'soul_canary_start_failed',
+      );
+    } finally {
+      setSoulCanaryBusy(undefined);
+    }
+  }, [emitRuntimeEvent, soulRuntimeMode, soulScope]);
+  const finishSoulCanary = useCallback(async () => {
+    const credential = soulCanaryOperatorCredential;
+    if (!credential) return;
+    setSoulCanaryBusy('finishing');
+    setSoulCanaryError('');
+    try {
+      const response = await fetch('/api/acceptance-ledger', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Runtime-Settings-Role': 'producer',
+          'X-Soul-Canary-Operator-Token': credential.operatorToken,
+        },
+        body: JSON.stringify({
+          action: 'finish-soul-canary',
+          runId: credential.runId,
+        }),
+      });
+      const payload = (await response.json().catch(() => ({}))) as {
+        error?: unknown;
+      };
+      if (!response.ok) {
+        throw new Error(
+          typeof payload.error === 'string'
+            ? payload.error
+            : 'soul_canary_finish_failed',
+        );
+      }
+      persistSoulCanaryOperatorCredential(null);
+      setSoulCanaryOperatorCredential(null);
+      setActiveSoulCanary(null);
+      soulCanaryRuntimeCredentialRef.current = null;
+      await refreshSoulPrimaryGate();
+    } catch (error) {
+      setSoulCanaryError(
+        error instanceof Error ? error.message : 'soul_canary_finish_failed',
+      );
+    } finally {
+      setSoulCanaryBusy(undefined);
+    }
+  }, [refreshSoulPrimaryGate, soulCanaryOperatorCredential]);
+  const abortSoulCanary = useCallback(async () => {
+    const credential = soulCanaryOperatorCredential;
+    if (!credential) return;
+    setSoulCanaryBusy('aborting');
+    setSoulCanaryError('');
+    try {
+      const response = await fetch('/api/acceptance-ledger', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Runtime-Settings-Role': 'producer',
+          'X-Soul-Canary-Operator-Token': credential.operatorToken,
+        },
+        body: JSON.stringify({
+          action: 'abort-soul-canary',
+          runId: credential.runId,
+          reasonCode: 'operator-aborted-from-soul-inspector',
+        }),
+      });
+      const payload = (await response.json().catch(() => ({}))) as {
+        error?: unknown;
+      };
+      if (!response.ok) {
+        throw new Error(
+          typeof payload.error === 'string'
+            ? payload.error
+            : 'soul_canary_abort_failed',
+        );
+      }
+      persistSoulCanaryOperatorCredential(null);
+      setSoulCanaryOperatorCredential(null);
+      setActiveSoulCanary(null);
+      soulCanaryRuntimeCredentialRef.current = null;
+    } catch (error) {
+      setSoulCanaryError(
+        error instanceof Error ? error.message : 'soul_canary_abort_failed',
+      );
+    } finally {
+      setSoulCanaryBusy(undefined);
+    }
+  }, [soulCanaryOperatorCredential]);
+  const recordSoulReflectionEvidence = useCallback(
+    (entry: SoulReflectionLedgerSummaryV1) => {
+      soulReflectionEvidenceRef.current = [
+        ...soulReflectionEvidenceRef.current.filter(
+          (candidate) => candidate.eventId !== entry.eventId,
+        ),
+        entry,
+      ].slice(-24);
+    },
+    [],
+  );
+  useEffect(() => {
+    if (!soulCanonRepository || soulRuntimeMode === 'legacy') return;
+    let cancelled = false;
+    void soulCanonRepository
+      .load()
+      .then((projection) => {
+        if (cancelled) return;
+        setSoulCanonProjection({ scopeKey: soulScopeKey, projection });
+        emitRuntimeEvent({
+          stage: 'soul_canon_projection_loaded',
+          at: Date.now(),
+          scope: soulScope,
+          activeCount: projection.active.length,
+          candidateCount: projection.candidates.length,
+          supersededCount: projection.superseded.length,
+          retractedCount: projection.retracted.length,
+        });
+      })
+      .catch((error) => {
+        if (cancelled) return;
+        emitRuntimeEvent({
+          stage: 'soul_canon_projection_failed_closed',
+          at: Date.now(),
+          scope: soulScope,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    emitRuntimeEvent,
+    soulCanonRepository,
+    soulRuntimeMode,
+    soulScope,
+    soulScopeKey,
+  ]);
 
   // The radar page sends chat to the overlay iframe, while the full control
   // room is a separate browser instance. Mirror the authoritative runtime
@@ -1151,29 +2091,68 @@ export default function App() {
         // This fires only when neither a TTS beat nor playback completion has
         // made progress for the watchdog window.  Do not confuse a long,
         // multi-beat response with a stalled renderer.
+        const active = activeLifecycleRef.current;
+        const outcome = resolveIncompleteDelivery({
+          beatCount: operatorBeatCountRef.current,
+          completedBeatCount: operatorCompletedBeatCountRef.current,
+          audioByteLength: operatorAudioByteLengthRef.current,
+          playbackObserved:
+            operatorPlaybackObservedRef.current || Boolean(active?.ttsStartAt),
+        });
         stop();
         speakingOperatorTaskRef.current = null;
         operatorPlaybackObservedRef.current = false;
-        if (activeLifecycleRef.current?.eventId === eventId) {
+        operatorSpeechWatchdogRef.current = null;
+        if (active?.eventId === eventId) {
           emitRuntimeEvent({
             eventId,
             stage: 'failed',
             at: Date.now(),
-            source: activeLifecycleRef.current.channel,
-            sourceLabel: activeLifecycleRef.current.label,
-            viewerId: activeLifecycleRef.current.viewerId,
-            viewerName: activeLifecycleRef.current.viewerName,
-            sourcesSeen: activeLifecycleRef.current.sourcesSeen,
+            source: active.channel,
+            sourceLabel: active.label,
+            viewerId: active.viewerId,
+            viewerName: active.viewerName,
+            sourcesSeen: active.sourcesSeen,
             reason,
+            soulOutcomeStatus: outcome.status,
+            deliveredFraction: outcome.deliveredFraction,
           });
-          activeLifecycleRef.current = null;
         }
-        void updateOperatorQueue(eventId, 'retry', {
-          reason,
-        }).catch(() => undefined);
+        dispatchLiveHostEvent({
+          type: 'runtime-fault',
+          at: Date.now(),
+          eventId,
+          reasonCode: reason,
+        });
+        commitConversationHistoryOutcome(eventId, outcome.status, {
+          viewerId: active?.viewerId,
+          deliveredFraction: outcome.deliveredFraction,
+          reasonCode: reason,
+          ttsStartAt: active?.ttsStartAt,
+          ttsEndAt: Date.now(),
+        });
+        void (async () => {
+          await soulOutcomeFinalizerRef.current(eventId, outcome.status, {
+            deliveredFraction: outcome.deliveredFraction,
+            reasonCode: reason,
+          });
+          pendingPersonaRuntimeCommitsRef.current.delete(eventId);
+          pendingDeliveredInteractionsRef.current.delete(eventId);
+          if (activeLifecycleRef.current?.eventId === eventId) {
+            activeLifecycleRef.current = null;
+          }
+          await updateOperatorQueue(eventId, 'fail', { reason }).catch(
+            () => undefined,
+          );
+        })();
       }, timeoutMs);
     },
-    [emitRuntimeEvent, stop],
+    [
+      commitConversationHistoryOutcome,
+      dispatchLiveHostEvent,
+      emitRuntimeEvent,
+      stop,
+    ],
   );
   operatorSpeechWatchdogArmRef.current = armOperatorSpeechWatchdog;
 
@@ -1367,6 +2346,69 @@ export default function App() {
     ],
   );
 
+  const finalizeSoulOutcome = useCallback(
+    (
+      eventId: string,
+      status: SoulOutcomeStatus,
+      options: {
+        deliveredFraction?: number;
+        reasonCode?: string;
+      } = {},
+    ): Promise<void> => {
+      const existing = soulOutcomePromiseByEventIdRef.current.get(eventId);
+      if (existing) return existing;
+      const session = soulSessionByEventIdRef.current.get(eventId);
+      if (!session) return Promise.resolve();
+      const finalizing = session
+        .applyOutcome(eventId, status, options)
+        .then(({ state, persistenceOk }) => {
+          setSoulInspectorTrace((previous) =>
+            previous?.event.id === eventId
+              ? {
+                  ...previous,
+                  state: projectSoulState(state),
+                  outcome: {
+                    status,
+                    occurredAt: Date.now(),
+                    deliveredFraction: options.deliveredFraction,
+                    reasonCode: options.reasonCode,
+                  },
+                }
+              : previous,
+          );
+          emitRuntimeEvent({
+            eventId,
+            stage: 'soul_outcome_committed',
+            at: Date.now(),
+            scope: session.scope,
+            runtimeMode: soulRuntimeMode,
+            status,
+            deliveredFraction: options.deliveredFraction,
+            reasonCode: options.reasonCode,
+            persistenceOk,
+            stateVersion: state.version,
+          });
+        })
+        .catch((error) => {
+          emitRuntimeEvent({
+            eventId,
+            stage: 'soul_outcome_failed',
+            at: Date.now(),
+            status,
+            error: error instanceof Error ? error.message : String(error),
+          });
+        })
+        .finally(() => {
+          soulOutcomePromiseByEventIdRef.current.delete(eventId);
+          soulSessionByEventIdRef.current.delete(eventId);
+        });
+      soulOutcomePromiseByEventIdRef.current.set(eventId, finalizing);
+      return finalizing;
+    },
+    [emitRuntimeEvent, soulRuntimeMode],
+  );
+  soulOutcomeFinalizerRef.current = finalizeSoulOutcome;
+
   const handleSpeechEnd = useCallback(() => {
     if (replyLatencyRef.current) {
       replyLatencyRef.current.speechEndSignaledAt = Date.now();
@@ -1375,31 +2417,35 @@ export default function App() {
     const isOperatorPlayback =
       Boolean(active?.eventId) &&
       speakingOperatorTaskRef.current === active?.eventId;
-    const hasCompleteOperatorAudio =
-      operatorBeatCountRef.current > 0 &&
-      operatorCompletedBeatCountRef.current >= operatorBeatCountRef.current &&
-      operatorAudioByteLengthRef.current > 0;
+    const hasCompleteOperatorAudio = hasCompleteDeliveryEvidence({
+      beatCount: operatorBeatCountRef.current,
+      completedBeatCount: operatorCompletedBeatCountRef.current,
+      audioByteLength: operatorAudioByteLengthRef.current,
+    });
     // Streaming TTS can briefly report an idle state between beats.  That is
     // not the end of the queued response: keep its lease and lifecycle alive
     // until every planned beat has completed.
     if (isOperatorPlayback && !hasCompleteOperatorAudio) return;
     if (active?.eventId) {
       const ttsEndAt = Date.now();
+      const isSoulDelivery = soulSessionByEventIdRef.current.has(active.eventId);
       dispatchLiveHostEvent({
         type: 'speech',
         at: ttsEndAt,
         eventId: active.eventId,
         stage: 'completed',
       });
-      void fetch('/api/conversation-history', {
-        method: 'PATCH',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          eventId: active.eventId,
-          ttsStartAt: active.ttsStartAt,
-          ttsEndAt,
-        }),
-      }).catch(() => undefined);
+      finalizeSoulOutcome(active.eventId, 'spoken', {
+        deliveredFraction: 1,
+        reasonCode: 'tts-playback-completed',
+      });
+      commitConversationHistoryOutcome(active.eventId, 'spoken', {
+        viewerId: active.viewerId,
+        deliveredFraction: 1,
+        reasonCode: 'tts-playback-completed',
+        ttsStartAt: active.ttsStartAt,
+        ttsEndAt,
+      });
       if (isOperatorPlayback) {
         void updateOperatorQueue(active.eventId, 'done', {
           ownerId: runtimeOwnerIdRef.current,
@@ -1433,7 +2479,93 @@ export default function App() {
         if (operatorSpeechWatchdogRef.current !== null) {
           window.clearTimeout(operatorSpeechWatchdogRef.current);
           operatorSpeechWatchdogRef.current = null;
+          }
+      }
+      const personaCommit = pendingPersonaRuntimeCommitsRef.current.get(
+        active.eventId,
+      );
+      if (personaCommit?.interaction) {
+        personaRuntimeStateRef.current!.commitInteraction(
+          personaCommit.interaction,
+        );
+      }
+      if (personaCommit?.proactive) {
+        personaRuntimeStateRef.current!.commitProactive(
+          personaCommit.proactive,
+          ttsEndAt,
+        );
+      }
+      if (personaCommit) {
+        const snapshot = personaRuntimeStateRef.current!.snapshot(ttsEndAt);
+        emitRuntimeEvent({
+          eventId: active.eventId,
+          stage: 'persona_state_committed',
+          at: ttsEndAt,
+          activeDrive: personaCommit.proactive?.drive,
+          topicFamily: personaCommit.proactive?.topicFamily,
+          topicSource: personaCommit.proactive?.source,
+          emotion: snapshot.emotion.activeAffect?.label,
+          emotionIntensity: snapshot.emotion.activeAffect?.intensity,
+          mood: snapshot.emotion.mood,
+          topicLedgerSize: snapshot.topics.length,
+        });
+        pendingPersonaRuntimeCommitsRef.current.delete(active.eventId);
+      }
+      const deliveredInteraction = pendingDeliveredInteractionsRef.current.get(
+        active.eventId,
+      );
+      if (deliveredInteraction && !soulControlState.memoryIsolated) {
+        recentLiveTurnsRef.current = mergeRecentLiveTurns(
+          recentLiveTurnsRef.current,
+          [
+            {
+              eventId: deliveredInteraction.eventId,
+              at: ttsEndAt,
+              input: deliveredInteraction.input,
+              reply: deliveredInteraction.reply,
+              viewerId: deliveredInteraction.viewerId,
+              viewerName: deliveredInteraction.viewerName,
+              sourceLabel: deliveredInteraction.sourceLabel,
+              sourcesSeen: deliveredInteraction.sourcesSeen,
+            },
+          ],
+        );
+        if (!isSoulDelivery) {
+          void streamerMemory.addInteraction(
+            deliveredInteraction.input,
+            deliveredInteraction.reply,
+            {
+              id: scopedViewerId(
+                deliveredInteraction.viewerId,
+                deliveredInteraction.sourcesSeen?.[0] ??
+                  deliveredInteraction.source,
+              ),
+              name: deliveredInteraction.viewerName,
+            },
+            deliveredInteraction.source,
+          );
         }
+        pendingDeliveredInteractionsRef.current.delete(active.eventId);
+        emitRuntimeEvent({
+          eventId: active.eventId,
+          stage: isSoulDelivery
+            ? 'soul_delivered_projection_committed'
+            : 'delivered_interaction_committed',
+          at: ttsEndAt,
+          source: deliveredInteraction.source,
+          viewerId: deliveredInteraction.viewerId,
+          authoritativeStore: isSoulDelivery
+            ? 'soul-ledger'
+            : 'legacy-streamer-memory',
+        });
+      } else if (deliveredInteraction) {
+        pendingDeliveredInteractionsRef.current.delete(active.eventId);
+        emitRuntimeEvent({
+          eventId: active.eventId,
+          stage: 'delivered_interaction_memory_isolated',
+          at: ttsEndAt,
+          reason: 'operator-memory-write-isolation',
+        });
       }
     }
     activeLifecycleRef.current = null;
@@ -1442,17 +2574,68 @@ export default function App() {
     proactiveEventIdRef.current = null;
     resetAvatarReaction();
     setAvatarMotion('idle_cold');
-  }, [dispatchLiveHostEvent, emitRuntimeEvent, resetAvatarReaction]);
+  }, [
+    dispatchLiveHostEvent,
+    emitRuntimeEvent,
+    finalizeSoulOutcome,
+    commitConversationHistoryOutcome,
+    resetAvatarReaction,
+    soulControlState.memoryIsolated,
+    streamerMemory,
+  ]);
 
   const handleSpeechInterrupted = useCallback(() => {
     const active = activeLifecycleRef.current;
+    const defersScopeCleanup = Boolean(
+      active?.eventId &&
+        scopeTransitionEventIdsRef.current.has(active.eventId),
+    );
     if (active?.eventId) {
+      if (!defersScopeCleanup) {
+        pendingPersonaRuntimeCommitsRef.current.delete(active.eventId);
+        pendingDeliveredInteractionsRef.current.delete(active.eventId);
+      }
       dispatchLiveHostEvent({
         type: 'speech',
         at: Date.now(),
         eventId: active.eventId,
         stage: 'interrupted',
       });
+      const incompleteDelivery = resolveIncompleteDelivery({
+        beatCount: operatorBeatCountRef.current,
+        completedBeatCount: operatorCompletedBeatCountRef.current,
+        audioByteLength: operatorAudioByteLengthRef.current,
+        playbackObserved:
+          operatorPlaybackObservedRef.current || Boolean(active.ttsStartAt),
+      });
+      const deliveredFraction = incompleteDelivery.deliveredFraction;
+      finalizeSoulOutcome(
+        active.eventId,
+        defersScopeCleanup
+          ? incompleteDelivery.status
+          : deliveredFraction > 0
+            ? 'partial'
+            : 'interrupted',
+        {
+          deliveredFraction,
+          reasonCode: defersScopeCleanup
+            ? 'scope-switch-interrupted-delivery'
+            : 'interrupted-at-beat-boundary',
+        },
+      );
+      commitConversationHistoryOutcome(
+        active.eventId,
+        incompleteDelivery.status,
+        {
+          viewerId: active.viewerId,
+          deliveredFraction,
+          reasonCode: defersScopeCleanup
+            ? 'scope-switch-interrupted-delivery'
+            : 'interrupted-at-beat-boundary',
+          ttsStartAt: active.ttsStartAt,
+          ttsEndAt: Date.now(),
+        },
+      );
       emitRuntimeEvent({
         eventId: active.eventId,
         stage: 'dropped',
@@ -1467,18 +2650,26 @@ export default function App() {
         reason: 'interrupted_at_beat_boundary',
       }).catch(() => undefined);
     }
-    speakingOperatorTaskRef.current = null;
-    operatorPlaybackObservedRef.current = false;
-    activeLifecycleRef.current = null;
-    proactiveSpeechRef.current = false;
-    proactiveEventIdRef.current = null;
-    if (operatorSpeechWatchdogRef.current !== null) {
-      window.clearTimeout(operatorSpeechWatchdogRef.current);
-      operatorSpeechWatchdogRef.current = null;
+    if (!defersScopeCleanup) {
+      speakingOperatorTaskRef.current = null;
+      operatorPlaybackObservedRef.current = false;
+      activeLifecycleRef.current = null;
+      proactiveSpeechRef.current = false;
+      proactiveEventIdRef.current = null;
+      if (operatorSpeechWatchdogRef.current !== null) {
+        window.clearTimeout(operatorSpeechWatchdogRef.current);
+        operatorSpeechWatchdogRef.current = null;
+      }
+      resetAvatarReaction();
+      setAvatarMotion('idle_cold');
     }
-    resetAvatarReaction();
-    setAvatarMotion('idle_cold');
-  }, [dispatchLiveHostEvent, emitRuntimeEvent, resetAvatarReaction]);
+  }, [
+    dispatchLiveHostEvent,
+    emitRuntimeEvent,
+    finalizeSoulOutcome,
+    commitConversationHistoryOutcome,
+    resetAvatarReaction,
+  ]);
 
   const {
     messages,
@@ -1544,12 +2735,29 @@ export default function App() {
         byteLength: stage === 'start' ? 0 : speechBeatBytesRef.current,
       });
       if (active?.eventId && stage === 'end') {
+        const completedBeatIndex = Number(
+          data.beatIndex ?? data.index ?? 0,
+        );
+        const completedBeatText =
+          data.screenplay && typeof data.screenplay === 'object'
+            ? String((data.screenplay as ScreenplayLike).text ?? '').trim()
+            : '';
+        if (completedBeatText && speechBeatBytesRef.current > 0) {
+          const completedBeats =
+            completedSpeechBeatTextByEventIdRef.current.get(active.eventId) ??
+            new Map<number, string>();
+          completedBeats.set(completedBeatIndex, completedBeatText);
+          completedSpeechBeatTextByEventIdRef.current.set(
+            active.eventId,
+            completedBeats,
+          );
+        }
         dispatchLiveHostEvent({
           type: 'speech',
           at: Date.now(),
           eventId: active.eventId,
           stage: 'beat-completed',
-          beatIndex: Number(data.beatIndex ?? data.index ?? 0),
+          beatIndex: completedBeatIndex,
           interruptibleAfter: data.interruptibleAfter === true,
         });
         operatorCompletedBeatCountRef.current = Math.max(
@@ -1571,6 +2779,35 @@ export default function App() {
           eventId: active.eventId,
           reasonCode: 'tts_beat_failed',
         });
+        pendingPersonaRuntimeCommitsRef.current.delete(active.eventId);
+        pendingDeliveredInteractionsRef.current.delete(active.eventId);
+        const deliveredFraction =
+          operatorBeatCountRef.current > 0
+            ? Math.min(
+                1,
+                operatorCompletedBeatCountRef.current /
+                  operatorBeatCountRef.current,
+              )
+            : 0;
+        finalizeSoulOutcome(
+          active.eventId,
+          deliveredFraction > 0 ? 'partial' : 'failed',
+          {
+            deliveredFraction,
+            reasonCode: 'tts-beat-failed',
+          },
+        );
+        commitConversationHistoryOutcome(
+          active.eventId,
+          deliveredFraction > 0 ? 'partial' : 'failed',
+          {
+            viewerId: active.viewerId,
+            deliveredFraction,
+            reasonCode: 'tts-beat-failed',
+            ttsStartAt: active.ttsStartAt,
+            ttsEndAt: Date.now(),
+          },
+        );
       }
     },
     personaPlannerEnabled,
@@ -1579,23 +2816,20 @@ export default function App() {
     speechPlanV2Enabled,
     getApiKeyForProvider: settingsHook.getApiKeyForProvider,
     onAssistantResponse: (input, reply, metadata) => {
-      // Update synchronously, before the disk write finishes, so an immediate
-      // follow-up never loses the just-broadcast answer.
-      recentLiveTurnsRef.current = mergeRecentLiveTurns(
-        recentLiveTurnsRef.current,
-        [
-          {
-            eventId: metadata?.eventId,
-            at: Date.now(),
-            input,
-            reply,
-            viewerId: metadata?.viewerId,
-            viewerName: metadata?.viewerName,
-            sourceLabel: metadata?.sourceLabel,
-            sourcesSeen: metadata?.sourcesSeen,
-          },
-        ],
-      );
+      // Generated text is not an autobiographical event yet. Reserve it here
+      // and commit only after the correlated speech lifecycle proves delivery.
+      if (metadata?.eventId) {
+        pendingDeliveredInteractionsRef.current.set(metadata.eventId, {
+          input,
+          reply,
+          eventId: metadata.eventId,
+          viewerId: metadata.viewerId,
+          viewerName: metadata.viewerName,
+          source: metadata.source,
+          sourceLabel: metadata.sourceLabel,
+          sourcesSeen: metadata.sourcesSeen,
+        });
+      }
       if (replyLatencyRef.current) {
         replyLatencyRef.current.llmCompletedAt = Date.now();
         replyLatencyRef.current.input = input;
@@ -1615,52 +2849,54 @@ export default function App() {
           sourcesSeen: active.sourcesSeen,
         });
       }
-      void fetch('/api/conversation-history', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          input,
-          reply,
-          viewerId: metadata?.viewerId,
-          viewerName: metadata?.viewerName,
-          source: metadata?.source,
-          sourceLabel: metadata?.sourceLabel,
-          eventId: metadata?.eventId,
-          commentAt: metadata?.commentAt,
-          receivedAt: metadata?.receivedAt,
-          queuedAt: metadata?.queuedAt,
-          selectedAt: metadata?.selectedAt,
-          processingAt: metadata?.processingAt,
-          llmStartAt: metadata?.processingAt,
-          llmEndAt: Date.now(),
-          sourcesSeen: metadata?.sourcesSeen,
-          testRunId:
-            active?.eventId === metadata?.eventId
-              ? active?.testRunId
-              : undefined,
-          stepId:
-            active?.eventId === metadata?.eventId ? active?.stepId : undefined,
-          scenarioId:
-            active?.eventId === metadata?.eventId
-              ? active?.scenarioId
-              : undefined,
-          replyAt: Date.now(),
-        }),
-      }).catch((error) => {
-        console.warn('Conversation history persistence failed.', error);
-      });
-      void streamerMemory.addInteraction(
-        input,
-        reply,
-        {
-          id: scopedViewerId(
-            metadata?.viewerId,
-            metadata?.sourcesSeen?.[0] ?? metadata?.source,
-          ),
-          name: metadata?.viewerName,
-        },
-        metadata?.source,
-      );
+      if (metadata?.eventId) {
+        const historyScope = conversationHistoryScopeFor(
+          metadata.viewerId,
+          metadata.sourcesSeen?.[0],
+        );
+        conversationHistoryScopeByEventIdRef.current.set(
+          metadata.eventId,
+          historyScope,
+        );
+        void fetch('/api/conversation-history', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            input,
+            reply,
+            viewerId: metadata.viewerId,
+            viewerName: metadata.viewerName,
+            source: metadata.source,
+            sourceLabel: metadata.sourceLabel,
+            eventId: metadata.eventId,
+            scope: historyScope,
+            deliveryStatus: 'generated',
+            commentAt: metadata.commentAt,
+            receivedAt: metadata.receivedAt,
+            queuedAt: metadata.queuedAt,
+            selectedAt: metadata.selectedAt,
+            processingAt: metadata.processingAt,
+            llmStartAt: metadata.processingAt,
+            llmEndAt: Date.now(),
+            sourcesSeen: metadata.sourcesSeen,
+            testRunId:
+              active?.eventId === metadata.eventId
+                ? active?.testRunId
+                : undefined,
+            stepId:
+              active?.eventId === metadata.eventId
+                ? active?.stepId
+                : undefined,
+            scenarioId:
+              active?.eventId === metadata.eventId
+                ? active?.scenarioId
+                : undefined,
+            replyAt: Date.now(),
+          }),
+        }).catch((error) => {
+          console.warn('Conversation history reservation failed.', error);
+        });
+      }
     },
     onChatError: (error, metadata) => {
       // Continuation failures from the chat processor can lose the original
@@ -1669,17 +2905,72 @@ export default function App() {
       // generation failure instead of a later, misleading TTS timeout.
       const active = activeLifecycleRef.current;
       const eventId = metadata?.eventId ?? active?.eventId;
+      if (eventId) {
+        pendingDeliveredInteractionsRef.current.delete(eventId);
+      }
       const errorMessage =
         error instanceof Error ? error.message.slice(0, 240) : 'chat_failed';
-      const reason = /truncated|continuation/i.test(errorMessage)
-        ? 'generation_truncated'
-        : 'generation_failed';
+      const reason: PendingGenerationFailure['reason'] =
+        /\b401\b|unauthori[sz]ed|api.?key|credential|authorization/i.test(
+          errorMessage,
+        )
+          ? 'generation_auth_failed'
+          : /truncated|continuation/i.test(errorMessage)
+            ? 'generation_truncated'
+            : 'generation_failed';
+      const queueOwnsFailure =
+        Boolean(eventId) && preparingOperatorTaskRef.current === eventId;
       if (eventId) {
-        void updateOperatorQueue(
-          eventId,
-          reason === 'generation_truncated' ? 'fail' : 'retry',
-          { reason },
-        ).catch(() => undefined);
+        if (queueOwnsFailure) {
+          generationFailureByEventIdRef.current.set(eventId, {
+            reason,
+            error: errorMessage,
+            retryable:
+              reason !== 'generation_auth_failed' &&
+              reason !== 'generation_truncated',
+          });
+          // The streaming core may report an error without resolving the
+          // outer preparation promise (for example after a transport-level
+          // network failure). Do not leave the durable queue item leased in
+          // `preparing` until the two-minute server lease expires. Mutate it
+          // once per attempt here; the preparation effect will observe that
+          // it is no longer `preparing` and therefore cannot double-retry it.
+          if (!generationFailureQueueMutationRef.current.has(eventId)) {
+            generationFailureQueueMutationRef.current.add(eventId);
+            processingLiveEventIdsRef.current.delete(eventId);
+            preparingOperatorTaskRef.current = null;
+            void updateOperatorQueue(
+              eventId,
+              reason === 'generation_failed' ? 'retry' : 'fail',
+              { reason },
+            ).catch(() => undefined);
+          }
+        }
+        const incompleteDelivery = resolveIncompleteDelivery({
+          beatCount: operatorBeatCountRef.current,
+          completedBeatCount: operatorCompletedBeatCountRef.current,
+          audioByteLength: operatorAudioByteLengthRef.current,
+          playbackObserved:
+            operatorPlaybackObservedRef.current || Boolean(active?.ttsStartAt),
+        });
+        commitConversationHistoryOutcome(eventId, incompleteDelivery.status, {
+          viewerId: active?.viewerId,
+          deliveredFraction: incompleteDelivery.deliveredFraction,
+          reasonCode: reason,
+          ttsStartAt: active?.ttsStartAt,
+          ttsEndAt: Date.now(),
+        });
+        // The queue preparation effect is the sole retry authority for its
+        // active event. Letting this callback also mutate the queue races the
+        // still-running generation attempt and previously caused four rapid
+        // duplicate retries with a misleading no-draft reason.
+        if (!queueOwnsFailure) {
+          void updateOperatorQueue(
+            eventId,
+            reason === 'generation_failed' ? 'retry' : 'fail',
+            { reason },
+          ).catch(() => undefined);
+        }
         dispatchLiveHostEvent({
           type: 'generation',
           at: Date.now(),
@@ -1696,31 +2987,296 @@ export default function App() {
           },
         });
       }
-      if (!active?.eventId || active.eventId !== eventId) return;
       emitRuntimeEvent({
-        eventId: active.eventId,
-        stage: 'failed',
+        eventId,
+        stage: queueOwnsFailure ? 'generation_error' : 'failed',
         at: Date.now(),
-        source: active.channel,
-        sourceLabel: active.label,
-        viewerId: active.viewerId,
-        viewerName: active.viewerName,
-        sourcesSeen: active.sourcesSeen,
-        testRunId: active.testRunId,
-        stepId: active.stepId,
-        scenarioId: active.scenarioId,
+        source: active?.channel,
+        sourceLabel: active?.label,
+        viewerId: active?.viewerId,
+        viewerName: active?.viewerName,
+        sourcesSeen: active?.sourcesSeen,
+        testRunId: active?.testRunId,
+        stepId: active?.stepId,
+        scenarioId: active?.scenarioId,
         reason,
         error: errorMessage,
       });
-      activeLifecycleRef.current = null;
+      if (active?.eventId && active.eventId === eventId) {
+        activeLifecycleRef.current = null;
+      }
     },
   });
+
+  useEffect(() => {
+    const previous = activeSoulScopeContextRef.current;
+    if (previous.scopeKey === soulScopeKey) {
+      // Snapshot recovery can replace the session without changing identity.
+      previous.session = soulSession;
+      return;
+    }
+
+    const targetScopeKey = soulScopeKey;
+    const targetEpoch = runtimeScopeEpochRef.current + 1;
+    const targetActivatedAt = Date.now();
+    runtimeScopeEpochRef.current = targetEpoch;
+    runtimeScopeActivatedAtRef.current = targetActivatedAt;
+    activeSoulScopeContextRef.current = {
+      scopeKey: targetScopeKey,
+      session: soulSession,
+    };
+
+    const active = activeLifecycleRef.current;
+    const capturedEventIds = new Set<string>([
+      ...pendingDeliveredInteractionsRef.current.keys(),
+      ...pendingPersonaRuntimeCommitsRef.current.keys(),
+      ...soulSessionByEventIdRef.current.keys(),
+    ]);
+    if (active?.eventId) capturedEventIds.add(active.eventId);
+    if (preparingOperatorTaskRef.current) {
+      capturedEventIds.add(preparingOperatorTaskRef.current);
+    }
+    if (speakingOperatorTaskRef.current) {
+      capturedEventIds.add(speakingOperatorTaskRef.current);
+    }
+    if (active?.eventId) {
+      scopeTransitionEventIdsRef.current.add(active.eventId);
+    }
+
+    const incompleteDelivery = resolveIncompleteDelivery({
+      beatCount: operatorBeatCountRef.current,
+      completedBeatCount: operatorCompletedBeatCountRef.current,
+      audioByteLength: operatorAudioByteLengthRef.current,
+      playbackObserved:
+        operatorPlaybackObservedRef.current || Boolean(active?.ttsStartAt),
+    });
+    const oldSoulEventIds = [...soulSessionByEventIdRef.current.keys()];
+    const oldQueueItems = operatorQueueRef.current.filter(
+      (item) =>
+        item.createdAt < targetActivatedAt &&
+        ['pending', 'preparing', 'ready', 'speaking'].includes(item.status),
+    );
+
+    // Stop the old performer immediately, but defer clearing its evidence until
+    // every old Soul reservation has a durable terminal outcome.
+    if (operatorSpeechWatchdogRef.current !== null) {
+      window.clearTimeout(operatorSpeechWatchdogRef.current);
+    }
+    interruptSpeech('immediate');
+    stop();
+    recoverChatRuntime();
+
+    let disposed = false;
+    const transition = scopeTransitionChainRef.current
+      .catch(() => undefined)
+      .then(async () => {
+        await Promise.all(
+          oldSoulEventIds.map((eventId) => {
+            const isActive = eventId === active?.eventId;
+            return finalizeSoulOutcome(
+              eventId,
+              isActive ? incompleteDelivery.status : 'failed',
+              {
+                deliveredFraction: isActive
+                  ? incompleteDelivery.deliveredFraction
+                  : 0,
+                reasonCode: isActive
+                  ? 'scope-switch-interrupted-delivery'
+                  : 'scope-switch-before-delivery',
+              },
+            );
+          }),
+        );
+
+        await Promise.allSettled(
+          oldQueueItems.map((item) =>
+            updateOperatorQueue(
+              item.eventId,
+              item.status === 'speaking' ? 'fail' : 'skip',
+              { reason: 'scope_changed_before_delivery' },
+            ),
+          ),
+        );
+
+        for (const eventId of capturedEventIds) {
+          const queueItem = oldQueueItems.find(
+            (item) => item.eventId === eventId,
+          );
+          const isActive = eventId === active?.eventId;
+          const deliveryStatus = isActive
+            ? incompleteDelivery.status
+            : queueItem && queueItem.status !== 'speaking'
+              ? 'skipped'
+              : 'failed';
+          commitConversationHistoryOutcome(eventId, deliveryStatus, {
+            viewerId: isActive ? active?.viewerId : queueItem?.viewerId,
+            deliveredFraction: isActive
+              ? incompleteDelivery.deliveredFraction
+              : 0,
+            reasonCode: isActive
+              ? 'scope-switch-interrupted-delivery'
+              : 'scope-switch-before-delivery',
+            ttsStartAt: isActive ? active?.ttsStartAt : undefined,
+            ttsEndAt: Date.now(),
+          });
+          pendingDeliveredInteractionsRef.current.delete(eventId);
+          pendingPersonaRuntimeCommitsRef.current.delete(eventId);
+          processingLiveEventIdsRef.current.delete(eventId);
+          scopeTransitionEventIdsRef.current.delete(eventId);
+        }
+        if (
+          activeLifecycleRef.current?.eventId &&
+          capturedEventIds.has(activeLifecycleRef.current.eventId)
+        ) {
+          activeLifecycleRef.current = null;
+        }
+        if (
+          preparingOperatorTaskRef.current &&
+          capturedEventIds.has(preparingOperatorTaskRef.current)
+        ) {
+          preparingOperatorTaskRef.current = null;
+        }
+        if (
+          speakingOperatorTaskRef.current &&
+          capturedEventIds.has(speakingOperatorTaskRef.current)
+        ) {
+          speakingOperatorTaskRef.current = null;
+        }
+        if (operatorSpeechWatchdogRef.current !== null) {
+          window.clearTimeout(operatorSpeechWatchdogRef.current);
+          operatorSpeechWatchdogRef.current = null;
+        }
+        operatorPlaybackObservedRef.current = false;
+        operatorBeatCountRef.current = 0;
+        operatorCompletedBeatCountRef.current = 0;
+        operatorAudioByteLengthRef.current = 0;
+        speechBeatBytesRef.current = 0;
+        activeLifecycleRef.current = null;
+        speechRenderTraceRef.current = null;
+        replyLatencyRef.current = null;
+        speechReactionRef.current = null;
+        proactiveSpeechRef.current = false;
+        proactiveEventIdRef.current = null;
+        recentLiveTurnsRef.current = [];
+        soulReflectionEvidenceRef.current = [];
+        soulLastReflectionAtRef.current = 0;
+
+        const nextPersonaRuntimeState = new PersonaRuntimeState();
+        personaRuntimeStateRef.current = nextPersonaRuntimeState;
+        emptyRoomAwarenessPlannerRef.current = new EmptyRoomAwarenessPlanner(
+          Math.random,
+          nextPersonaRuntimeState,
+        );
+        resetAvatarReaction();
+        setAvatarMotion('idle_cold');
+
+        const stillCurrent =
+          activeSoulScopeContextRef.current.scopeKey === targetScopeKey &&
+          runtimeScopeEpochRef.current === targetEpoch;
+        if (!disposed && stillCurrent) {
+          setSoulInspectorTrace(null);
+          setRuntimeScopeReadyKey(targetScopeKey);
+          emitRuntimeEvent({
+            stage: 'runtime_scope_transition_committed',
+            at: Date.now(),
+            fromScopeKey: previous.scopeKey,
+            toScopeKey: targetScopeKey,
+            settledSoulReservations: oldSoulEventIds.length,
+            discardedQueueItems: oldQueueItems.length,
+          });
+        }
+      });
+    scopeTransitionChainRef.current = transition;
+
+    return () => {
+      disposed = true;
+    };
+  }, [
+    commitConversationHistoryOutcome,
+    emitRuntimeEvent,
+    finalizeSoulOutcome,
+    interruptSpeech,
+    recoverChatRuntime,
+    resetAvatarReaction,
+    soulScopeKey,
+    soulSession,
+    stop,
+  ]);
+
+  useEffect(() => {
+    if (pendingLiveHostActions.length === 0) return;
+    const consumed: string[] = [];
+    for (const action of pendingLiveHostActions) {
+      consumed.push(action.actionId);
+      emitRuntimeEvent({
+        eventId: action.eventId,
+        stage: 'live_host_action_consumed',
+        at: Date.now(),
+        actionId: action.actionId,
+        actionKind: action.kind,
+        reasonCode: action.reasonCode,
+        scope: action.scope,
+      });
+      if (action.kind === 'emit-avatar-intent') {
+        dispatchAvatarBehavior({
+          motion: `host-${action.intent}`,
+          emotion: action.intent === 'recovering' ? 'serious' : 'neutral',
+          emotionIntensity: 0.35,
+        });
+        continue;
+      }
+      if (action.kind === 'enter-recovery') {
+        stop();
+        recoverChatRuntime();
+        if (action.eventId) {
+          const pending = pendingDeliveredInteractionsRef.current.get(
+            action.eventId,
+          );
+          commitConversationHistoryOutcome(action.eventId, 'failed', {
+            viewerId: pending?.viewerId,
+            deliveredFraction: 0,
+            reasonCode: action.reasonCode,
+            ttsEndAt: Date.now(),
+          });
+          pendingPersonaRuntimeCommitsRef.current.delete(action.eventId);
+          pendingDeliveredInteractionsRef.current.delete(action.eventId);
+          finalizeSoulOutcome(action.eventId, 'failed', {
+            deliveredFraction: 0,
+            reasonCode: action.reasonCode,
+          });
+        }
+        continue;
+      }
+      if (action.kind === 'request-operator-attention') {
+        setStreamErrorMessage(
+          `Soul runtime requires operator attention: ${action.reasonCode}`,
+        );
+        // Host execution recovery and Soul cognition are separate failure
+        // domains. A model/TTS/coordinator fault may require operator
+        // attention, but it must never rewrite the Soul control mode. Soul
+        // fallback is enabled only by explicit operator action or a verified
+        // Soul persistence/integrity failure at its own call site.
+      }
+    }
+    acknowledgeLiveHostActions(consumed);
+  }, [
+    acknowledgeLiveHostActions,
+    commitConversationHistoryOutcome,
+    dispatchAvatarBehavior,
+    emitRuntimeEvent,
+    finalizeSoulOutcome,
+    pendingLiveHostActions,
+    recoverChatRuntime,
+    stop,
+  ]);
 
   useEffect(() => {
     if (!isLiveRuntimeOwner) return;
     const heartbeat = () =>
       emitRuntimeEvent({
         stage: 'runtime-owner-heartbeat',
+        scope: soulScope,
+        runtimeMode: soulRuntimeMode,
         ownerId: runtimeOwnerIdRef.current,
         availableForStress:
           !isProcessing &&
@@ -1753,6 +3309,8 @@ export default function App() {
     liveHostSnapshot,
     settingsHook.settings.tts.engine,
     settingsHook.settings.tts.minimaxApiKey,
+    soulRuntimeMode,
+    soulScope,
   ]);
 
   // A browser-side provider stream can remain internally locked after its
@@ -1795,58 +3353,424 @@ export default function App() {
     }
     if (!operatorPlaybackObservedRef.current) return;
 
-    const hasCompleteOperatorAudio =
-      operatorBeatCountRef.current > 0 &&
-      operatorCompletedBeatCountRef.current >= operatorBeatCountRef.current &&
-      operatorAudioByteLengthRef.current > 0;
+    const hasCompleteOperatorAudio = hasCompleteDeliveryEvidence({
+      beatCount: operatorBeatCountRef.current,
+      completedBeatCount: operatorCompletedBeatCountRef.current,
+      audioByteLength: operatorAudioByteLengthRef.current,
+    });
     // `isSpeaking` can fall false between streaming TTS beats.  In that gap,
     // a queue item must remain leased instead of being falsely announced as
     // done before its final beat exists.
     if (!hasCompleteOperatorAudio) return;
 
-    void updateOperatorQueue(eventId, 'done', {
-      ownerId: runtimeOwnerIdRef.current,
-      beatCount: operatorBeatCountRef.current,
-      completedBeatCount: operatorCompletedBeatCountRef.current,
-      audioByteLength: operatorAudioByteLengthRef.current,
-    })
-      .then(() => {
-        operatorPlaybackObservedRef.current = false;
-        speakingOperatorTaskRef.current = null;
-        if (operatorSpeechWatchdogRef.current !== null) {
-          window.clearTimeout(operatorSpeechWatchdogRef.current);
-          operatorSpeechWatchdogRef.current = null;
-        }
-        if (activeLifecycleRef.current?.eventId === eventId) {
-          emitRuntimeEvent({
-            eventId,
-            stage: 'done',
-            at: Date.now(),
-            source: activeLifecycleRef.current.channel,
-            sourceLabel: activeLifecycleRef.current.label,
-            viewerId: activeLifecycleRef.current.viewerId,
-            viewerName: activeLifecycleRef.current.viewerName,
-            sourcesSeen: activeLifecycleRef.current.sourcesSeen,
+    // Use the same idempotent completion path as the core SPEECH_END event.
+    // The first caller clears activeLifecycleRef; a late duplicate becomes a
+    // no-op and cannot commit the Soul reservation twice.
+    handleSpeechEnd();
+  }, [handleSpeechEnd, isSpeaking]);
+  const liveDirector = useLiveDirector(runtimeProfile, {
+    soulManaged: soulPublicBehaviorEnabled,
+  });
+  useEffect(() => {
+    if (!soulSession || soulRuntimeMode === 'legacy') return;
+    let cancelled = false;
+    const migrationKey = `aituber:soul-migration:v2:${soulScopeKey}`;
+    try {
+      if (localStorage.getItem(migrationKey)) return;
+    } catch {
+      // The ledger remains the authority when storage access is unavailable.
+    }
+    const timer = window.setTimeout(() => {
+      void (async () => {
+        try {
+          const exportedRecords = await streamerMemory.export();
+          // A record that explicitly belongs to another persona is not
+          // ambiguous legacy data; it is out of scope and must not even enter
+          // this persona's quarantine ledger.
+          const records = exportedRecords.filter(
+            (record) => record.digitalHumanId === soulScope.personaId,
+          );
+          const foreignPersonaSkippedCount =
+            exportedRecords.length - records.length;
+          const relationships = liveDirector.getRelationshipSnapshot();
+          const memoryEntries = records.map((record) => {
+            const classification = classifyLegacyMemoryMigration(record, {
+              personaId: soulScope.personaId,
+              platform: soulScope.platform,
+            });
+            const eligible = classification.disposition === 'projection-seed';
+            return {
+              id: `${eligible ? 'migration:v2:memory' : 'quarantine:v2:memory'}:${soulScope.sessionId}:${encodeURIComponent(record.id).slice(0, 100)}`,
+              occurredAt: record.updatedAt || record.createdAt || Date.now(),
+              payload: eligible
+                ? {
+                    protocolVersion: '1.0',
+                    recordType: 'legacy-memory-migration',
+                    disposition: 'projection-seed',
+                    provenance: 'indexeddb-streamer-memory-v1',
+                    evidenceLevel: 'production-equivalent',
+                    legacyRecordId: record.id,
+                    platform: soulScope.platform,
+                    viewerId: classification.viewerId,
+                    memoryKind: record.kind,
+                    subjectType: record.subjectType,
+                    subjectId: record.subjectId,
+                    title: record.title.slice(0, 240),
+                    untrustedLegacyContent: record.content.slice(0, 1_200),
+                    confidence: record.confidence,
+                    status: record.status,
+                  }
+                : {
+                    protocolVersion: '1.0',
+                    recordType: 'legacy-memory-quarantine',
+                    disposition: 'quarantine-audit',
+                    provenance: 'indexeddb-streamer-memory-v1',
+                    evidenceLevel: 'synthetic',
+                    legacyRecordId: record.id,
+                    quarantineReason: classification.reason,
+                    claimedPersonaId: record.digitalHumanId,
+                    claimedSubjectType: record.subjectType,
+                    claimedSubjectId: record.subjectId,
+                    claimedSourceType: record.sourceType,
+                  },
+            };
           });
-          activeLifecycleRef.current = null;
+          const relationshipEntries = Object.entries(relationships).map(
+            ([viewerScopeKey, relationship]) => {
+              const classification = classifyLegacyRelationshipMigration(
+                viewerScopeKey,
+                soulScope.platform,
+              );
+              const eligible =
+                classification.disposition === 'projection-seed';
+              return {
+                id: `${eligible ? 'migration:v2:relationship' : 'quarantine:v2:relationship'}:${soulScope.sessionId}:${encodeURIComponent(viewerScopeKey).slice(0, 90)}`,
+                occurredAt: relationship.lastSeenAt || Date.now(),
+                payload: eligible
+                  ? {
+                      protocolVersion: '1.0',
+                      recordType: 'legacy-relationship-migration',
+                      disposition: 'projection-seed',
+                      provenance: 'localstorage-live-relationships-v1',
+                      evidenceLevel: 'production-equivalent',
+                      platform: soulScope.platform,
+                      viewerId: classification.viewerId,
+                      viewerScopeKey,
+                      relationship,
+                    }
+                  : {
+                      protocolVersion: '1.0',
+                      recordType: 'legacy-relationship-quarantine',
+                      disposition: 'quarantine-audit',
+                      provenance: 'localstorage-live-relationships-v1',
+                      evidenceLevel: 'synthetic',
+                      viewerScopeKey,
+                      quarantineReason: classification.reason,
+                    },
+              };
+            },
+          );
+          const entries = [...memoryEntries, ...relationshipEntries];
+          const migratedMemoryCount = memoryEntries.filter(
+            (entry) => entry.payload.disposition === 'projection-seed',
+          ).length;
+          const migratedRelationshipCount = relationshipEntries.filter(
+            (entry) => entry.payload.disposition === 'projection-seed',
+          ).length;
+          const quarantineCount = entries.filter(
+            (entry) => entry.payload.disposition === 'quarantine-audit',
+          ).length;
+          for (const entry of entries) {
+            if (cancelled) return;
+            const response = await fetch('/api/soul/ledger', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                ...entry,
+                kind: 'reflection',
+                scope: soulScope,
+              }),
+            });
+            if (!response.ok) {
+              throw new Error(`legacy_migration_http_${response.status}`);
+            }
+          }
+          if (cancelled) return;
+          try {
+            localStorage.setItem(
+              migrationKey,
+              JSON.stringify({
+                completedAt: Date.now(),
+                memoryCount: migratedMemoryCount,
+                relationshipCount: migratedRelationshipCount,
+                quarantineCount,
+                foreignPersonaSkippedCount,
+              }),
+            );
+          } catch {
+            // The append-only ledger is already idempotent by migration IDs.
+          }
+          emitRuntimeEvent({
+            stage: 'soul_legacy_projection_migrated',
+            at: Date.now(),
+            scope: soulScope,
+            runtimeMode: soulRuntimeMode,
+            memoryCount: migratedMemoryCount,
+            relationshipCount: migratedRelationshipCount,
+            quarantineCount,
+            foreignPersonaSkippedCount,
+            evidenceLevel: 'production-equivalent',
+          });
+        } catch (error) {
+          if (cancelled) return;
+          emitRuntimeEvent({
+            stage: 'soul_legacy_projection_migration_failed',
+            at: Date.now(),
+            scope: soulScope,
+            error: error instanceof Error ? error.message : String(error),
+          });
         }
-      })
-      .catch((error) => {
+      })();
+    }, 1_500);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [
+    emitRuntimeEvent,
+    liveDirector,
+    runtimeProfile.id,
+    soulRuntimeMode,
+    soulScope,
+    soulScopeKey,
+    soulSession,
+    streamerMemory,
+  ]);
+  const runSoulReflection = useCallback(
+    async (reason: 'long-idle' | 'session-end' | 'important-conflict') => {
+      if (
+        !soulSession ||
+        soulRuntimeMode === 'legacy' ||
+        soulReflectionInFlightRef.current ||
+        soulControlState.cognitionFrozen ||
+        soulControlState.memoryIsolated ||
+        soulControlState.operatorHasControl
+      ) {
+        return;
+      }
+      const ledgerSummary = soulReflectionEvidenceRef.current.slice(-24);
+      if (ledgerSummary.length === 0) return;
+      soulReflectionInFlightRef.current = true;
+      const startedAt = Date.now();
+      emitRuntimeEvent({
+        stage: 'soul_reflection_started',
+        at: startedAt,
+        reason,
+        evidenceCount: ledgerSummary.length,
+        stateVersion: soulSession.getState().version,
+      });
+      try {
+        const canonProjection =
+          soulCanonProjection?.scopeKey === soulScopeKey
+            ? soulCanonProjection.projection
+            : undefined;
+        const existingCanon = canonProjection
+          ? [
+              ...canonProjection.active,
+              ...canonProjection.candidates,
+              ...canonProjection.superseded,
+              ...canonProjection.retracted,
+            ]
+          : [];
+        const result = await requestSoulReflection({
+          session: soulSession,
+          constitution: LINGLAN_SOUL_CONSTITUTION,
+          profile: LINGLAN_SOUL_PROFILE,
+          scope: soulScope,
+          ledgerSummary,
+          existingCanon,
+          memories: soulCanonMemoryRefs(canonProjection?.active ?? []),
+          reflectionKey: reason,
+          signal: AbortSignal.timeout(45_000),
+        });
+        const allowedEvidenceEventIds = ledgerSummary.map(
+          (entry) => entry.eventId,
+        );
+        const policyEvaluation = evaluateSoulReflectionPolicy({
+          profile: LINGLAN_SOUL_PROFILE,
+          proposal: result.proposal,
+          allowedEvidenceEventIds,
+        });
+        const committed = await soulSession.commitReflection({
+          proposal: result.proposal,
+          allowedEvidenceEventIds,
+          approval: policyEvaluation.approval,
+          occurredAt: Date.now(),
+        });
+        if (!committed.persistenceOk && committed.applied) {
+          setSoulControlState((state) => ({
+            ...state,
+            cognitionFrozen: true,
+            cognitionFreezeOrigin: 'state-persistence-failure',
+            neutralFallbackActive: true,
+          }));
+        } else if (!committed.persistenceOk) {
+          emitRuntimeEvent({
+            eventId: result.proposal.id,
+            stage: 'soul_reflection_audit_persistence_degraded',
+            at: Date.now(),
+            reason,
+            disposition: committed.record.disposition,
+          });
+        }
+        const reviewableCanonIds = new Set(
+          result.canonCandidates
+            .flatMap(({ validation, unknownEvidenceEventIds }, index) =>
+                unknownEvidenceEventIds.length === 0 &&
+                (validation.valid ||
+                  validation.reasonCodes.every(
+                    (code) => code === 'canon-review-passes-insufficient',
+                  ))
+                  ? [result.proposal.canonProposals[index]?.id ?? '']
+                  : [],
+            ),
+        );
+        const reviewableCanonProposal = {
+          ...result.proposal,
+          canonProposals: result.proposal.canonProposals.filter((proposal) =>
+            reviewableCanonIds.has(proposal.id),
+          ),
+        };
+        const canonResults =
+          committed.persistenceOk &&
+          soulCanonRepository &&
+          reviewableCanonProposal.canonProposals.length > 0
+            ? await soulCanonRepository.acceptReflectionCandidates(
+                reviewableCanonProposal,
+                ledgerSummary.flatMap((entry) =>
+                  entry.actorId
+                    ? [{ eventId: entry.eventId, actorId: entry.actorId }]
+                    : [],
+                ),
+              )
+            : [];
+        if (soulCanonRepository && canonResults.length > 0) {
+          setSoulCanonProjection({
+            scopeKey: soulScopeKey,
+            projection: soulCanonRepository.getProjection(),
+          });
+        }
+        soulLastReflectionAtRef.current = Date.now();
         emitRuntimeEvent({
-          eventId,
-          stage: 'failed',
+          eventId: result.reflectionId,
+          stage: 'soul_reflection_proposal_persisted',
           at: Date.now(),
-          reason: 'queue_completion_rejected',
+          reason,
+          durationMs: Date.now() - startedAt,
+          modelProfileId: result.meta.modelProfileId,
+          fallback: result.meta.fallback,
+          fallbackReason: result.meta.fallbackReason,
+          goalProposalCount: result.proposal.goalWeightDeltas.length,
+          beliefProposalCount: result.proposal.beliefProposals.length,
+          canonCandidateCount: result.canonCandidates.length,
+          validCanonCandidateCount: result.canonCandidates.filter(
+            (candidate) => candidate.validation.valid,
+          ).length,
+          approvedGoalCount: policyEvaluation.goalReviews.filter(
+            (review) => review.approved,
+          ).length,
+          approvedBeliefCount: policyEvaluation.beliefReviews.filter(
+            (review) => review.approved,
+          ).length,
+          reflectionDisposition: committed.record.disposition,
+          reflectionPersistenceOk: committed.persistenceOk,
+          canonDispositionCounts: canonResults.reduce<Record<string, number>>(
+            (counts, item) => {
+              counts[item.status] = (counts[item.status] ?? 0) + 1;
+              return counts;
+            },
+            {},
+          ),
+          reasonCodes: result.proposal.reasonCodes,
+          disposition: 'proposal-reviewed-under-local-policy',
+        });
+      } catch (error) {
+        emitRuntimeEvent({
+          stage: 'soul_reflection_failed',
+          at: Date.now(),
+          reason,
+          durationMs: Date.now() - startedAt,
           error: error instanceof Error ? error.message : String(error),
         });
-      });
-  }, [emitRuntimeEvent, isSpeaking]);
-  const liveDirector = useLiveDirector(runtimeProfile);
+      } finally {
+        soulReflectionInFlightRef.current = false;
+      }
+    },
+    [
+      emitRuntimeEvent,
+      soulCanonProjection,
+      soulCanonRepository,
+      soulControlState.cognitionFrozen,
+      soulControlState.memoryIsolated,
+      soulControlState.operatorHasControl,
+      soulRuntimeMode,
+      soulScope,
+      soulScopeKey,
+      soulSession,
+    ],
+  );
+  useEffect(() => {
+    if (!soulSession || soulRuntimeMode === 'legacy') return;
+    const maybeReflectDuringIdle = () => {
+      const now = Date.now();
+      const quietFor = Math.max(
+        0,
+        now - liveHostSnapshot.lastAudienceActivityAt,
+      );
+      if (
+        quietFor >= 5 * 60_000 &&
+        now - soulLastReflectionAtRef.current >= 15 * 60_000 &&
+        soulReflectionEvidenceRef.current.length >= 3 &&
+        !isProcessing &&
+        !isSpeaking
+      ) {
+        void runSoulReflection('long-idle');
+      }
+    };
+    maybeReflectDuringIdle();
+    const timer = window.setInterval(maybeReflectDuringIdle, 60_000);
+    return () => window.clearInterval(timer);
+  }, [
+    isProcessing,
+    isSpeaking,
+    liveHostSnapshot.lastAudienceActivityAt,
+    runSoulReflection,
+    soulRuntimeMode,
+    soulSession,
+  ]);
+  useEffect(() => {
+    const previous = soulPreviousHostPhaseRef.current;
+    soulPreviousHostPhaseRef.current = liveHostSnapshot.phase;
+    if (
+      previous !== 'offline' &&
+      liveHostSnapshot.phase === 'offline' &&
+      soulReflectionEvidenceRef.current.length > 0
+    ) {
+      void runSoulReflection('session-end');
+    }
+  }, [liveHostSnapshot.phase, runSoulReflection]);
   const getShortTermLiveContext = useCallback(
-    async (before = Date.now(), viewerId?: string) => {
+    async (before = Date.now(), viewerId?: string, eventPlatform?: string) => {
       try {
+        const params = appendConversationHistoryScopeQuery(
+          new URLSearchParams({
+            shortTerm: '1',
+            before: String(before),
+          }),
+          conversationHistoryScopeFor(viewerId, eventPlatform),
+        );
         const response = await fetch(
-          `/api/conversation-history?shortTerm=1&before=${before}`,
+          `/api/conversation-history?${params.toString()}`,
           {
             cache: 'no-store',
             signal: AbortSignal.timeout(900),
@@ -1861,7 +3785,10 @@ export default function App() {
                 const value = record as Record<string, unknown>;
                 if (
                   typeof value.at !== 'number' ||
-                  typeof value.input !== 'string'
+                  typeof value.input !== 'string' ||
+                  !['spoken', 'partial'].includes(
+                    String(value.deliveryStatus || ''),
+                  )
                 ) {
                   return [];
                 }
@@ -1920,7 +3847,7 @@ export default function App() {
       }
       return buildLiveRoomTranscript(recentLiveTurnsRef.current, viewerId);
     },
-    [],
+    [conversationHistoryScopeFor],
   );
   // Keep this object stable when its values did not change; otherwise the
   // scheduler effect below mistakes every sync for a configuration edit and
@@ -1990,9 +3917,69 @@ export default function App() {
       emptyRoomAwarenessPlannerRef.current?.reset();
     }
   }, [emptyRoomAwarenessSettings, runtimeProfile.id]);
+  const processCoordinatedScreenVisionChat = useCallback(
+    async (imageDataUrl: string, prompt?: string) => {
+      if (runtimeScopeReadyKey !== soulScopeKey) return;
+      const eventId = `screen-vision:${crypto.randomUUID()}`;
+      const turn = {
+        eventId,
+        kind: 'viewer' as const,
+        priority: 'low' as const,
+        createdAt: Date.now(),
+      };
+      dispatchLiveHostEvent({
+        type: 'generation',
+        at: Date.now(),
+        eventId,
+        stage: 'started',
+        turn,
+      });
+      dispatchLiveHostEvent({
+        type: 'generation',
+        at: Date.now(),
+        eventId,
+        stage: 'completed',
+        turn,
+      });
+      if (!claimSpeechPermission(eventId)) {
+        emitRuntimeEvent({
+          eventId,
+          stage: 'dropped',
+          at: Date.now(),
+          source: 'screen-vision',
+          reason: 'coordinator_denied_screen_vision_speech',
+        });
+        return;
+      }
+      beginConversationLifecycle(
+        { channel: 'screen-vision', label: 'screen-vision' },
+        eventId,
+      );
+      await processVisionChat(imageDataUrl, prompt);
+      if (activeLifecycleRef.current?.eventId === eventId) {
+        emitRuntimeEvent({
+          eventId,
+          stage: 'failed',
+          at: Date.now(),
+          source: 'screen-vision',
+          reason: 'vision_completed_without_public_speech',
+        });
+        activeLifecycleRef.current = null;
+      }
+    },
+    [
+      beginConversationLifecycle,
+      claimSpeechPermission,
+      dispatchLiveHostEvent,
+      emitRuntimeEvent,
+      processVisionChat,
+      runtimeScopeReadyKey,
+      soulScopeKey,
+    ],
+  );
   const screenVisionController = useScreenVisionController({
     settings: settingsHook.settings.screenVision,
-    onCapture: processVisionChat,
+    onCapture: processCoordinatedScreenVisionChat,
     onEnabledChange: settingsHook.updateScreenVisionEnabled,
     onDeviceIdChange: settingsHook.updateScreenVisionDeviceId,
   });
@@ -2030,6 +4017,7 @@ export default function App() {
         scenarioId?: string;
         faultKind?: OperatorQueueItem['faultKind'];
         faultConsumed?: boolean;
+        engagementSignals?: OperatorQueueItem['engagementSignals'];
       },
     ) => {
       const eventId = options?.eventId ?? crypto.randomUUID();
@@ -2071,6 +4059,7 @@ export default function App() {
         : await getShortTermLiveContext(
             options?.createdAt,
             options?.viewerId,
+            options?.sourcesSeen?.[0],
           );
       const routerTurns = isProactive
         ? []
@@ -2079,13 +4068,29 @@ export default function App() {
             .slice(-8);
       const weatherLocationClarification =
         getWeatherLocationClarification(displayText);
-      const routing = await routeTyphoonSkillWithAgent({
+      const routingInput = {
         text: displayText,
         viewerId: options?.viewerId,
         viewerName: options?.viewerName,
         sourceLabel: options?.sourceLabel,
         turns: routerTurns,
-      });
+      };
+      const soulRouting = soulPublicBehaviorEnabled
+        ? routeSoulSkillDeterministically(routingInput)
+        : null;
+      const soulOwnsTurn = Boolean(
+        soulRouting &&
+          (soulRuntimeMode === 'primary' ||
+            (soulRuntimeMode === 'canary' &&
+              canaryOwnsSoulTurn(
+                isProactive,
+                options?.engagementSignals,
+                soulRouting.moderation,
+              ))),
+      );
+      const routing = soulOwnsTurn
+        ? soulRouting!
+        : await routeTyphoonSkillWithAgent(routingInput);
       emitRuntimeEvent({
         eventId,
         stage: 'program_decision',
@@ -2105,7 +4110,9 @@ export default function App() {
         },
       });
       let personaContext = '';
-      if (personaPlannerEnabled) {
+      let legacySpeechPlanHints: SpeechPlanV2BuilderHints | undefined;
+      let personaRuntimeTransition: PersonaRuntimeTransition | undefined;
+      if (personaPlannerEnabled && !soulOwnsTurn) {
         const personaStartedAt = performance.now();
         emitRuntimeEvent({
           eventId,
@@ -2139,11 +4146,58 @@ export default function App() {
           personaInput,
           LINGLAN_PERSONA_POLICY,
         );
-        const personaPlan = await refinePersonaPlanWithAgent(
+        const refinedPersonaPlan = await refinePersonaPlanWithAgent(
           personaInput,
           localPlan,
           LINGLAN_PERSONA_POLICY,
         );
+        const proactiveIntent =
+          pendingPersonaRuntimeCommitsRef.current.get(eventId)?.proactive;
+        const intentAlignedPlan = proactiveIntent
+          ? {
+              ...refinedPersonaPlan,
+              mustDo: [
+                proactiveIntent.mustAdvance,
+                `只推进人格动力：${proactiveIntent.drive}（${proactiveIntent.driveGoal}）`,
+                ...refinedPersonaPlan.mustDo,
+              ],
+              mustAvoid: [
+                `不得重复近期冷却主题：${proactiveIntent.mustAvoidTopics.join('、') || '无'}`,
+                '不得把杯子、饮料或其他道具当作人格内容引擎',
+                ...refinedPersonaPlan.mustAvoid,
+              ],
+              deliveryTarget: {
+                ...refinedPersonaPlan.deliveryTarget,
+                emotion: proactiveIntent.emotion.label,
+                delivery: proactiveIntent.emotion.delivery,
+                intensity: proactiveIntent.emotion.intensity,
+              },
+              reasonCode: `${refinedPersonaPlan.reasonCode}:${proactiveIntent.reasonCode}`.slice(
+                0,
+                120,
+              ),
+            }
+          : refinedPersonaPlan;
+        const runtimePrepared = personaRuntimeStateRef.current!.prepareInteraction(
+          intentAlignedPlan,
+          Date.now(),
+          options?.viewerId,
+        );
+        const personaPlan = runtimePrepared.plan;
+        legacySpeechPlanHints = {
+          emotion: personaPlan.deliveryTarget.emotion,
+          delivery: personaPlan.deliveryTarget.delivery,
+          emotionIntensity:
+            (personaPlan.deliveryTarget.intensity[0] +
+              personaPlan.deliveryTarget.intensity[1]) /
+            2,
+          prosody: personaPlan.deliveryTarget.prosody,
+          motion:
+            routing.mode === 'urgent' || routing.mode === 'weather'
+              ? 'serious_report'
+              : undefined,
+        };
+        personaRuntimeTransition = runtimePrepared.transition;
         const personaDurationMs = Math.round(performance.now() - personaStartedAt);
         const personaAudit = {
           eventId,
@@ -2156,6 +4210,10 @@ export default function App() {
           source: personaPlan.source,
           reasonCode: personaPlan.reasonCode,
           durationMs: personaDurationMs,
+          activeDrive: proactiveIntent?.drive,
+          topicFamily: proactiveIntent?.topicFamily,
+          topicSource: proactiveIntent?.source,
+          expressedEmotion: personaPlan.deliveryTarget.emotion,
         };
         emitRuntimeEvent({
           ...personaAudit,
@@ -2246,6 +4304,74 @@ export default function App() {
           routing.moderation === 'local_mute') &&
         options?.viewerId
       ) {
+        if (
+          soulSession &&
+          (soulOwnsTurn ||
+            soulRuntimeMode === 'shadow' ||
+            soulRuntimeMode === 'canary')
+        ) {
+          const safetyEvent = createLinglanSoulEvent({
+            id: eventId,
+            scope: soulScope,
+            kind: 'safety-signal',
+            occurredAt: options?.commentAt ?? Date.now(),
+            receivedAt: options?.receivedAt ?? Date.now(),
+            evidenceLevel: soulEvidenceLevel({
+              testRunId: options?.testRunId,
+              sourceLabel: options?.sourceLabel,
+              sourcesSeen: options?.sourcesSeen,
+            }),
+            provenance: 'local-live-safety-gateway',
+            confidence: 1,
+            urgency: 'high',
+            actor: {
+              kind: 'viewer',
+              id:
+                scopedViewerId(
+                  options.viewerId,
+                  options?.sourcesSeen?.[0],
+                ) ?? options.viewerId,
+              displayName: options?.viewerName,
+            },
+            data: {
+              text: displayText,
+              untrustedViewerText: displayText,
+              moderation: 'local_mute',
+              safetyScore: safety?.event?.score,
+            },
+          });
+          recordSoulReflectionEvidence({
+            eventId,
+            summary: `Safety-gated viewer event: ${displayText.slice(0, 420)}`,
+            evidenceLevel: safetyEvent.evidenceLevel,
+            provenance: safetyEvent.provenance,
+            actorId: safetyEvent.actor?.id,
+          });
+          const safetyEvaluation = await soulSession.evaluate(safetyEvent, {
+            forceFallbackReason: 'local-safety-mute',
+          });
+          const safetyTrace = projectSoulEvaluation(
+            safetyEvaluation,
+            safetyEvent,
+          );
+          setSoulInspectorTrace({
+            ...safetyTrace,
+            outcome: {
+              status: 'skipped',
+              occurredAt: Date.now(),
+              reasonCode: 'local-safety-mute',
+            },
+          });
+          if (soulOwnsTurn) {
+            await soulSession.reserveDecision(eventId);
+            soulSessionByEventIdRef.current.set(eventId, soulSession);
+            finalizeSoulOutcome(eventId, 'skipped', {
+              deliveredFraction: 0,
+              reasonCode: 'local-safety-mute',
+            });
+          }
+          void runSoulReflection('important-conflict');
+        }
         emitRuntimeEvent({
           eventId,
           stage: 'director_local_mute',
@@ -2268,6 +4394,13 @@ export default function App() {
         });
         options?.onPrepared?.(NO_REPLY_TOKEN, []);
         return true;
+      }
+      if (personaRuntimeTransition) {
+        const pending = pendingPersonaRuntimeCommitsRef.current.get(eventId);
+        pendingPersonaRuntimeCommitsRef.current.set(eventId, {
+          ...pending,
+          interaction: personaRuntimeTransition,
+        });
       }
       const responseContract = isProactive
         ? {
@@ -2301,7 +4434,11 @@ export default function App() {
         sourcesSeen: options?.sourcesSeen,
         createdAt: options?.commentAt,
       });
-      if (weatherLocationClarification && options?.onPrepared) {
+      if (
+        weatherLocationClarification &&
+        options?.onPrepared &&
+        !soulOwnsTurn
+      ) {
         emitRuntimeEvent({
           eventId,
           stage: 'weather_clarification_fast_path',
@@ -2353,21 +4490,459 @@ export default function App() {
         });
       }
       const payload = enrichment.payload;
+      const shouldShadowSoulTurn = Boolean(
+        soulSession &&
+          !soulOwnsTurn &&
+          (soulRuntimeMode === 'shadow' || soulRuntimeMode === 'canary'),
+      );
+      let runShadowSoulEvaluation: (() => void) | undefined;
+      if (soulSession && (soulOwnsTurn || shouldShadowSoulTurn)) {
+        const actorId =
+          scopedViewerId(options?.viewerId, options?.sourcesSeen?.[0]) ??
+          (isProactive ? runtimeProfile.id : 'control-room-operator');
+        const eventKind = soulEventKindForTurn(
+          isProactive,
+          options?.engagementSignals,
+        );
+        const soulEvent = createLinglanSoulEvent({
+          id: eventId,
+          scope: soulScope,
+          kind: eventKind,
+          occurredAt: options?.commentAt ?? options?.createdAt ?? Date.now(),
+          receivedAt: options?.receivedAt ?? Date.now(),
+          evidenceLevel: soulEvidenceLevel({
+            testRunId: options?.testRunId,
+            sourceLabel: options?.sourceLabel,
+            sourcesSeen: options?.sourcesSeen,
+          }),
+          provenance: [
+            options?.sourceLabel,
+            ...(options?.sourcesSeen ?? []),
+          ]
+            .filter(Boolean)
+            .join(':') || 'local-control-room',
+          confidence: 1,
+          urgency:
+            routing.mode === 'urgent'
+              ? 'urgent'
+              : routing.moderation !== 'none'
+                ? 'high'
+                : isProactive
+                  ? 'low'
+                  : 'normal',
+          actor: {
+            kind: isProactive
+              ? 'self'
+              : options?.viewerId
+                ? 'viewer'
+                : 'operator',
+            id: actorId,
+            displayName: options?.viewerName,
+          },
+          data: isProactive
+            ? createSoulQuietEventData({
+                durationMs:
+                  Date.now() - liveHostSnapshot.lastAudienceActivityAt,
+                roomContext: options?.roomContext,
+                sourceLabel: options?.sourceLabel,
+                // Soul focus has no authoritative activity lease yet. Keep
+                // this false instead of inferring engagement from legacy drives.
+                selfDirectedEngagement: false,
+              })
+            : {
+                text: displayText,
+                untrustedViewerText: displayText,
+                sourceLabel: options?.sourceLabel,
+                supportRequestEligible: !isCityReportEngagementPayload({
+                  eventId,
+                  text: displayText,
+                }),
+                engagementSignals: options?.engagementSignals,
+                roomConflict: options?.roomContext?.conflictLevel,
+                routeMode: routing.mode,
+                routeIntent: routing.intent,
+                truthDomain: enrichment.isDomainSensitive
+                  ? 'weather'
+                  : routing.mode === 'urgent'
+                    ? 'safety'
+                    : undefined,
+              },
+        });
+        recordSoulReflectionEvidence({
+          eventId,
+          summary: isProactive
+            ? `Quiet-room interval: ${String(soulEvent.data.durationMs ?? 0)}ms`
+            : displayText.slice(0, 600),
+          evidenceLevel: soulEvent.evidenceLevel,
+          provenance: soulEvent.provenance,
+          actorId: soulEvent.actor?.id,
+        });
+        const verifiedFacts: SubjectiveFactV1[] = [];
+        if (weatherLocationClarification) {
+          verifiedFacts.push({
+            id: `fact:${eventId}:weather-location-required`,
+            statement: weatherLocationClarification,
+            provenance: 'local-weather-location-validator',
+            confidence: 1,
+          });
+        }
+        if (Array.isArray(payload?.claims)) {
+          payload.claims.slice(0, 8).forEach((claim, index) => {
+            const statement = boundedSoulFactContent(claim);
+            if (!statement) return;
+            verifiedFacts.push({
+              id: `fact:${eventId}:tool-claim:${index}`,
+              statement,
+              provenance: `tool:${enrichment.skills.join(',') || 'host-extension'}`,
+              confidence: 1,
+            });
+          });
+        }
+        if (enrichment.isDomainSensitive && enrichment.fallbackReply) {
+          verifiedFacts.push({
+            id: `fact:${eventId}:required-answer`,
+            statement: enrichment.fallbackReply,
+            provenance: `tool-postcondition:${enrichment.skills.join(',') || 'host-extension'}`,
+            confidence: 1,
+          });
+        }
+        const memories: SubjectiveMemoryRefV1[] = soulControlState.memoryIsolated
+          ? []
+          : [
+              ...soulCanonMemoryRefs(activeSoulCanon, soulEvent.actor?.id),
+              ...streamerMemory
+                .signalsFor(displayText, {
+                  id: scopedViewerId(
+                    options?.viewerId,
+                    options?.sourcesSeen?.[0],
+                  ),
+                  name: options?.viewerName,
+                })
+                .map((signal, index) => ({
+                  id: `legacy-memory:${eventId}:${index}`,
+                  content: signal.topic,
+                  provenance: `legacy-memory-migration:${signal.sourceKind}`,
+                  confidence: signal.confidence,
+                })),
+            ].slice(0, 6);
+        const forceFallbackReason = soulControlState.operatorHasControl
+          ? 'operator-has-execution-control'
+          : soulControlState.cognitionFrozen
+            ? 'cognition-frozen'
+            : soulControlState.neutralFallbackActive
+              ? 'operator-neutral-fallback'
+              : undefined;
+        const evaluateSoulTurn = () =>
+          soulSession.evaluate(soulEvent, {
+            verifiedFacts,
+            memories,
+            forceFallbackReason,
+          });
+
+        if (!soulOwnsTurn) {
+          runShadowSoulEvaluation = () => {
+            void evaluateSoulTurn()
+              .then((evaluation) => {
+                const trace = projectSoulEvaluation(evaluation, soulEvent);
+                setSoulInspectorTrace({
+                  ...trace,
+                  outcome: {
+                    status: 'skipped',
+                    occurredAt: Date.now(),
+                    reasonCode: 'shadow-non-authoritative',
+                  },
+                });
+                emitRuntimeEvent({
+                  eventId,
+                  stage: 'soul_shadow_decision',
+                  at: Date.now(),
+                  evidenceLevel: soulEvent.evidenceLevel,
+                  stateVersion: evaluation.state.version,
+                  action: evaluation.decision.action,
+                  utility: evaluation.decision.utility,
+                  reasonCodes: evaluation.decision.reasonCodes,
+                  candidateScores: evaluation.decision.candidateScores,
+                  modelProfileId: evaluation.meta.modelProfileId,
+                  modelLatencyMs: evaluation.meta.latencyMs,
+                  fallback: evaluation.meta.fallback,
+                  fallbackReason: evaluation.meta.fallbackReason,
+                  persistenceOk: evaluation.persistenceOk,
+                });
+              })
+              .catch((error) => {
+                emitRuntimeEvent({
+                  eventId,
+                  stage: 'soul_shadow_failed',
+                  at: Date.now(),
+                  error: error instanceof Error ? error.message : String(error),
+                });
+              });
+          };
+        } else {
+          const evaluation = await evaluateSoulTurn();
+          setSoulInspectorTrace(projectSoulEvaluation(evaluation, soulEvent));
+          emitRuntimeEvent({
+            eventId,
+            stage: 'soul_decision_selected',
+            at: Date.now(),
+            scope: soulScope,
+            runtimeMode: soulRuntimeMode,
+            evidenceLevel: soulEvent.evidenceLevel,
+            stateVersion: evaluation.state.version,
+            action: evaluation.decision.action,
+            truthMode: evaluation.decision.truthMode,
+            goalsServed: evaluation.decision.goalsServed,
+            utility: evaluation.decision.utility,
+            reasonCodes: evaluation.decision.reasonCodes,
+            candidateScores: evaluation.decision.candidateScores,
+            internalAffect: evaluation.decision.internalAffect,
+            expressedAffect: evaluation.decision.expressedAffect,
+            modelProfileId: evaluation.meta.modelProfileId,
+            modelLatencyMs: evaluation.meta.latencyMs,
+            modelFirstContentLatencyMs: evaluation.meta.firstContentLatencyMs,
+            fallback: evaluation.meta.fallback,
+            fallbackReason: evaluation.meta.fallbackReason,
+            persistenceOk: evaluation.persistenceOk,
+          });
+
+          const reserved = await soulSession.reserveDecision(eventId);
+          setSoulInspectorTrace((previous) =>
+            previous?.event.id === eventId
+              ? { ...previous, state: projectSoulState(reserved.state) }
+              : previous,
+          );
+          const publicExecutionBlocked =
+            !evaluation.persistenceOk ||
+            !reserved.persistenceOk ||
+            soulControlState.operatorHasControl;
+          const authoritativeUtterance =
+            weatherLocationClarification ||
+            (enrichment.forceFallback && enrichment.fallbackReply
+              ? enrichment.fallbackReply
+              : undefined);
+          const selectedUtterance =
+            authoritativeUtterance ?? evaluation.decision.utterance;
+          const deliberateSilence =
+            (!authoritativeUtterance &&
+              (evaluation.decision.action === 'remain-silent' ||
+                evaluation.decision.action === 'delay')) ||
+            !selectedUtterance?.trim() ||
+            (!authoritativeUtterance &&
+              evaluation.decision.expiresAt <= Date.now());
+          if (publicExecutionBlocked || deliberateSilence) {
+            const reasonCode = publicExecutionBlocked
+              ? soulControlState.operatorHasControl
+                ? 'operator-has-execution-control'
+                : 'soul-persistence-fail-closed'
+              : evaluation.decision.expiresAt <= Date.now()
+                ? 'soul-decision-expired'
+                : `deliberate-${evaluation.decision.action}`;
+            soulSessionByEventIdRef.current.set(eventId, soulSession);
+            finalizeSoulOutcome(eventId, 'skipped', {
+              deliveredFraction: 0,
+              reasonCode,
+            });
+            processingLiveEventIdsRef.current.delete(eventId);
+            dispatchLiveHostEvent({
+              type: 'generation',
+              at: Date.now(),
+              eventId,
+              stage: 'completed',
+              turn,
+            });
+            emitRuntimeEvent({
+              eventId,
+              stage: 'soul_formal_silence',
+              at: Date.now(),
+              action: evaluation.decision.action,
+              reasonCode,
+              expiresAt: evaluation.decision.expiresAt,
+            });
+            options?.onPrepared?.(NO_REPLY_TOKEN, []);
+            return true;
+          }
+
+          const guardedResponse = guardViewerResponse(selectedUtterance ?? '', {
+            isWeather: Boolean(enrichment.isDomainSensitive),
+            viewerText: displayText,
+            requiredAnswer: enrichment.isDomainSensitive
+              ? enrichment.fallbackReply
+              : undefined,
+            claims: Array.isArray(payload?.claims) ? payload.claims : undefined,
+            placeResolution: payload?.placeResolution,
+            rawEvidence: payload,
+            catchup: options?.catchup,
+            forceFallback: enrichment.forceFallback,
+          });
+          const spokenText = guardedResponse.text.trim();
+          const speechHints = speechPlanHintsForSoulDecision(
+            evaluation.decision,
+          );
+          const builtSpeechPlan = buildSpeechPlanV2(
+            spokenText,
+            authoritativeUtterance
+              ? {
+                  ...speechHints,
+                  emotion: 'serious',
+                  delivery: 'serious',
+                  motion: 'serious_report',
+                }
+              : speechHints,
+          );
+          const speechPlan: PreparedSpeechPlan = {
+            version: 2,
+            beats: builtSpeechPlan.beats.map((beat) => ({
+              ...beat,
+              prosody: beat.prosody
+                ? Object.fromEntries(Object.entries(beat.prosody))
+                : undefined,
+            })),
+          };
+          if (options?.persistInteraction !== false) {
+            pendingDeliveredInteractionsRef.current.set(eventId, {
+              input: displayText,
+              reply: spokenText,
+              eventId,
+              viewerId: options?.viewerId,
+              viewerName: options?.viewerName,
+              source: options?.source,
+              sourceLabel: options?.sourceLabel,
+              sourcesSeen: options?.sourcesSeen,
+            });
+          }
+          soulSessionByEventIdRef.current.set(eventId, soulSession);
+          if (replyLatencyRef.current) {
+            replyLatencyRef.current.llmCompletedAt = Date.now();
+            replyLatencyRef.current.input = displayText;
+            replyLatencyRef.current.reply = spokenText;
+            replyLatencyRef.current.eventId = eventId;
+          }
+          const historyScope = conversationHistoryScopeFor(
+            options?.viewerId,
+            options?.sourcesSeen?.[0],
+          );
+          conversationHistoryScopeByEventIdRef.current.set(
+            eventId,
+            historyScope,
+          );
+          void fetch('/api/conversation-history', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              input: displayText,
+              reply: spokenText,
+              viewerId: options?.viewerId,
+              viewerName: options?.viewerName,
+              source: options?.source,
+              sourceLabel: options?.sourceLabel,
+              eventId,
+              scope: historyScope,
+              deliveryStatus: 'generated',
+              commentAt: options?.commentAt,
+              receivedAt: options?.receivedAt,
+              queuedAt: options?.queuedAt,
+              selectedAt: options?.selectedAt,
+              processingAt: options?.processingAt,
+              llmStartAt: options?.processingAt,
+              llmEndAt: Date.now(),
+              sourcesSeen: options?.sourcesSeen,
+              replyAt: Date.now(),
+            }),
+          }).catch(() => undefined);
+          processingLiveEventIdsRef.current.delete(eventId);
+          dispatchLiveHostEvent({
+            type: 'generation',
+            at: Date.now(),
+            eventId,
+            stage: 'completed',
+            turn,
+          });
+          emitRuntimeEvent({
+            eventId,
+            stage: 'soul_speech_plan_built',
+            at: Date.now(),
+            beatCount: speechPlan.beats.length,
+            action: evaluation.decision.action,
+            factPostconditionApplied:
+              spokenText !== evaluation.decision.utterance,
+            responseGuardRewritten: guardedResponse.rewritten,
+            responseGuardReasons: guardedResponse.reasons,
+          });
+          if (options?.onPrepared) {
+            options.onPrepared(spokenText, enrichment.skills, speechPlan);
+            return true;
+          }
+          if (!claimSpeechPermission(eventId)) {
+            commitConversationHistoryOutcome(eventId, 'skipped', {
+              viewerId: options?.viewerId,
+              deliveredFraction: 0,
+              reasonCode: 'coordinator-denied-direct-speech',
+            });
+            pendingDeliveredInteractionsRef.current.delete(eventId);
+            finalizeSoulOutcome(eventId, 'skipped', {
+              deliveredFraction: 0,
+              reasonCode: 'coordinator-denied-direct-speech',
+            });
+            return true;
+          }
+          await speakPrepared(spokenText, speechPlan);
+          return true;
+        }
+      }
       // Operator-queue preparation must return a writable text draft. The
       // screenshot/vision route speaks directly and has no draft callback, so
       // reserve it for one-off direct broadcasts only.
       if (enrichment.vision && !options?.silent) {
         const liveRadarImage = await enrichment.vision.capture();
         if (liveRadarImage) {
-          return processVisionChat(
+          processingLiveEventIdsRef.current.delete(eventId);
+          dispatchLiveHostEvent({
+            type: 'generation',
+            at: Date.now(),
+            eventId,
+            stage: 'completed',
+            turn,
+          });
+          if (!claimSpeechPermission(eventId)) {
+            emitRuntimeEvent({
+              eventId,
+              stage: 'dropped',
+              at: Date.now(),
+              reason: 'coordinator_denied_direct_vision_speech',
+            });
+            return false;
+          }
+          if (activeLifecycleRef.current?.eventId !== eventId) {
+            activeLifecycleRef.current = {
+              eventId,
+              channel: options?.source ?? 'vision',
+              label: options?.sourceLabel ?? 'vision',
+              viewerId: options?.viewerId,
+              viewerName: options?.viewerName,
+              sourcesSeen: options?.sourcesSeen,
+            };
+          }
+          await processVisionChat(
             liveRadarImage,
             enrichment.vision.buildPrompt(
               options?.displayText ?? text,
               enrichment.context,
             ),
           );
+          if (activeLifecycleRef.current?.eventId === eventId) {
+            emitRuntimeEvent({
+              eventId,
+              stage: 'failed',
+              at: Date.now(),
+              reason: 'vision_completed_without_public_speech',
+            });
+            activeLifecycleRef.current = null;
+          }
+          return true;
         }
       }
+      const directPlaybackRequested =
+        options?.silent !== true && !options?.onPrepared;
       return processChat(text, {
         ...options,
         eventId,
@@ -2390,8 +4965,16 @@ export default function App() {
           catchup: options?.catchup,
           forceFallback: enrichment.forceFallback,
         },
-        silent: options?.silent,
+        speechPlanHints: legacySpeechPlanHints,
+        // Generate silently, then let the one-shot coordinator permission
+        // authorize the only public playback path.
+        silent: true,
         onPrepared: (reply, speechPlan) => {
+          // Shadow mode deliberately runs the second diagnostic model call
+          // only after the authoritative legacy draft has completed. Running
+          // both MiniMax requests concurrently starved the Soul stream before
+          // its first content and made every trace look like a provider fault.
+          runShadowSoulEvaluation?.();
           processingLiveEventIdsRef.current.delete(eventId);
           dispatchLiveHostEvent({
             type: 'generation',
@@ -2400,19 +4983,96 @@ export default function App() {
             stage: 'completed',
             turn,
           });
-          options?.onPrepared?.(reply, enrichment.skills, speechPlan);
+          if (options?.onPrepared) {
+            options.onPrepared(reply, enrichment.skills, speechPlan);
+            return;
+          }
+          if (!directPlaybackRequested) return;
+          if (
+            runtimeScopeReadyKey !== soulScopeKey ||
+            !claimSpeechPermission(eventId)
+          ) {
+            emitRuntimeEvent({
+              eventId,
+              stage: 'dropped',
+              at: Date.now(),
+              reason: 'coordinator_denied_direct_chat_speech',
+            });
+            commitConversationHistoryOutcome(eventId, 'skipped', {
+              viewerId: options?.viewerId,
+              deliveredFraction: 0,
+              reasonCode: 'coordinator-denied-direct-chat-speech',
+            });
+            return;
+          }
+          const active = activeLifecycleRef.current;
+          if (active?.eventId === eventId) {
+            active.replyText = reply;
+          } else {
+            activeLifecycleRef.current = {
+              eventId,
+              replyText: reply,
+              channel: options?.source ?? 'chat',
+              label: options?.sourceLabel ?? 'chat',
+              viewerId: options?.viewerId,
+              viewerName: options?.viewerName,
+              sourcesSeen: options?.sourcesSeen,
+            };
+          }
+          void speakPrepared(reply, speechPlan).catch((error) => {
+            emitRuntimeEvent({
+              eventId,
+              stage: 'failed',
+              at: Date.now(),
+              reason: 'direct_chat_tts_failed',
+              error: error instanceof Error ? error.message : String(error),
+            });
+            commitConversationHistoryOutcome(eventId, 'failed', {
+              viewerId: options?.viewerId,
+              deliveredFraction: 0,
+              reasonCode: 'direct-chat-tts-failed',
+              ttsEndAt: Date.now(),
+            });
+            void finalizeSoulOutcome(eventId, 'failed', {
+              deliveredFraction: 0,
+              reasonCode: 'direct-chat-tts-failed',
+            });
+            if (activeLifecycleRef.current?.eventId === eventId) {
+              activeLifecycleRef.current = null;
+            }
+          });
         },
       });
     },
     [
+      activeSoulCanon,
+      commitConversationHistoryOutcome,
+      conversationHistoryScopeFor,
       emitRuntimeEvent,
       dispatchLiveHostEvent,
+      claimSpeechPermission,
+      finalizeSoulOutcome,
       getShortTermLiveContext,
+      hostExtensions,
       liveDirector,
+      liveHostSnapshot.lastAudienceActivityAt,
+      personaPlannerEnabled,
       processChat,
       processVisionChat,
-      hostExtensions,
-      personaPlannerEnabled,
+      recordSoulReflectionEvidence,
+      runSoulReflection,
+      runtimeProfile.id,
+      runtimeScopeReadyKey,
+      soulControlState.cognitionFrozen,
+      soulControlState.memoryIsolated,
+      soulControlState.neutralFallbackActive,
+      soulControlState.operatorHasControl,
+      soulPublicBehaviorEnabled,
+      soulRuntimeMode,
+      soulScope,
+      soulScopeKey,
+      soulSession,
+      speakPrepared,
       streamerMemory,
     ],
   );
@@ -2682,10 +5342,25 @@ export default function App() {
         typeof input.createdAt === 'number' && Number.isFinite(input.createdAt)
           ? input.createdAt
           : now;
+      const normalizedCityReport = normalizeCityReportEngagementPayload(
+        {
+          eventId: input.eventId,
+          text: input.text,
+          directReply: input.directReply,
+          viewerName: input.viewerName,
+        },
+        soulRuntimeMode,
+      );
+      const queueInput = {
+        ...input,
+        text: normalizedCityReport.text,
+        directReply: normalizedCityReport.directReply,
+        viewerName: normalizedCityReport.viewerName,
+      };
       const response = await fetch('/api/operator-queue', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ action: 'ingest', ...input, createdAt }),
+        body: JSON.stringify({ action: 'ingest', ...queueInput, createdAt }),
       });
       if (!response.ok) {
         const detail = (await response.text()).trim();
@@ -2695,13 +5370,28 @@ export default function App() {
           }`,
         );
       }
-      emitRuntimeEvent({ ...input, stage: 'received', at: now });
-      emitRuntimeEvent({ ...input, stage: 'queued', at: now, queuedAt: now });
+      emitRuntimeEvent({
+        ...queueInput,
+        stage: 'received',
+        at: now,
+        cityReportResult: normalizedCityReport.isCityReportResult,
+        legacySupportRequestRemoved:
+          normalizedCityReport.legacySupportRequestRemoved,
+      });
+      emitRuntimeEvent({
+        ...queueInput,
+        stage: 'queued',
+        at: now,
+        queuedAt: now,
+        cityReportResult: normalizedCityReport.isCityReportResult,
+        legacySupportRequestRemoved:
+          normalizedCityReport.legacySupportRequestRemoved,
+      });
       // The item has already been accepted. A transient list refresh must not
       // make the caller treat that accepted task as an enqueue failure.
       await refreshOperatorQueue().catch(() => undefined);
     },
-    [emitRuntimeEvent, refreshOperatorQueue],
+    [emitRuntimeEvent, refreshOperatorQueue, soulRuntimeMode],
   );
 
   const enqueueProactiveSpeech = useCallback(
@@ -2709,6 +5399,8 @@ export default function App() {
       prompt: string;
       awarenessSource: string;
       audiencePresent: boolean;
+      personaIntent?: ProactiveIntentPlanV1;
+      roomContext?: RoomInteractionSnapshot;
       scheduledNextAt?: number;
       busy?: boolean;
     }) => {
@@ -2718,6 +5410,8 @@ export default function App() {
         at: Date.now(),
         eventId,
         source: input.awarenessSource,
+        opportunityId: eventId,
+        expiresAt: Date.now() + 30_000,
         prompt: input.prompt,
         busy: input.busy === true,
       });
@@ -2736,29 +5430,71 @@ export default function App() {
         });
         return;
       }
-      emitRuntimeEvent({
-        eventId,
-        stage: 'proactive-selected',
-        at: Date.now(),
-        source: 'quiet-room-awareness',
-        awarenessSource: input.awarenessSource,
-        audiencePresent: input.audiencePresent,
-        scheduledNextAt: input.scheduledNextAt,
-      });
+      const personaIntent = input.personaIntent;
+      if (!soulPublicBehaviorEnabled && !personaIntent) {
+        emitRuntimeEvent({
+          eventId,
+          stage: 'dropped',
+          at: Date.now(),
+          source: 'quiet-room-awareness',
+          reason: 'legacy-persona-intent-missing',
+        });
+        return;
+      }
+      if (!soulPublicBehaviorEnabled && personaIntent) {
+        pendingPersonaRuntimeCommitsRef.current.set(eventId, {
+          proactive: personaIntent,
+        });
+      }
+      emitRuntimeEvent(
+        soulPublicBehaviorEnabled
+          ? {
+              eventId,
+              stage: 'proactive-opportunity-selected',
+              at: Date.now(),
+              source: 'quiet-room-awareness',
+              awarenessSource: input.awarenessSource,
+              audiencePresent: input.audiencePresent,
+              scheduledNextAt: input.scheduledNextAt,
+            }
+          : {
+              eventId,
+              stage: 'proactive-selected',
+              at: Date.now(),
+              source: 'quiet-room-awareness',
+              awarenessSource: input.awarenessSource,
+              audiencePresent: input.audiencePresent,
+              activeDrive: personaIntent?.drive,
+              topicFamily: personaIntent?.topicFamily,
+              topicSource: personaIntent?.source,
+              continuity: personaIntent?.continuity,
+              expressedEmotion: personaIntent?.emotion.label,
+              scheduledNextAt: input.scheduledNextAt,
+            },
+      );
       proactiveSpeechRef.current = true;
       proactiveEventIdRef.current = eventId;
+      const isSoulOpportunity = input.awarenessSource === 'soul-opportunity';
       void enqueueOperatorMessage({
         eventId,
-        text: input.audiencePresent
-          ? '空场主动搭话（有在场观众）'
-          : `空场自语（${input.awarenessSource}）`,
+        text: isSoulOpportunity
+          ? input.audiencePresent
+            ? '安静时段自主评估（有在场观众）'
+            : '安静时段自主评估（当前无人）'
+          : input.audiencePresent
+            ? '空场主动搭话（有在场观众）'
+            : `空场自语（${input.awarenessSource}）`,
         prompt: input.prompt,
         source: 'quiet-room-awareness',
-        sourceLabel: '安静直播间主动搭话',
+        sourceLabel: isSoulOpportunity
+          ? 'Soul 安静时段自主机会'
+          : '安静直播间主动搭话',
         sourcesSeen: ['quiet-room-awareness', input.awarenessSource],
+        roomContext: input.roomContext,
       }).catch((error) => {
         proactiveSpeechRef.current = false;
         proactiveEventIdRef.current = null;
+        pendingPersonaRuntimeCommitsRef.current.delete(eventId);
         dispatchLiveHostEvent({
           type: 'runtime-fault',
           at: Date.now(),
@@ -2780,6 +5516,7 @@ export default function App() {
       emitRuntimeEvent,
       enqueueOperatorMessage,
       hostCoordinatorV2Enabled,
+      soulPublicBehaviorEnabled,
     ],
   );
 
@@ -2800,6 +5537,7 @@ export default function App() {
       void Promise.all(
         [...eventIds].map(async (eventId) => {
           await updateOperatorQueue(eventId, 'skip', { reason });
+          const pending = pendingDeliveredInteractionsRef.current.get(eventId);
           emitRuntimeEvent({
             eventId,
             stage: 'dropped',
@@ -2807,12 +5545,30 @@ export default function App() {
             source: 'quiet-room-awareness',
             reason,
           });
+          pendingPersonaRuntimeCommitsRef.current.delete(eventId);
+          commitConversationHistoryOutcome(eventId, 'skipped', {
+            viewerId: pending?.viewerId,
+            deliveredFraction: 0,
+            reasonCode: reason,
+          });
+          pendingDeliveredInteractionsRef.current.delete(eventId);
+          finalizeSoulOutcome(eventId, 'skipped', {
+            deliveredFraction: 0,
+            reasonCode: reason,
+          });
         }),
       )
         .then(() => refreshOperatorQueue())
         .catch(() => undefined);
     },
-    [emitRuntimeEvent, isSpeaking, operatorQueue, refreshOperatorQueue],
+    [
+      commitConversationHistoryOutcome,
+      emitRuntimeEvent,
+      finalizeSoulOutcome,
+      isSpeaking,
+      operatorQueue,
+      refreshOperatorQueue,
+    ],
   );
 
   const interruptProactiveSpeech = useCallback(
@@ -2836,6 +5592,14 @@ export default function App() {
         }
       }
       cancelQueuedProactiveSpeech('viewer_interaction');
+      return (
+        !hostCoordinatorV2Enabled ||
+        decisions.some(
+          (decision) =>
+            decision.kind === 'queue-audience-turn' &&
+            decision.eventId === eventId,
+        )
+      );
     },
     [
       cancelQueuedProactiveSpeech,
@@ -2924,6 +5688,7 @@ export default function App() {
     if (
       !isLiveRuntimeOwner ||
       !isCoreReady ||
+      runtimeScopeReadyKey !== soulScopeKey ||
       (hostCoordinatorV2Enabled &&
         liveHostSnapshot.phase === 'operator_hold') ||
       isProcessing ||
@@ -2933,10 +5698,14 @@ export default function App() {
     const next = operatorQueue.find(
       (item) =>
         item.status === 'pending' &&
+        (item.createdAt >= runtimeScopeActivatedAtRef.current ||
+          item.finishReason === 'lease_expired_requeued') &&
         (!item.assignedOwnerId ||
           item.assignedOwnerId === runtimeOwnerIdRef.current),
     );
     if (!next) return;
+    const claimedScopeEpoch = runtimeScopeEpochRef.current;
+    generationFailureQueueMutationRef.current.delete(next.eventId);
     preparingOperatorTaskRef.current = next.eventId;
     void (async () => {
       try {
@@ -2974,11 +5743,13 @@ export default function App() {
             const relationshipPlatform = next.sourcesSeen?.[0] || 'unknown';
             const relationshipKey = `${relationshipPlatform}:${next.viewerId}`;
             const beforeRelationships = liveDirector.getRelationshipSnapshot();
-            liveDirector.observeViewerInteraction({
-              id: next.viewerId,
-              name: next.viewerName,
-              platform: relationshipPlatform,
-            });
+            if (!soulPublicBehaviorEnabled) {
+              liveDirector.observeViewerInteraction({
+                id: next.viewerId,
+                name: next.viewerName,
+                platform: relationshipPlatform,
+              });
+            }
             const afterRelationships = liveDirector.getRelationshipSnapshot();
             const beforeVisits =
               beforeRelationships[relationshipKey]?.visits ?? 0;
@@ -3003,15 +5774,17 @@ export default function App() {
             next.viewerId &&
             next.engagementSignals?.length
           ) {
-            for (const signal of next.engagementSignals) {
-              liveDirector.recordRelationshipSignal(
-                {
-                  id: next.viewerId,
-                  name: next.viewerName,
-                  platform: next.sourcesSeen?.[0],
-                },
-                signal,
-              );
+            if (!soulPublicBehaviorEnabled) {
+              for (const signal of next.engagementSignals) {
+                liveDirector.recordRelationshipSignal(
+                  {
+                    id: next.viewerId,
+                    name: next.viewerName,
+                    platform: next.sourcesSeen?.[0],
+                  },
+                  signal,
+                );
+              }
             }
             await updateOperatorQueue(next.eventId, 'mark-engagement');
           }
@@ -3034,6 +5807,16 @@ export default function App() {
             return;
           }
           await refreshOperatorQueue();
+          if (
+            claimedScopeEpoch !== runtimeScopeEpochRef.current ||
+            activeSoulScopeContextRef.current.scopeKey !== soulScopeKey
+          ) {
+            prepared = true;
+            await updateOperatorQueue(next.eventId, 'fail', {
+              reason: 'scope_changed_during_generation',
+            }).catch(() => undefined);
+            return;
+          }
           const generationPrompt = next.prompt || next.text;
           // Queue-originated turns (live comments, radar bridge messages and
           // proactive turns) used to bypass the trace initialised by
@@ -3076,6 +5859,7 @@ export default function App() {
               scenarioId: next.scenarioId,
               faultKind: next.faultKind,
               faultConsumed: next.faultConsumed,
+              engagementSignals: next.engagementSignals,
               memoryContext: streamerMemory.contextFor(next.text, {
                 id: scopedViewerId(next.viewerId, next.sourcesSeen?.[0]),
                 name: next.viewerName,
@@ -3083,6 +5867,15 @@ export default function App() {
               silent: true,
               onPrepared: (reply, skills, speechPlan) => {
                 prepared = true;
+                if (
+                  claimedScopeEpoch !== runtimeScopeEpochRef.current ||
+                  activeSoulScopeContextRef.current.scopeKey !== soulScopeKey
+                ) {
+                  void updateOperatorQueue(next.eventId, 'fail', {
+                    reason: 'scope_changed_before_draft_commit',
+                  }).catch(() => undefined);
+                  return;
+                }
                 if (reply === NO_REPLY_TOKEN) {
                   emitRuntimeEvent({
                     eventId: next.eventId,
@@ -3130,6 +5923,12 @@ export default function App() {
           window.clearInterval(leaseTimer);
         }
         if (!prepared) {
+          // The current attempt has returned, so its generation de-duplication
+          // guard must not outlive the attempt and reject the controlled retry.
+          processingLiveEventIdsRef.current.delete(next.eventId);
+          const capturedFailure =
+            generationFailureByEventIdRef.current.get(next.eventId);
+          generationFailureByEventIdRef.current.delete(next.eventId);
           const response = await fetch('/api/operator-queue', {
             cache: 'no-store',
           });
@@ -3143,6 +5942,22 @@ export default function App() {
             current?.status === 'preparing' &&
             current.leaseOwnerId === runtimeOwnerIdRef.current
           ) {
+            const reason =
+              capturedFailure?.reason ??
+              (chatAccepted
+                ? 'generation_completed_without_draft'
+                : 'generation_core_rejected');
+            emitRuntimeEvent({
+              eventId: next.eventId,
+              stage: 'failed',
+              at: Date.now(),
+              reason,
+              error: capturedFailure?.error,
+            });
+            if (capturedFailure && !capturedFailure.retryable) {
+              await updateOperatorQueue(next.eventId, 'fail', { reason });
+              return;
+            }
             // `processChat` can resolve without an ASSISTANT_RESPONSE when a
             // previous provider stream left the core's private lock engaged.
             // Reset before retrying so the next queue turn gets a fresh core
@@ -3155,15 +5970,6 @@ export default function App() {
             // burst without making a provider request.
             await new Promise<void>((resolve) => {
               window.setTimeout(resolve, 750);
-            });
-            const reason = chatAccepted
-              ? 'generation_completed_without_draft'
-              : 'generation_core_rejected';
-            emitRuntimeEvent({
-              eventId: next.eventId,
-              stage: 'failed',
-              at: Date.now(),
-              reason,
             });
             await updateOperatorQueue(next.eventId, 'retry', {
               reason,
@@ -3191,12 +5997,16 @@ export default function App() {
     recoverChatRuntime,
     replyModelTrace,
     refreshOperatorQueue,
+    runtimeScopeReadyKey,
+    soulScopeKey,
+    soulPublicBehaviorEnabled,
     streamerMemory,
   ]);
 
   useEffect(() => {
     if (
       !isLiveRuntimeOwner ||
+      runtimeScopeReadyKey !== soulScopeKey ||
       (hostCoordinatorV2Enabled &&
         liveHostSnapshot.phase === 'operator_hold') ||
       isSpeaking ||
@@ -3207,6 +6017,8 @@ export default function App() {
     const stale = operatorQueue.find(
       (item) =>
         isStaleReadyReply(item) &&
+        (item.createdAt >= runtimeScopeActivatedAtRef.current ||
+          item.finishReason === 'lease_expired_requeued') &&
         (!item.assignedOwnerId ||
           item.assignedOwnerId === runtimeOwnerIdRef.current),
     );
@@ -3215,6 +6027,16 @@ export default function App() {
         reason: 'stale_before_speech',
       })
         .then(() => {
+          commitConversationHistoryOutcome(stale.eventId, 'skipped', {
+            viewerId: stale.viewerId,
+            deliveredFraction: 0,
+            reasonCode: 'stale-before-speech',
+          });
+          pendingDeliveredInteractionsRef.current.delete(stale.eventId);
+          finalizeSoulOutcome(stale.eventId, 'skipped', {
+            deliveredFraction: 0,
+            reasonCode: 'stale-before-speech',
+          });
           emitRuntimeEvent({
             eventId: stale.eventId,
             stage: 'dropped',
@@ -3231,11 +6053,46 @@ export default function App() {
       (item) =>
         item.status === 'ready' &&
         item.preparedReply &&
+        item.createdAt >= runtimeScopeActivatedAtRef.current &&
         (!item.assignedOwnerId ||
           item.assignedOwnerId === runtimeOwnerIdRef.current),
     );
     if (!next?.preparedReply) return;
     const preparedReply = next.preparedReply;
+    if (
+      liveHostSnapshot.activeTurn?.eventId !== next.eventId
+    ) {
+      const turn = {
+        eventId: next.eventId,
+        kind: next.source.includes('quiet-room')
+          ? ('proactive' as const)
+          : next.engagementSignals?.length
+            ? ('engagement' as const)
+            : ('viewer' as const),
+        priority: next.engagementSignals?.some(
+          (signal) => signal === 'superchat' || signal === 'guard',
+        )
+          ? ('high' as const)
+          : ('normal' as const),
+        createdAt: next.createdAt,
+        targetViewerId: next.viewerId,
+      };
+      dispatchLiveHostEvent({
+        type: 'generation',
+        at: Date.now(),
+        eventId: next.eventId,
+        stage: 'started',
+        turn,
+      });
+      dispatchLiveHostEvent({
+        type: 'generation',
+        at: Date.now(),
+        eventId: next.eventId,
+        stage: 'completed',
+        turn,
+      });
+    }
+    const claimedScopeEpoch = runtimeScopeEpochRef.current;
     speakingOperatorTaskRef.current = next.eventId;
     void (async () => {
       let leaseTimer: number | null = null;
@@ -3245,6 +6102,23 @@ export default function App() {
           ownerId: runtimeOwnerIdRef.current,
         });
         claimedSpeech = true;
+        if (!claimSpeechPermission(next.eventId)) {
+          await updateOperatorQueue(next.eventId, 'fail', {
+            reason: 'coordinator_speak_turn_missing',
+          }).catch(() => undefined);
+          speakingOperatorTaskRef.current = null;
+          return;
+        }
+        if (
+          claimedScopeEpoch !== runtimeScopeEpochRef.current ||
+          activeSoulScopeContextRef.current.scopeKey !== soulScopeKey
+        ) {
+          await updateOperatorQueue(next.eventId, 'fail', {
+            reason: 'scope_changed_before_speech',
+          }).catch(() => undefined);
+          speakingOperatorTaskRef.current = null;
+          return;
+        }
         operatorBeatCountRef.current = 0;
         operatorCompletedBeatCountRef.current = 0;
         operatorAudioByteLengthRef.current = 0;
@@ -3272,49 +6146,6 @@ export default function App() {
           await updateOperatorQueue(next.eventId, 'retry');
           speakingOperatorTaskRef.current = null;
           return;
-        }
-        // Direct replies (for example, a radar city acknowledgement) arrive
-        // pre-prepared and therefore bypass normal generation. Tell the host
-        // coordinator before audio starts; otherwise that audio can complete
-        // a different viewer turn and silently strand its real reply.
-        // A manual broadcast is already approved text from the operator.  It
-        // enters the technical playback queue for ordering, but must never be
-        // presented to the live director as a generated viewer/proactive turn.
-        if (
-          next.source !== 'operator-manual' &&
-          liveHostSnapshot.activeTurn?.eventId !== next.eventId
-        ) {
-          const turn = {
-            eventId: next.eventId,
-            kind: next.source.includes('quiet-room')
-              ? ('proactive' as const)
-              : next.engagementSignals?.length
-                ? ('engagement' as const)
-                : next.source === 'operator-manual'
-                  ? ('operator' as const)
-                  : ('viewer' as const),
-            priority: next.engagementSignals?.some(
-              (signal) => signal === 'superchat' || signal === 'guard',
-            )
-              ? ('high' as const)
-              : ('normal' as const),
-            createdAt: next.createdAt,
-            targetViewerId: next.viewerId,
-          };
-          dispatchLiveHostEvent({
-            type: 'generation',
-            at: Date.now(),
-            eventId: next.eventId,
-            stage: 'started',
-            turn,
-          });
-          dispatchLiveHostEvent({
-            type: 'generation',
-            at: Date.now(),
-            eventId: next.eventId,
-            stage: 'completed',
-            turn,
-          });
         }
         activeLifecycleRef.current = {
           eventId: next.eventId,
@@ -3368,9 +6199,35 @@ export default function App() {
           reason: 'tts_playback_failed',
           error: error instanceof Error ? error.message : String(error),
         });
+        const incompleteDelivery = resolveIncompleteDelivery({
+          beatCount: operatorBeatCountRef.current,
+          completedBeatCount: operatorCompletedBeatCountRef.current,
+          audioByteLength: operatorAudioByteLengthRef.current,
+          playbackObserved:
+            operatorPlaybackObservedRef.current ||
+            Boolean(activeLifecycleRef.current?.ttsStartAt),
+        });
+        await finalizeSoulOutcome(next.eventId, incompleteDelivery.status, {
+          deliveredFraction: incompleteDelivery.deliveredFraction,
+          reasonCode:
+            incompleteDelivery.status === 'partial'
+              ? 'tts-playback-failed-after-partial-delivery'
+              : 'tts-playback-failed',
+        });
         if (activeLifecycleRef.current?.eventId === next.eventId) {
           activeLifecycleRef.current = null;
         }
+        commitConversationHistoryOutcome(
+          next.eventId,
+          incompleteDelivery.status,
+          {
+            viewerId: next.viewerId,
+            deliveredFraction: incompleteDelivery.deliveredFraction,
+            reasonCode: 'tts_playback_failed',
+            ttsEndAt: Date.now(),
+          },
+        );
+        pendingDeliveredInteractionsRef.current.delete(next.eventId);
         // The core already retries the first beat exactly once. Never requeue
         // a heard response, and do not add a second outer retry loop.
         await updateOperatorQueue(next.eventId, 'fail', {
@@ -3386,7 +6243,9 @@ export default function App() {
       }
     })();
   }, [
+    commitConversationHistoryOutcome,
     emitRuntimeEvent,
+    finalizeSoulOutcome,
     dispatchLiveHostEvent,
     isLiveRuntimeOwner,
     isProcessing,
@@ -3396,7 +6255,10 @@ export default function App() {
     liveHostSnapshot.phase,
     operatorQueue,
     refreshOperatorQueue,
+    runtimeScopeReadyKey,
+    soulScopeKey,
     armOperatorSpeechWatchdog,
+    claimSpeechPermission,
     speakPrepared,
   ]);
 
@@ -3449,6 +6311,49 @@ export default function App() {
           typeof data.viewerName === 'string' && data.viewerName.trim()
             ? data.viewerName.trim()
             : viewerId;
+        if (soulPublicBehaviorEnabled) {
+          const eventId = String(
+            data.requestId || `parent-engagement:${crypto.randomUUID()}`,
+          );
+          const decisions = dispatchLiveHostEvent({
+            type: 'engagement',
+            at: requestedAt,
+            eventId,
+            viewerId,
+            engagementKind: signal,
+            priority:
+              signal === 'superchat' || signal === 'guard'
+                ? 'high'
+                : 'normal',
+          });
+          const interrupt = decisions.find(
+            (decision) => decision.kind === 'interrupt',
+          );
+          if (interrupt?.kind === 'interrupt') {
+            interruptSpeech(interrupt.mode);
+          }
+          const accepted =
+            !hostCoordinatorV2Enabled ||
+            decisions.some(
+              (decision) =>
+                decision.kind === 'queue-audience-turn' &&
+                decision.eventId === eventId,
+            );
+          if (accepted) {
+            void enqueueOperatorMessage({
+              eventId,
+              text: `Verified platform ${signal} event`,
+              source: 'parent-engagement',
+              sourceLabel: 'typhoon-radar-engagement',
+              viewerId,
+              viewerName,
+              sourcesSeen: ['typhoon-radar'],
+              engagementSignals: [signal],
+              createdAt: requestedAt,
+            });
+          }
+          return;
+        }
         liveDirector.recordRelationshipSignal(
           {
             id: viewerId,
@@ -3488,7 +6393,15 @@ export default function App() {
             ? data.viewerName.trim()
             : viewerId;
         markLiveActivity('parent-message');
-        interruptProactiveSpeech(requestId, viewerId);
+        if (!interruptProactiveSpeech(requestId, viewerId)) {
+          emitRuntimeEvent({
+            eventId: requestId,
+            stage: 'dropped',
+            at: Date.now(),
+            reason: 'coordinator-rejected-audience-turn',
+          });
+          return;
+        }
         const directReply =
           typeof data.directReply === 'string' ? data.directReply.trim() : '';
         void enqueueOperatorMessage({
@@ -3520,10 +6433,15 @@ export default function App() {
     window.parent.postMessage({ type: hostBridgeType('ready', true) }, '*');
     return () => window.removeEventListener('message', handleNarrationRequest);
   }, [
+    dispatchLiveHostEvent,
+    emitRuntimeEvent,
+    hostCoordinatorV2Enabled,
+    interruptSpeech,
     liveDirector,
     markLiveActivity,
     enqueueOperatorMessage,
     interruptProactiveSpeech,
+    soulPublicBehaviorEnabled,
   ]);
 
   useEffect(() => {
@@ -3549,7 +6467,7 @@ export default function App() {
         const viewerId =
           typeof data.viewerId === 'string' ? data.viewerId : 'external-viewer';
         markLiveActivity('external-chat-bridge');
-        interruptProactiveSpeech(eventId, viewerId);
+        if (!interruptProactiveSpeech(eventId, viewerId)) return;
         void enqueueOperatorMessage({
           eventId,
           text,
@@ -3578,6 +6496,21 @@ export default function App() {
       // Unlock audio while this Enter/click handler still has user-gesture
       // permission; TTS arrives asynchronously after the LLM response.
       void unlock().catch(() => undefined);
+      // Manual chat uses the same authoritative queue in legacy, shadow,
+      // canary and primary modes. No direct processChat/TTS bypass remains.
+      if (isLiveHostCoordinatorRequired()) {
+        const eventId = crypto.randomUUID();
+        markLiveActivity('web-chat');
+        if (!interruptProactiveSpeech(eventId, 'operator')) return;
+        void enqueueOperatorMessage({
+          eventId,
+          text,
+          source: 'web-chat',
+          sourceLabel: 'control-room-input',
+          sourcesSeen: ['local-control-room'],
+        });
+        return;
+      }
       const lifecycle = beginConversationLifecycle({
         channel: 'web-chat',
         label: '总控手动输入',
@@ -3592,7 +6525,10 @@ export default function App() {
         origin: { channel: 'web-chat' },
       };
       markLiveActivity('web-chat');
-      interruptProactiveSpeech(lifecycle.eventId, 'operator');
+      if (!interruptProactiveSpeech(lifecycle.eventId, 'operator')) {
+        activeLifecycleRef.current = null;
+        return;
+      }
       // Stop previous audio if speech is currently playing
       stop();
       resetAvatarReaction();
@@ -3611,6 +6547,7 @@ export default function App() {
       markLiveActivity,
       replyModelTrace,
       beginConversationLifecycle,
+      enqueueOperatorMessage,
       interruptProactiveSpeech,
     ],
   );
@@ -3746,40 +6683,40 @@ export default function App() {
         content: record.content.slice(0, 180),
       }));
     const audienceMembers = liveDirector.getAudienceSnapshot();
-    const recentProactiveMemories = streamerMemory.records
-      .filter(
-        (record) =>
-          record.digitalHumanId === runtimeProfile.id &&
-          record.sourceType === 'live_event' &&
-          record.content.includes('<empty_room_awareness>') &&
-          typeof record.details.reply === 'string',
-      )
-      .sort((left, right) => right.updatedAt - left.updatedAt)
-      .slice(0, 6)
-      .map((record) => ({
-        at: record.updatedAt,
-        reply: String(record.details.reply).slice(0, 180),
-      }));
-    const awareness = emptyRoomAwarenessPlannerRef.current?.poll(
-      emptyRoomAwarenessSettings,
-      {
-        digitalHumanName: runtimeProfile.displayName,
-        digitalHumanTitle: runtimeProfile.title,
-        isLive: room.isLive,
-        audiencePresent: room.estimatedAudience > 0,
-        busy:
-          isProcessing || isSpeaking || queueDepth > 0 || oldestQueueAgeMs > 0,
-        interfaceContext,
-        memoryCues,
-        audienceMembers,
-        recentProactiveMemories,
-      },
-    );
+    const awarenessContext = {
+      digitalHumanName: runtimeProfile.displayName,
+      digitalHumanTitle: runtimeProfile.title,
+      isLive: room.isLive,
+      audiencePresent: room.estimatedAudience > 0,
+      participantCount: room.estimatedAudience,
+      busy:
+        isProcessing || isSpeaking || queueDepth > 0 || oldestQueueAgeMs > 0,
+      interfaceContext,
+      memoryCues,
+      audienceMembers,
+    };
+    const awareness = soulPublicBehaviorEnabled
+      ? emptyRoomAwarenessPlannerRef.current?.pollSoulOpportunity(
+          emptyRoomAwarenessSettings,
+          awarenessContext,
+        )
+      : emptyRoomAwarenessPlannerRef.current?.poll(
+          emptyRoomAwarenessSettings,
+          awarenessContext,
+        );
     if (awareness) {
       enqueueProactiveSpeech({
         prompt: awareness.prompt,
         awarenessSource: awareness.source,
         audiencePresent: room.estimatedAudience > 0,
+        personaIntent:
+          awareness.source === 'strategy'
+            ? awareness.personaIntent
+            : undefined,
+        roomContext:
+          awareness.source === 'soul-opportunity'
+            ? awareness.roomContext
+            : undefined,
         scheduledNextAt: awareness.scheduledNextAt,
       });
     }
@@ -3788,8 +6725,9 @@ export default function App() {
   const handleYoutubeComment = useCallback(
     (comment: YouTubeChatMessage) => {
       markLiveActivity('youtube-comment');
-      interruptProactiveSpeech(comment.id, comment.userName);
-      enqueueYouTubeComments([comment]);
+      if (interruptProactiveSpeech(comment.id, comment.userName)) {
+        enqueueYouTubeComments([comment]);
+      }
     },
     [enqueueYouTubeComments, interruptProactiveSpeech, markLiveActivity],
   );
@@ -3798,8 +6736,9 @@ export default function App() {
     (comment: TwitchChatMessage) => {
       const eventId = `twitch:${crypto.randomUUID()}`;
       markLiveActivity('twitch-comment');
-      interruptProactiveSpeech(eventId, comment.userName);
-      enqueueTwitchComments([comment]);
+      if (interruptProactiveSpeech(eventId, comment.userName)) {
+        enqueueTwitchComments([comment]);
+      }
     },
     [enqueueTwitchComments, interruptProactiveSpeech, markLiveActivity],
   );
@@ -3844,6 +6783,7 @@ export default function App() {
                 : comment.type === 'like'
                   ? 'like'
                   : undefined;
+      let coordinatorAccepted = true;
       if (supportSignal) {
         const decisions = dispatchLiveHostEvent({
           type: 'engagement',
@@ -3856,20 +6796,29 @@ export default function App() {
               ? 'high'
               : 'normal',
         });
+        coordinatorAccepted =
+          !hostCoordinatorV2Enabled ||
+          decisions.some(
+            (decision) =>
+              decision.kind === 'queue-audience-turn' &&
+              decision.eventId === comment.id,
+          );
         const interrupt = decisions.find(
           (decision) => decision.kind === 'interrupt',
         );
         if (interrupt?.kind === 'interrupt') {
           interruptSpeech(interrupt.mode);
         }
-        liveDirector.recordRelationshipSignal(
-          {
-            id: comment.author.id,
-            name: comment.author.name,
-            platform,
-          },
-          supportSignal,
-        );
+        if (!soulPublicBehaviorEnabled) {
+          liveDirector.recordRelationshipSignal(
+            {
+              id: comment.author.id,
+              name: comment.author.name,
+              platform,
+            },
+            supportSignal,
+          );
+        }
       }
       if (comment.type === 'follow') {
         const observedAt = comment.timestamp || Date.now();
@@ -3927,7 +6876,7 @@ export default function App() {
                 estimatedAudience: entryObservation.estimatedAudience,
               })
             : null;
-        if (welcomePrompt) {
+        if (welcomePrompt && !soulPublicBehaviorEnabled) {
           const welcomeEventId = `entry-welcome:${comment.id}`;
           interruptProactiveSpeech(welcomeEventId, comment.author.id);
           void enqueueOperatorMessage({
@@ -4012,11 +6961,23 @@ export default function App() {
         `${String(comment.metadata?.platformId || 'live')}-${comment.type}`,
       );
       if (!supportSignal) {
-        interruptProactiveSpeech(comment.id, comment.author.id);
+        coordinatorAccepted = interruptProactiveSpeech(
+          comment.id,
+          comment.author.id,
+        );
       } else {
         cancelQueuedProactiveSpeech('engagement_waits_for_next_beat');
       }
-      enqueueLiveRoomEvents([routeSimulatorEventForQueue(comment)]);
+      if (coordinatorAccepted) {
+        enqueueLiveRoomEvents([routeSimulatorEventForQueue(comment)]);
+      } else {
+        emitRuntimeEvent({
+          eventId: comment.id,
+          stage: 'dropped',
+          at: Date.now(),
+          reason: 'coordinator-rejected-audience-turn',
+        });
+      }
     },
     [
       cancelQueuedProactiveSpeech,
@@ -4026,8 +6987,10 @@ export default function App() {
       enqueueLiveRoomEvents,
       interruptProactiveSpeech,
       interruptSpeech,
+      hostCoordinatorV2Enabled,
       liveDirector,
       markLiveActivity,
+      soulPublicBehaviorEnabled,
     ],
   );
 
@@ -4480,6 +7443,203 @@ export default function App() {
         />
       ) : (
         <ControlRoom
+          soulInspector={{
+            runtimeMode: soulRuntimeMode,
+            onRuntimeModeChange: (mode) => {
+              if (mode === 'primary' && !soulPrimaryGatePassed) {
+                settingsHook.updateSoulRuntimeMode('canary');
+                emitRuntimeEvent({
+                  stage: 'soul_primary_gate_blocked',
+                  at: Date.now(),
+                  reason: 'requires-two-distinct-two-hour-production-canaries',
+                });
+                return;
+              }
+              settingsHook.updateSoulRuntimeMode(mode);
+            },
+            state:
+              soulInspectorTrace?.state ??
+              (soulSession ? projectSoulState(soulSession.getState()) : null),
+            event: soulInspectorTrace?.event,
+            decision: soulInspectorTrace?.decision,
+            outcome: soulInspectorTrace?.outcome,
+            telemetry: soulInspectorTrace?.telemetry,
+            memoryRefs: soulInspectorTrace?.memoryRefs,
+            canary: {
+              status:
+                soulCanaryBusy ??
+                (activeSoulCanary
+                  ? soulCanaryOperatorCredential?.runId ===
+                    activeSoulCanary.runId
+                    ? 'active'
+                    : 'active-elsewhere'
+                  : soulCanaryError
+                    ? 'error'
+                    : 'idle'),
+              runId: activeSoulCanary?.runId,
+              startedAt: activeSoulCanary?.startedAt,
+              elapsedMs: activeSoulCanary
+                ? Math.max(0, soulCanaryClock - activeSoulCanary.startedAt)
+                : undefined,
+              scopeLabel: activeSoulCanary
+                ? `${activeSoulCanary.scope.platform}/${activeSoulCanary.scope.roomId}`
+                : `${soulScope.platform}/${soulScope.roomId}`,
+              runtimeOwnerClaimedAt:
+                activeSoulCanary?.runtimeOwnerClaimedAt,
+              primaryEligible: soulPrimaryGatePassed,
+              canStart:
+                soulRuntimeMode === 'canary' &&
+                soulScope.personaId === LINGLAN_SOUL_CONSTITUTION.personaId &&
+                !activeSoulCanary &&
+                !soulCanaryBusy,
+              canFinish: Boolean(
+                activeSoulCanary &&
+                  soulCanaryOperatorCredential?.runId ===
+                    activeSoulCanary.runId &&
+                  soulCanaryClock - activeSoulCanary.startedAt >=
+                    SOUL_CANARY_MIN_DURATION_MS &&
+                  !soulCanaryBusy,
+              ),
+              canAbort: Boolean(
+                activeSoulCanary &&
+                  soulCanaryOperatorCredential?.runId ===
+                    activeSoulCanary.runId &&
+                  !soulCanaryBusy,
+              ),
+              error: soulCanaryError || undefined,
+            },
+            onStartCanary: startSoulCanary,
+            onFinishCanary: finishSoulCanary,
+            onAbortCanary: abortSoulCanary,
+            controls: soulControlState,
+            onFreezeCognition: (cognitionFrozen) => {
+              setSoulControlState((state) => ({
+                ...state,
+                cognitionFrozen,
+                cognitionFreezeOrigin: cognitionFrozen
+                  ? 'operator'
+                  : undefined,
+              }));
+              emitRuntimeEvent({
+                stage: 'soul_operator_control',
+                control: 'cognition',
+                enabled: cognitionFrozen,
+                at: Date.now(),
+              });
+            },
+            onIsolateMemory: (memoryIsolated) => {
+              setSoulControlState((state) => ({
+                ...state,
+                memoryIsolated,
+              }));
+              emitRuntimeEvent({
+                stage: 'soul_operator_control',
+                control: 'memory-write-isolation',
+                enabled: memoryIsolated,
+                at: Date.now(),
+              });
+            },
+            onEnableNeutralFallback: (neutralFallbackActive) => {
+              setSoulControlState((state) => ({
+                ...state,
+                neutralFallbackActive,
+              }));
+              emitRuntimeEvent({
+                stage: 'soul_operator_control',
+                control: 'neutral-fallback',
+                enabled: neutralFallbackActive,
+                at: Date.now(),
+              });
+            },
+            onRecoverSnapshot: async () => {
+              if (!baseSoulSession) return;
+              setSoulControlState((state) => ({
+                ...state,
+                cognitionFrozen: true,
+                cognitionFreezeOrigin: 'snapshot-recovery',
+                busyControl: 'snapshot',
+              }));
+              emitRuntimeEvent({
+                stage: 'soul_snapshot_recovery_requested',
+                at: Date.now(),
+                scope: soulScope,
+              });
+              try {
+                const restored = await BrowserSoulRuntimeSession.recover({
+                  constitution: LINGLAN_SOUL_CONSTITUTION,
+                  profile: LINGLAN_SOUL_PROFILE,
+                  scope: soulScope,
+                });
+                soulSessionByEventIdRef.current.clear();
+                setRecoveredSoulSession({
+                  scopeKey: soulScopeKey,
+                  session: restored,
+                });
+                setSoulInspectorTrace((previous) =>
+                  previous
+                    ? {
+                        ...previous,
+                        state: projectSoulState(restored.getState()),
+                        outcome: {
+                          status: 'skipped',
+                          occurredAt: Date.now(),
+                          reasonCode: 'snapshot-restored-cognition-frozen',
+                        },
+                      }
+                    : previous,
+                );
+                setSoulControlState((state) => ({
+                  ...state,
+                  cognitionFrozen: true,
+                  cognitionFreezeOrigin: 'snapshot-recovery',
+                  snapshotRecoveryAvailable: true,
+                  busyControl: undefined,
+                }));
+                emitRuntimeEvent({
+                  stage: 'soul_snapshot_recovered',
+                  at: Date.now(),
+                  scope: soulScope,
+                  stateVersion: restored.getState().version,
+                });
+              } catch (error) {
+                setSoulControlState((state) => ({
+                  ...state,
+                  cognitionFrozen: true,
+                  cognitionFreezeOrigin: 'snapshot-recovery',
+                  snapshotRecoveryAvailable: false,
+                  busyControl: undefined,
+                }));
+                emitRuntimeEvent({
+                  stage: 'soul_snapshot_recovery_failed',
+                  at: Date.now(),
+                  scope: soulScope,
+                  error: error instanceof Error ? error.message : String(error),
+                });
+              }
+            },
+            onOperatorTakeover: (operatorHasControl) => {
+              setSoulControlState((state) => ({
+                ...state,
+                operatorHasControl,
+              }));
+              if (operatorHasControl) {
+                emergencyTakeover();
+              } else {
+                dispatchLiveHostEvent({
+                  type: 'operator-command',
+                  at: Date.now(),
+                  command: 'resume',
+                  isLive: liveDirector.isRoomLive(),
+                });
+              }
+              emitRuntimeEvent({
+                stage: 'soul_operator_control',
+                control: 'execution-authority',
+                enabled: operatorHasControl,
+                at: Date.now(),
+              });
+            },
+          }}
           messages={messages}
           partialResponse={partialResponse}
           isProcessing={isProcessing}

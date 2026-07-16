@@ -313,6 +313,19 @@ export type LiveHostTurnKind =
   | 'safety'
   | 'operator';
 
+/**
+ * Identity boundary for one coordinator session.
+ *
+ * Integrations which provide a scope get stale-event protection across
+ * persona/stream switches. Scope remains optional on events for backwards
+ * compatibility with existing unscoped integrations.
+ */
+export interface LiveHostScope {
+  profileId: string;
+  sessionId: string;
+  streamId?: string;
+}
+
 export interface LiveHostTurn {
   eventId: string;
   kind: LiveHostTurnKind;
@@ -320,6 +333,8 @@ export interface LiveHostTurn {
   createdAt: number;
   targetViewerId?: string;
   proactiveSource?: string;
+  proactiveOpportunityId?: string;
+  scope?: LiveHostScope;
 }
 
 export interface LiveHostPolicy {
@@ -328,7 +343,7 @@ export interface LiveHostPolicy {
   maxProactiveTurns: number;
 }
 
-export type LiveHostEvent =
+export type LiveHostEvent = (
   | { type: 'stream-state'; at: number; isLive: boolean; eventId?: string }
   | (ViewerPresenceEvent & {
       type: 'viewer-presence';
@@ -360,6 +375,10 @@ export type LiveHostEvent =
       at: number;
       eventId: string;
       source: string;
+      /** Stable identity of the quiet-room opportunity; defaults to eventId. */
+      opportunityId?: string;
+      /** Candidates which expire before selection are never prepared. */
+      expiresAt?: number;
       prompt: string;
       busy: boolean;
     }
@@ -395,15 +414,27 @@ export type LiveHostEvent =
       eventId?: string;
       command: 'takeover' | 'mute' | 'resume';
       isLive?: boolean;
-    };
+    }
+) & { scope?: LiveHostScope };
 
-export type LiveHostDecision =
+export interface LiveHostDecisionMetadata {
+  /** Stable key for idempotent execution by an integration. */
+  actionId?: string;
+  /** Coordinator time at which this action was issued. */
+  issuedAt?: number;
+  /** Bound persona/session scope, when the integration supplied one. */
+  scope?: LiveHostScope;
+}
+
+export type LiveHostDecisionPayload =
   | {
       kind: 'queue-audience-turn';
       eventId: string;
       targetViewerId?: string;
       priority: LiveHostPriority;
       reasonCode: string;
+      /** Complete turn envelope for the queue consumer. */
+      turn?: LiveHostTurn;
     }
   | {
       kind: 'prepare-reply';
@@ -411,31 +442,83 @@ export type LiveHostDecision =
       turnKind: LiveHostTurnKind;
       prompt?: string;
       reasonCode: string;
+      /** Complete turn envelope for the generation consumer. */
+      turn?: LiveHostTurn;
     }
-  | { kind: 'speak-turn'; eventId: string; reasonCode: string }
+  | {
+      kind: 'speak-turn';
+      eventId: string;
+      reasonCode: string;
+      /** Complete turn envelope for the speech queue consumer. */
+      turn?: LiveHostTurn;
+    }
   | {
       kind: 'interrupt';
       eventId?: string;
       mode: 'immediate' | 'beat-boundary';
       reasonCode: string;
+      turn?: LiveHostTurn;
     }
-  | { kind: 'drop'; eventId?: string; reasonCode: string }
+  | {
+      kind: 'drop';
+      eventId?: string;
+      reasonCode: string;
+      turn?: LiveHostTurn;
+    }
   | {
       kind: 'emit-avatar-intent';
       eventId: string;
       intent: 'observing' | 'speaking' | 'recovering';
       reasonCode: string;
     }
-  | { kind: 'enter-recovery'; eventId?: string; reasonCode: string }
+  | {
+      kind: 'enter-recovery';
+      eventId?: string;
+      reasonCode: string;
+      recoveryCount?: number;
+    }
   | {
       kind: 'request-operator-attention';
       eventId?: string;
       reasonCode: string;
+      severity?: 'warning' | 'critical';
+      recoveryCount?: number;
     };
+
+/** Backwards-compatible decision shape. New integrations should consume actions. */
+export type LiveHostDecision = LiveHostDecisionPayload &
+  LiveHostDecisionMetadata;
+
+type RequireTurnForExecutableAction<T> = T extends {
+  kind: 'queue-audience-turn' | 'prepare-reply' | 'speak-turn';
+}
+  ? Omit<T, 'turn'> & { turn: LiveHostTurn }
+  : T extends { kind: 'enter-recovery' }
+    ? Omit<T, 'recoveryCount'> & { recoveryCount: number }
+    : T extends { kind: 'request-operator-attention' }
+      ? Omit<T, 'severity' | 'recoveryCount'> & {
+          severity: 'warning' | 'critical';
+          recoveryCount: number;
+        }
+      : T;
+
+/**
+ * Fully executable coordinator output. `dispatch` always returns this shape.
+ * The legacy `LiveHostDecision` name remains available to existing consumers.
+ */
+export type LiveHostAction =
+  RequireTurnForExecutableAction<LiveHostDecisionPayload> & {
+    actionId: string;
+    issuedAt: number;
+    scope?: LiveHostScope;
+  };
 
 export interface LiveHostSnapshot {
   phase: LiveHostPhase;
+  scope?: LiveHostScope;
   activeTurn?: LiveHostTurn;
+  pendingTurnCount?: number;
+  readyTurnIds?: string[];
   pendingInterruptEventId?: string;
   lastAudienceActivityAt: number;
   lastHostSpeechAt: number;
@@ -443,6 +526,7 @@ export interface LiveHostSnapshot {
   proactiveRemaining: number;
   nextProactiveAt: number;
   lastProactiveSource?: string;
+  lastProactiveOpportunityId?: string;
   recoveryCount: number;
   currentBeatIndex?: number;
   currentBeatInterruptible: boolean;

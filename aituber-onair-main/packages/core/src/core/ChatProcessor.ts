@@ -148,10 +148,10 @@ export class ChatProcessor extends EventEmitter {
     text: string,
     chatType: ChatType = 'chatForm',
     transientContext?: string,
-  ): Promise<void> {
+  ): Promise<boolean> {
     if (this.processingChat) {
       console.warn('Another chat processing is in progress');
-      return;
+      return false;
     }
 
     try {
@@ -199,9 +199,11 @@ export class ChatProcessor extends EventEmitter {
       await this.runToolLoop<Message>(initialMsgs, (msgs, stream, cb) =>
         this.chatService.chatOnce(msgs as Message[], stream, cb, maxTokens),
       );
+      return true;
     } catch (error) {
       console.error('Error in text chat processing:', error);
       this.emit('error', error);
+      return false;
     } finally {
       this.processingChat = false;
       this.emit('processingEnd');
@@ -212,10 +214,10 @@ export class ChatProcessor extends EventEmitter {
    * Process vision chat
    * @param imageDataUrl Image data URL
    */
-  async processVisionChat(imageDataUrl: string): Promise<void> {
+  async processVisionChat(imageDataUrl: string): Promise<boolean> {
     if (this.processingChat) {
       console.warn('Another chat processing is in progress');
-      return;
+      return false;
     }
 
     try {
@@ -278,9 +280,11 @@ export class ChatProcessor extends EventEmitter {
           ),
         imageDataUrl, // visionSource
       );
+      return true;
     } catch (error) {
       console.error('Error in vision chat processing:', error);
       this.emit('error', error);
+      return false;
     } finally {
       this.processingChat = false;
       this.emit('processingEnd');
@@ -520,7 +524,7 @@ export class ChatProcessor extends EventEmitter {
               {
                 role: 'user',
                 content:
-                  '上一份输出被模型长度边界截断。请从头重新输出完整最终答案，覆盖原问题的主答案并以完整句结束；遵守原结构化输出协议，只输出最终结果。',
+                  '上一份输出被长度边界截断。请从头用更短的完整句重新回答原问题，并严格遵守最初的输出协议；只输出最终结果。',
               },
             ] as T[];
             continue;

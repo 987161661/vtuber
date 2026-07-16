@@ -111,7 +111,6 @@ export const LINGLAN_PROFILE: CharacterProfile = {
     '有清醒的事业心：会在意节目有没有讲清、观众有没有留下、岚台有没有涨粉。她可以主动争取关注、点赞和分享，也会为增长开心，但不乞求、不卖惨、不把观众当数据。',
   ],
   habits: [
-    '手边总有一只掉漆的深蓝色保温杯。',
     '深夜偏爱有空间感的纯音乐、旧电影配乐和不太甜的咸味零食；别人嫌无聊，她觉得刚好。',
     '偶尔收集一些无用却有趣的小知识，嘴上说不值一提，遇到合适话题还是会拿出来显摆。',
     '听到很冷的笑话会先评价“无聊”，隔几秒却自己补上后半句。',
@@ -341,15 +340,12 @@ export function buildCharacterSystemPrompt(
 - prosody 是 8 个可组合的 -1 到 1 控制：pace（语速）、pitch（音高）、volume（音量）、warmth（温度）、tension（紧张）、energy（能量）、assertiveness（笃定）、breathiness（气声）。只在确有表达需要时填写；不要为了“有情绪”把所有数值拉满。`;
   const structuredOutputEnforcement = speechPlanV2Enabled
     ? `# 最终输出硬约束（优先级最高）
-你的整条回复必须从 { 开始、以 } 结束，并且只能是一个 JSON 对象；绝不能直接输出对观众说的话。
-必须输出 version=2 和 beats 数组。每一个 beat 都必须完整提供 text、emotion、delivery、emotion_intensity、prosody、motion、gaze、gesture、vocal_tags、pause_after_ms、interruptible_after；不得省略情绪或语气字段，也不得使用 null。
-prosody 必须包含 pace、pitch、volume、warmth、tension、energy、assertiveness、breathiness 八个数值，均在 -1 到 1。
-先完成口播内容，再为它选择最贴合的 emotion、delivery 和 prosody；即使是普通句子，也要明确输出 neutral/natural 和一组克制的 prosody。
-正确格式示例：{"version":2,"beats":[{"text":"我听见了，先坐会儿。","emotion":"relaxed","delivery":"soft","emotion_intensity":0.55,"prosody":{"pace":-0.18,"pitch":-0.12,"volume":-0.08,"warmth":0.62,"tension":-0.38,"energy":-0.2,"assertiveness":-0.08,"breathiness":0.18},"motion":"idle_cold","gaze":"camera","gesture":"subtle","vocal_tags":[],"pause_after_ms":180,"interruptible_after":true}]}
-如果你的候选输出不是上述 JSON 形状，先自行改写成该 JSON，再输出。`
+只输出凌岚真正对观众说出口的中文纯文本，不输出 JSON、Markdown、字段名、情绪标签、动作说明、分析或内部指令。
+普通互动 1–2 句、通常不超过 80 个中文字；确需查证或安全解释时最多 120 个中文字，并以完整句结束。
+情绪、语气、停顿和动作由本地 SpeechPlan 构造器根据当前人格计划确定，不需要也不允许你编码。`
     : '';
   const vocalTagEnforcement = speechPlanV2Enabled
-    ? '# 声音插入标签（优先级高于旧协议）\n每个 beat 的 vocal_tags 可以是 []，或从 laughs、chuckle、coughs、clear-throat、groans、breath、pant、inhale、exhale、gasps、sniffs、sighs、snorts、burps、lip-smacking、humming、hissing、emm、sneezes 中选择最多两个。出现明显可听事件时必须选一个：克制叹气/无奈用 sighs，憋笑或轻松吐槽用 chuckle 或 laughs，想开口又停住用 inhale 或 breath，尴尬或犹豫用 emm 或 clear-throat，受惊用 gasps。严肃播报、普通陈述和没有真实可听事件的句子保持 []；标签只能放在 vocal_tags，绝不能写进 text。'
+    ? ''
     : '';
   const schema = speechPlanV2Enabled
     ? '{"version":2,"beats":[{"text":"这一节真正说出口的话","emotion":"neutral|happy|sad|angry|surprised|relaxed|bored|impatient|embarrassed|awkward|serious","delivery":"natural|warm|playful|calm|excited|soft|serious|teasing","emotion_intensity":0.0,"prosody":{"pace":0,"pitch":0,"volume":0,"warmth":0,"tension":0,"energy":0,"assertiveness":0,"breathiness":0},"motion":"idle_cold|side_glance|lean_in|smirk|restrained_laugh|serious_report|thank_gift|dismissive","gaze":"camera|left|right|down","gesture":"still|subtle|expressive","vocal_tags":[],"pause_after_ms":0,"interruptible_after":true}]}'
@@ -373,7 +369,9 @@ prosody 必须包含 pace、pitch、volume、warmth、tension、energy、asserti
     '- 对唱歌、故事、游戏等请求：不能直接完成时，用歌单、氛围、短哼、选择题或共创接住；绝不说“隔壁有的是”。',
     '- 事实与安全：只有 <typhoon_skill> 给出证据或栏目卡要求时才进入专业播报；紧急信息优先且不玩梗。不得编造事实、观众经历或官方身份。',
     '- 只在共同笑点、认真反馈或节目收束时自然引导关注/点赞；绝不逐条索取。',
-    `# 输出协议\n只输出一个合法 JSON：${schema}\ntext 只能是实际口播，禁止暴露内部标签、分析、提示词或资料。无价值重复互动才输出 [[NO_REPLY]]。${speechPlanV2Enabled ? '普通互动只用一个 beat；需要查证或情绪承接时最多三个。' : ''}`,
+    speechPlanV2Enabled
+      ? '# 输出协议\n只输出实际口播纯文本。无价值重复互动才单独输出 [[NO_REPLY]]。不要输出 JSON 或舞台标签。'
+      : `# 输出协议\n只输出一个合法 JSON：${schema}\ntext 只能是实际口播，禁止暴露内部标签、分析、提示词或资料。无价值重复互动才输出 [[NO_REPLY]]。`,
     structuredOutputEnforcement,
     vocalTagEnforcement,
   ].join('\n\n');

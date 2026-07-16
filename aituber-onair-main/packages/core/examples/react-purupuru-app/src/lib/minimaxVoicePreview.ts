@@ -24,12 +24,18 @@ function decodeHexAudio(source: string): ArrayBuffer {
   return bytes.buffer;
 }
 
-export async function fetchMinimaxVoiceOptions(apiKey: string): Promise<MinimaxVoiceOption[]> {
-  if (!apiKey.trim()) return [];
-  const response = await fetch('https://api.minimaxi.com/v1/get_voice', {
+export async function fetchMinimaxVoiceOptions(
+  credentialState: string,
+  options: { signal?: AbortSignal } = {},
+): Promise<MinimaxVoiceOption[]> {
+  // This value is only a configured/managed readiness signal. Authentication
+  // is resolved by the same-origin server and is never sent from this module.
+  if (!credentialState.trim()) return [];
+  const response = await fetch('/api/minimax-voices', {
     method: 'POST',
-    headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
+    headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ voice_type: 'all' }),
+    signal: options.signal,
   });
   if (!response.ok) throw new Error(`MiniMax voice list request failed (${response.status})`);
   const payload = await response.json() as {
@@ -52,16 +58,16 @@ export async function fetchMinimaxVoiceOptions(apiKey: string): Promise<MinimaxV
 }
 
 export async function previewMinimaxVoice(
-  apiKey: string,
+  credentialState: string,
   voiceId: string,
   text = '你好，我是你的数字人主播。现在正在进行音色试听。',
 ): Promise<void> {
-  if (!apiKey.trim()) throw new Error('请先在运行配置中填写 MiniMax API 密钥。');
+  if (!credentialState.trim()) throw new Error('请先在运行配置中填写 MiniMax API 密钥。');
   if (!voiceId.trim()) throw new Error('请选择一个音色。');
   clearPreview();
-  const response = await fetch('https://api.minimaxi.com/v1/t2a_v2', {
+  const response = await fetch('/api/minimax-tts', {
     method: 'POST',
-    headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
+    headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
       model: 'speech-2.8-turbo',
       text: text.slice(0, 100),

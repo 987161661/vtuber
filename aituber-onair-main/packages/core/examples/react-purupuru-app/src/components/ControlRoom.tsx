@@ -28,7 +28,14 @@ import {
 import type { StressRunState } from './StressTestPanel';
 import { LiveConnectorConsole } from './LiveConnectorConsole';
 import { SimulatorRoomConsole } from './SimulatorRoomConsole';
-import { BroadcastTopologyPanel } from './BroadcastTopologyPanel';
+import {
+  BroadcastTopologyPanel,
+  type BroadcastRuntimeHealth,
+} from './BroadcastTopologyPanel';
+import {
+  SoulInspectorPanel,
+  type SoulInspectorPanelProps,
+} from './SoulInspectorPanel';
 import type { LiveHostSnapshot } from '@aituber-onair/live-companion';
 
 type Workspace =
@@ -102,20 +109,15 @@ interface ControlRoomProps {
   onAbortStressTest: () => void | Promise<void>;
   onCleanupStressTest: () => void | Promise<void>;
   onAuditAction: (event: Record<string, unknown>) => void;
+  soulInspector: SoulInspectorPanelProps;
 }
 
-type RuntimeHealth = {
+type RuntimeHealth = BroadcastRuntimeHealth & {
   runtimeOwner?: {
     active: boolean;
     available: boolean;
     ttsConfigured: boolean;
   };
-  lastFaults?: Partial<
-    Record<
-      'model' | 'skill' | 'tts' | 'flashhead' | 'platform',
-      { at: number; stage: string; reason?: string }
-    >
-  >;
   repeatedReplyCount?: number;
 };
 
@@ -159,7 +161,12 @@ type PipelineLatencyRecord = {
   source?: string;
   origin?: { channel?: string; commentAt?: number; receivedAt?: number };
 };
-type PipelineRuntimeEvent = { eventId?: string; stage?: string; source?: string; at?: number };
+type PipelineRuntimeEvent = {
+  eventId?: string;
+  stage?: string;
+  source?: string;
+  at?: number;
+};
 
 const workspaceLabels: Record<Workspace, string> = {
   avatars: '数字人管理',
@@ -230,6 +237,7 @@ function sourceRoomLabel(source: string): string {
 function queueTone(status: OperatorQueueItem['status']) {
   if (status === 'done') return 'replied';
   if (status === 'skipped') return 'skipped';
+  if (status === 'failed') return 'failed';
   if (status === 'pending') return 'waiting';
   return 'replying';
 }
@@ -240,7 +248,8 @@ function queueStatusLabel(status: OperatorQueueItem['status']) {
   if (status === 'pending') return '待回复';
   if (status === 'preparing') return '正在撰写';
   if (status === 'ready') return '等待播出';
-  return '正在播出';
+  if (status === 'speaking') return '正在播出';
+  return '执行失败';
 }
 
 function formatViewerWait(item: OperatorQueueItem) {
@@ -314,6 +323,9 @@ function describeOperatorControl(
 
 export function ControlRoom(props: ControlRoomProps) {
   const [workspace, setWorkspace] = useState<Workspace>('overview');
+  const soulOwnsQuietRoomBehavior =
+    props.soulInspector.runtimeMode === 'canary' ||
+    props.soulInspector.runtimeMode === 'primary';
   const [radarInput, setRadarInput] = useState('');
   const [minimaxVoices, setMinimaxVoices] = useState<MinimaxVoiceOption[]>([]);
   const [voiceLoadError, setVoiceLoadError] = useState('');
@@ -354,8 +366,16 @@ export function ControlRoom(props: ControlRoomProps) {
     return [
       ...ordinaryRoad,
       ...social,
-      { id: 'simulator', label: sourceRoomLabel('simulator'), tone: 'simulator' },
-      { id: 'typhoon-radar', label: sourceRoomLabel('typhoon-radar'), tone: 'radar' },
+      {
+        id: 'simulator',
+        label: sourceRoomLabel('simulator'),
+        tone: 'simulator',
+      },
+      {
+        id: 'typhoon-radar',
+        label: sourceRoomLabel('typhoon-radar'),
+        tone: 'radar',
+      },
     ];
   }, [props.settings.liveConnectors]);
   const formatSourceRoom = (source: string) =>
@@ -404,15 +424,21 @@ export function ControlRoom(props: ControlRoomProps) {
   useEffect(() => {
     let cancelled = false;
     const refresh = () =>
-      void fetch('/api/live-runtime-events?history=1&limit=80', { cache: 'no-store' })
+      void fetch('/api/live-runtime-events?history=1&limit=80', {
+        cache: 'no-store',
+      })
         .then((response) => (response.ok ? response.json() : null))
         .then((payload: { events?: PipelineRuntimeEvent[] } | null) => {
-          if (!cancelled && Array.isArray(payload?.events)) setPipelineRuntimeEvents(payload.events);
+          if (!cancelled && Array.isArray(payload?.events))
+            setPipelineRuntimeEvents(payload.events);
         })
         .catch(() => undefined);
     refresh();
     const timer = window.setInterval(refresh, 600);
-    return () => { cancelled = true; window.clearInterval(timer); };
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
   }, []);
   useEffect(() => {
     let cancelled = false;
@@ -492,13 +518,16 @@ export function ControlRoom(props: ControlRoomProps) {
   const [replyDraft, setReplyDraft] = useState('');
   const [draggingQueueId, setDraggingQueueId] = useState<string | null>(null);
   const [queueFilter, setQueueFilter] = useState<
-    'active' | 'replied' | 'skipped'
+    'active' | 'replied' | 'skipped' | 'failed'
   >('active');
   const visibleQueue = useMemo(() => {
     const matching = props.operatorQueue.filter((item) => {
       if (queueFilter === 'replied') return item.status === 'done';
       if (queueFilter === 'skipped') return item.status === 'skipped';
-      return item.status !== 'done' && item.status !== 'skipped';
+      if (queueFilter === 'failed') return item.status === 'failed';
+      return ['pending', 'preparing', 'ready', 'speaking'].includes(
+        item.status,
+      );
     });
 
     // Completed history is a timeline: the latest actual response belongs on top.
@@ -544,7 +573,6 @@ export function ControlRoom(props: ControlRoomProps) {
     props.settings.digitalHumans.profiles.find(
       (profile) => profile.id === props.settings.digitalHumans.activeId,
     ) || props.settings.digitalHumans.profiles[0];
-
   useEffect(() => {
     if (
       props.settings.tts.engine !== 'minimax' ||
@@ -1027,57 +1055,93 @@ export function ControlRoom(props: ControlRoomProps) {
             <section className="program-director" aria-label="直播栏目导演">
               <div>
                 <b>当前栏目：{liveProgram.mode}</b>
-                <small>{liveProgram.locked ? '总控已锁定，智能体不切换栏目' : '智能体按当前互动自动切换'}</small>
+                <small>
+                  {liveProgram.locked
+                    ? '总控已锁定，智能体不切换栏目'
+                    : '智能体按当前互动自动切换'}
+                </small>
               </div>
               <div className="program-director-actions">
-                {(['companion', 'variety', 'weather', 'urgent'] as const).map((mode) => (
-                  <button
-                    key={mode}
-                    className={liveProgram.mode === mode ? 'is-active' : ''}
-                    onClick={() => updateLiveProgram({ mode })}
-                  >
-                    {mode === 'companion' ? '陪伴' : mode === 'variety' ? '节目' : mode === 'weather' ? '天气' : '紧急'}
-                  </button>
-                ))}
-                <button onClick={() => updateLiveProgram({ locked: !liveProgram.locked })}>
+                {(['companion', 'variety', 'weather', 'urgent'] as const).map(
+                  (mode) => (
+                    <button
+                      key={mode}
+                      className={liveProgram.mode === mode ? 'is-active' : ''}
+                      onClick={() => updateLiveProgram({ mode })}
+                    >
+                      {mode === 'companion'
+                        ? '陪伴'
+                        : mode === 'variety'
+                          ? '节目'
+                          : mode === 'weather'
+                            ? '天气'
+                            : '紧急'}
+                    </button>
+                  ),
+                )}
+                <button
+                  onClick={() =>
+                    updateLiveProgram({ locked: !liveProgram.locked })
+                  }
+                >
                   {liveProgram.locked ? '解除锁定' : '锁定栏目'}
                 </button>
               </div>
             </section>
-            <section className="program-director live-safety-console" aria-label="直播安全网关">
+            <section
+              className="program-director live-safety-console"
+              aria-label="直播安全网关"
+            >
               <div>
                 <b>直播安全网关</b>
                 <small>
-                  本地静默保护数字人，不会伪装成平台禁言；高危事件请由房管在 B 站后台处理。
+                  本地静默保护数字人，不会伪装成平台禁言；高危事件请由房管在 B
+                  站后台处理。
                 </small>
               </div>
               <div className="live-safety-list">
-                {liveSafety.viewers.length ? liveSafety.viewers.map((viewer) => (
-                  <div key={viewer.viewerId} className="live-safety-viewer">
-                    <span>
-                      <b>{viewer.viewerName || viewer.viewerId}</b>
-                      <small>{viewer.sourceLabel || '未知来源'} · 风险 {viewer.score}</small>
-                    </span>
-                    <span>
-                      <small>静默至 {viewer.mutedUntil ? new Date(viewer.mutedUntil).toLocaleTimeString('zh-CN') : '—'}</small>
-                      <button className="quiet-action" onClick={() => releaseViewerSafety(viewer.viewerId)}>
-                        解除本地静默
-                      </button>
-                    </span>
-                  </div>
-                )) : (
+                {liveSafety.viewers.length ? (
+                  liveSafety.viewers.map((viewer) => (
+                    <div key={viewer.viewerId} className="live-safety-viewer">
+                      <span>
+                        <b>{viewer.viewerName || viewer.viewerId}</b>
+                        <small>
+                          {viewer.sourceLabel || '未知来源'} · 风险{' '}
+                          {viewer.score}
+                        </small>
+                      </span>
+                      <span>
+                        <small>
+                          静默至{' '}
+                          {viewer.mutedUntil
+                            ? new Date(viewer.mutedUntil).toLocaleTimeString(
+                                'zh-CN',
+                              )
+                            : '—'}
+                        </small>
+                        <button
+                          className="quiet-action"
+                          onClick={() => releaseViewerSafety(viewer.viewerId)}
+                        >
+                          解除本地静默
+                        </button>
+                      </span>
+                    </div>
+                  ))
+                ) : (
                   <small>当前没有本地静默观众。</small>
                 )}
               </div>
               {liveSafety.events[0] && (
                 <small>
-                  最近安全决策：{liveSafety.events[0].action} · {liveSafety.events[0].reason}
+                  最近安全决策：{liveSafety.events[0].action} ·{' '}
+                  {liveSafety.events[0].reason}
                 </small>
               )}
             </section>
             <small className="queue-age">
               最近故障：
-              {(['model', 'skill', 'tts', 'flashhead', 'platform'] as const)
+              {(['soul', 'model', 'skill', 'tts', 'flashhead', 'platform'] as const)
                 .map((kind) =>
                   runtimeHealth.lastFaults?.[kind]
                     ? `${kind}=${runtimeHealth.lastFaults[kind]?.stage}`
@@ -1099,14 +1163,30 @@ export function ControlRoom(props: ControlRoomProps) {
                   </div>
                   <div className="source-room-list">
                     {sourceRooms.map((room) => (
-                      <span key={room.id} className={`source-room-chip is-${room.tone}`}>
+                      <span
+                        key={room.id}
+                        className={`source-room-chip is-${room.tone}`}
+                      >
                         {room.label}
                       </span>
                     ))}
                   </div>
                   <div className="radar-input-row">
-                    <input value={radarInput} placeholder="从台风 Boss 雷达发送一条观众提问…" onChange={(event) => setRadarInput(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter') submitRadarInput(); }} />
-                    <button type="button" disabled={!radarInput.trim()} onClick={submitRadarInput}>送入数字人</button>
+                    <input
+                      value={radarInput}
+                      placeholder="从台风 Boss 雷达发送一条观众提问…"
+                      onChange={(event) => setRadarInput(event.target.value)}
+                      onKeyDown={(event) => {
+                        if (event.key === 'Enter') submitRadarInput();
+                      }}
+                    />
+                    <button
+                      type="button"
+                      disabled={!radarInput.trim()}
+                      onClick={submitRadarInput}
+                    >
+                      送入数字人
+                    </button>
                   </div>
                 </div>
                 <div className="interaction-metrics" aria-label="互动处理概览">
@@ -1148,6 +1228,19 @@ export function ControlRoom(props: ControlRoomProps) {
                     </strong>
                     <span>未采用</span>
                   </button>
+                  <button
+                    className={`interaction-metric-button ${queueFilter === 'failed' ? 'is-active' : ''}`}
+                    onClick={() => setQueueFilter('failed')}
+                  >
+                    <strong>
+                      {
+                        props.operatorQueue.filter(
+                          (item) => item.status === 'failed',
+                        ).length
+                      }
+                    </strong>
+                    <span>执行失败</span>
+                  </button>
                 </div>
                 <small className="queue-age">
                   {Math.max(props.queueDepth, props.interactionSummary.pending)
@@ -1188,7 +1281,10 @@ export function ControlRoom(props: ControlRoomProps) {
                             {queueStatusLabel(item.status)}
                           </b>
                           <small className="queue-source-room">
-                            {(item.sourcesSeen.length ? item.sourcesSeen : [item.source])
+                            {(item.sourcesSeen.length
+                              ? item.sourcesSeen
+                              : [item.source]
+                            )
                               .map(formatSourceRoom)
                               .join(' / ')}
                           </small>
@@ -1232,7 +1328,9 @@ export function ControlRoom(props: ControlRoomProps) {
                             {(event.sourcesSeen.length
                               ? event.sourcesSeen
                               : ['unknown']
-                            ).map(formatSourceRoom).join(' / ')}
+                            )
+                              .map(formatSourceRoom)
+                              .join(' / ')}
                           </small>
                           <time>{formatEventTime(event.at)}</time>
                         </header>
@@ -1589,18 +1687,16 @@ export function ControlRoom(props: ControlRoomProps) {
                               ? '已经遗忘'
                               : record.phase === 'now'
                                 ? '此刻印象'
-                          : record.phase === 'dormant'
-                            ? '已经沉睡'
-                            : '正在模糊'}{' '}
+                                : record.phase === 'dormant'
+                                  ? '已经沉睡'
+                                  : '正在模糊'}{' '}
                         · {record.subjectName}
                       </small>
                     </article>
                   );
                 })}
               {!props.memory.records.length && (
-                <p className="empty-state">
-                  还没有可审计的记忆记录。
-                </p>
+                <p className="empty-state">还没有可审计的记忆记录。</p>
               )}
             </div>
             <div className="digital-human-actions">
@@ -1625,6 +1721,7 @@ export function ControlRoom(props: ControlRoomProps) {
               </div>
               <p>管理主播何时主动开口，以及静息时从哪里获得自然的话题。</p>
             </div>
+            <SoulInspectorPanel {...props.soulInspector} />
             <div className="awareness-control-panel">
               <header>
                 <div>
@@ -1641,7 +1738,9 @@ export function ControlRoom(props: ControlRoomProps) {
                       })
                     }
                   />
-                  {props.settings.emptyRoomAwareness.enabled ? '已启用' : '已关闭'}
+                  {props.settings.emptyRoomAwareness.enabled
+                    ? '已启用'
+                    : '已关闭'}
                 </label>
               </header>
               <p>
@@ -1699,8 +1798,12 @@ export function ControlRoom(props: ControlRoomProps) {
                   <label>
                     开始
                     <select
-                      disabled={!props.settings.emptyRoomAwareness.scheduleEnabled}
-                      value={props.settings.emptyRoomAwareness.scheduleStartHour}
+                      disabled={
+                        !props.settings.emptyRoomAwareness.scheduleEnabled
+                      }
+                      value={
+                        props.settings.emptyRoomAwareness.scheduleStartHour
+                      }
                       onChange={(event) =>
                         props.onUpdateEmptyRoomAwareness({
                           scheduleStartHour: Number(event.target.value),
@@ -1718,7 +1821,9 @@ export function ControlRoom(props: ControlRoomProps) {
                   <label>
                     结束
                     <select
-                      disabled={!props.settings.emptyRoomAwareness.scheduleEnabled}
+                      disabled={
+                        !props.settings.emptyRoomAwareness.scheduleEnabled
+                      }
                       value={props.settings.emptyRoomAwareness.scheduleEndHour}
                       onChange={(event) =>
                         props.onUpdateEmptyRoomAwareness({
@@ -1734,7 +1839,9 @@ export function ControlRoom(props: ControlRoomProps) {
                     </select>
                   </label>
                 </div>
-                <small>开始与结束设为同一小时，表示全天允许；跨午夜时段也会正确生效。</small>
+                <small>
+                  开始与结束设为同一小时，表示全天允许；跨午夜时段也会正确生效。
+                </small>
               </div>
               <div className="awareness-window">
                 <label>
@@ -1745,11 +1852,13 @@ export function ControlRoom(props: ControlRoomProps) {
                       min="2"
                       max="60"
                       value={Math.round(
-                        props.settings.emptyRoomAwareness.minIntervalMs / 60_000,
+                        props.settings.emptyRoomAwareness.minIntervalMs /
+                          60_000,
                       )}
                       onChange={(event) =>
                         props.onUpdateEmptyRoomAwareness({
-                          minIntervalMs: Number(event.target.value || 2) * 60_000,
+                          minIntervalMs:
+                            Number(event.target.value || 2) * 60_000,
                         })
                       }
                     />
@@ -1769,11 +1878,13 @@ export function ControlRoom(props: ControlRoomProps) {
                       min="2"
                       max="60"
                       value={Math.round(
-                        props.settings.emptyRoomAwareness.maxIntervalMs / 60_000,
+                        props.settings.emptyRoomAwareness.maxIntervalMs /
+                          60_000,
                       )}
                       onChange={(event) =>
                         props.onUpdateEmptyRoomAwareness({
-                          maxIntervalMs: Number(event.target.value || 2) * 60_000,
+                          maxIntervalMs:
+                            Number(event.target.value || 2) * 60_000,
                         })
                       }
                     />
@@ -1810,7 +1921,9 @@ export function ControlRoom(props: ControlRoomProps) {
                       type="number"
                       min="1"
                       max="100"
-                      value={props.settings.emptyRoomAwareness.maxProactiveTurns}
+                      value={
+                        props.settings.emptyRoomAwareness.maxProactiveTurns
+                      }
                       onChange={(event) =>
                         props.onUpdateEmptyRoomAwareness({
                           maxProactiveTurns: Number(event.target.value || 1),
@@ -1821,126 +1934,178 @@ export function ControlRoom(props: ControlRoomProps) {
                   </span>
                 </label>
               </div>
-              <section className="behavior-strategy-list" aria-label="静息行为策略">
-                <div className="behavior-strategy-heading">
-                  <div>
-                    <span>BEHAVIOR LIBRARY</span>
-                    <strong>静息时主动做什么</strong>
+              {soulOwnsQuietRoomBehavior ? (
+                <section
+                  className="behavior-strategy-list"
+                  aria-label="Soul 自主静息决策"
+                >
+                  <div className="behavior-strategy-heading">
+                    <div>
+                      <span>SOUL AUTONOMY</span>
+                      <strong>静息行动由目标与评价决定</strong>
+                    </div>
                   </div>
-                  <button
-                    type="button"
-                    onClick={() =>
-                      props.onUpdateEmptyRoomAwareness({
-                        behaviorStrategies: [
-                          ...props.settings.emptyRoomAwareness.behaviorStrategies,
-                          {
-                            id: createEmptyRoomStrategyId(),
-                            name: '新行为策略',
-                            prompt: '描述这一次静息时希望数字人主动做什么，以及需要遵守的边界。',
-                            probability: 10,
-                            enabled: true,
-                          },
-                        ],
-                      })
-                    }
-                  >
-                    添加策略
-                  </button>
-                </div>
-                <p>每次触发会从已启用、概率大于 0 的策略中按比例选一条，并将其作为 <code>&lt;behavior_strategy&gt;</code> 模块插入完整静息提示词。</p>
-                {props.settings.emptyRoomAwareness.behaviorStrategies.map(
-                  (strategy) => (
-                    <article
-                      className="behavior-strategy-card"
-                      key={strategy.id}
+                  <p>
+                    当前模式只产生一次中性的安静时段机会事件。旧行为策略轮盘、固定人格动力和计数
+                    CTA 均不参与决策；Soul
+                    可以主动开题、调整注意力、延迟，或有理由地继续沉默。下方旧策略仍保存在
+                    Legacy / Shadow 回滚配置中，但此处不执行。
+                  </p>
+                </section>
+              ) : (
+                <section
+                  className="behavior-strategy-list"
+                  aria-label="静息行为策略"
+                >
+                  <div className="behavior-strategy-heading">
+                    <div>
+                      <span>BEHAVIOR LIBRARY</span>
+                      <strong>静息时主动做什么</strong>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() =>
+                        props.onUpdateEmptyRoomAwareness({
+                          behaviorStrategies: [
+                            ...props.settings.emptyRoomAwareness
+                              .behaviorStrategies,
+                            {
+                              id: createEmptyRoomStrategyId(),
+                              name: '新行为策略',
+                              prompt:
+                                '描述这一次静息时希望数字人主动做什么，以及需要遵守的边界。',
+                              probability: 10,
+                              enabled: true,
+                            },
+                          ],
+                        })
+                      }
                     >
-                      <div className="behavior-strategy-card-header">
-                        <label className="awareness-master-switch">
+                      添加策略
+                    </button>
+                  </div>
+                  <p>
+                    每次触发会从已启用、概率大于 0
+                    的策略中按比例选一条，并将其作为{' '}
+                    <code>&lt;behavior_strategy&gt;</code>{' '}
+                    模块插入完整静息提示词。
+                  </p>
+                  {props.settings.emptyRoomAwareness.behaviorStrategies.map(
+                    (strategy) => (
+                      <article
+                        className="behavior-strategy-card"
+                        key={strategy.id}
+                      >
+                        <div className="behavior-strategy-card-header">
+                          <label className="awareness-master-switch">
+                            <input
+                              type="checkbox"
+                              checked={strategy.enabled}
+                              onChange={(event) =>
+                                props.onUpdateEmptyRoomAwareness({
+                                  behaviorStrategies:
+                                    props.settings.emptyRoomAwareness.behaviorStrategies.map(
+                                      (item) =>
+                                        item.id === strategy.id
+                                          ? {
+                                              ...item,
+                                              enabled: event.target.checked,
+                                            }
+                                          : item,
+                                    ),
+                                })
+                              }
+                            />
+                            {strategy.enabled ? '已启用' : '已停用'}
+                          </label>
+                          <button
+                            type="button"
+                            className="behavior-strategy-delete"
+                            aria-label={`删除策略：${strategy.name}`}
+                            onClick={() =>
+                              props.onUpdateEmptyRoomAwareness({
+                                behaviorStrategies:
+                                  props.settings.emptyRoomAwareness.behaviorStrategies.filter(
+                                    (item) => item.id !== strategy.id,
+                                  ),
+                              })
+                            }
+                          >
+                            删除
+                          </button>
+                        </div>
+                        <label>
+                          行为策略名
                           <input
-                            type="checkbox"
-                            checked={strategy.enabled}
+                            value={strategy.name}
+                            maxLength={80}
                             onChange={(event) =>
                               props.onUpdateEmptyRoomAwareness({
-                                behaviorStrategies: props.settings.emptyRoomAwareness.behaviorStrategies.map((item) =>
-                                  item.id === strategy.id
-                                    ? { ...item, enabled: event.target.checked }
-                                    : item,
-                                ),
+                                behaviorStrategies:
+                                  props.settings.emptyRoomAwareness.behaviorStrategies.map(
+                                    (item) =>
+                                      item.id === strategy.id
+                                        ? { ...item, name: event.target.value }
+                                        : item,
+                                  ),
                               })
                             }
                           />
-                          {strategy.enabled ? '已启用' : '已停用'}
                         </label>
-                        <button
-                          type="button"
-                          className="behavior-strategy-delete"
-                          aria-label={`删除策略：${strategy.name}`}
-                          onClick={() =>
-                            props.onUpdateEmptyRoomAwareness({
-                              behaviorStrategies: props.settings.emptyRoomAwareness.behaviorStrategies.filter(
-                                (item) => item.id !== strategy.id,
-                              ),
-                            })
-                          }
-                        >
-                          删除
-                        </button>
-                      </div>
-                      <label>
-                        行为策略名
-                        <input
-                          value={strategy.name}
-                          maxLength={80}
-                          onChange={(event) =>
-                            props.onUpdateEmptyRoomAwareness({
-                              behaviorStrategies: props.settings.emptyRoomAwareness.behaviorStrategies.map((item) =>
-                                item.id === strategy.id
-                                  ? { ...item, name: event.target.value }
-                                  : item,
-                              ),
-                            })
-                          }
-                        />
-                      </label>
-                      <label>
-                        策略提示词
-                        <textarea
-                          value={strategy.prompt}
-                          maxLength={1600}
-                          rows={4}
-                          onChange={(event) =>
-                            props.onUpdateEmptyRoomAwareness({
-                              behaviorStrategies: props.settings.emptyRoomAwareness.behaviorStrategies.map((item) =>
-                                item.id === strategy.id
-                                  ? { ...item, prompt: event.target.value }
-                                  : item,
-                              ),
-                            })
-                          }
-                        />
-                      </label>
-                      <label className="behavior-strategy-probability">
-                        <span>行为概率 <strong>{strategy.probability}%</strong></span>
-                        <input
-                          type="range"
-                          min="0"
-                          max="100"
-                          value={strategy.probability}
-                          onChange={(event) =>
-                            props.onUpdateEmptyRoomAwareness({
-                              behaviorStrategies: props.settings.emptyRoomAwareness.behaviorStrategies.map((item) =>
-                                item.id === strategy.id
-                                  ? { ...item, probability: Number(event.target.value) }
-                                  : item,
-                              ),
-                            })
-                          }
-                        />
-                      </label>
-                    </article>
-                  ),
-                )}
-              </section>
+                        <label>
+                          策略提示词
+                          <textarea
+                            value={strategy.prompt}
+                            maxLength={1600}
+                            rows={4}
+                            onChange={(event) =>
+                              props.onUpdateEmptyRoomAwareness({
+                                behaviorStrategies:
+                                  props.settings.emptyRoomAwareness.behaviorStrategies.map(
+                                    (item) =>
+                                      item.id === strategy.id
+                                        ? {
+                                            ...item,
+                                            prompt: event.target.value,
+                                          }
+                                        : item,
+                                  ),
+                              })
+                            }
+                          />
+                        </label>
+                        <label className="behavior-strategy-probability">
+                          <span>
+                            行为概率 <strong>{strategy.probability}%</strong>
+                          </span>
+                          <input
+                            type="range"
+                            min="0"
+                            max="100"
+                            value={strategy.probability}
+                            onChange={(event) =>
+                              props.onUpdateEmptyRoomAwareness({
+                                behaviorStrategies:
+                                  props.settings.emptyRoomAwareness.behaviorStrategies.map(
+                                    (item) =>
+                                      item.id === strategy.id
+                                        ? {
+                                            ...item,
+                                            probability: Number(
+                                              event.target.value,
+                                            ),
+                                          }
+                                        : item,
+                                  ),
+                              })
+                            }
+                          />
+                        </label>
+                      </article>
+                    ),
+                  )}
+                </section>
+              )}
               <div className="awareness-sources" hidden>
                 {(
                   [
@@ -1970,7 +2135,9 @@ export function ControlRoom(props: ControlRoomProps) {
                 ))}
               </div>
               <small>
-                权重只控制话题来源；实际口播仍由当前数字人的人设与实时提示词生成。
+                {soulOwnsQuietRoomBehavior
+                  ? '时间窗口只决定何时重新评价，不保证开口；行动与台词由 Soul Runtime 独立仲裁。'
+                  : '权重只控制话题来源；实际口播仍由当前数字人的人设与实时提示词生成。'}
               </small>
             </div>
             <div className="digital-human-actions">
@@ -1984,6 +2151,7 @@ export function ControlRoom(props: ControlRoomProps) {
             queue={props.operatorQueue}
             health={runtimeHealth}
             events={pipelineRuntimeEvents}
+            onOpenModelSettings={props.onOpenLegacySettings}
           />
         )}
         {workspace === 'config' && (

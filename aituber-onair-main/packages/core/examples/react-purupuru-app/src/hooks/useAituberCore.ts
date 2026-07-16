@@ -2,12 +2,14 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import {
   AITuberOnAirCore,
   AITuberOnAirCoreEvent,
+  buildSpeechPlanV2,
   getDefaultXaiReasoningEffort,
   hasUnsafeSpeechArtifacts,
   isGPT5Model,
   isXaiReasoningEffortModel,
   MinimaxEngine,
   sanitizeSpeechText,
+  type SpeechPlanV2BuilderHints,
 } from '@aituber-onair/core';
 import { ManneriDetector } from '@aituber-onair/manneri';
 import type {
@@ -141,6 +143,7 @@ type ProcessChatOptions = {
   sourcesSeen?: string[];
   sourceLabel?: string;
   factGuard?: ResponseFactGuard;
+  speechPlanHints?: SpeechPlanV2BuilderHints;
   showInput?: boolean;
   persistInteraction?: boolean;
   /** Generate a moderator-visible draft without requesting TTS playback. */
@@ -654,6 +657,7 @@ export function useAituberCore({
     sourcesSeen?: string[];
     sourceLabel?: string;
     factGuard?: ResponseFactGuard;
+    speechPlanHints?: SpeechPlanV2BuilderHints;
     persistInteraction?: boolean;
     onPrepared?: (reply: string, speechPlan?: PreparedSpeechPlan) => void;
   } | null>(null);
@@ -792,11 +796,9 @@ export function useAituberCore({
           speechPlanV2Enabled,
           personaPlannerEnabled,
         }),
-        // The response contract controls speaking length.  The model still
-        // needs enough headroom to close structured answers; a lower ceiling
-        // causes continuation retries while TTS has already begun, which
-        // presents as a false playback stall.
-        maxTokens: 700,
+        // M3 writes only the short spoken draft. SpeechPlanV2 is constructed
+        // locally, so the model no longer needs hundreds of tokens for JSON.
+        maxTokens: 320,
       },
       voiceOptions: buildVoiceOptions(
         settings.tts,
@@ -817,8 +819,12 @@ export function useAituberCore({
               .map((beat) => beat.text.trim())
               .filter(Boolean)
               .join(' ');
-            const guarded = guardViewerResponse(
+            const localSpeechPlan = buildSpeechPlanV2(
               combinedText,
+              pending?.speechPlanHints,
+            );
+            const guarded = guardViewerResponse(
+              localSpeechPlan.beats.map((beat) => beat.text).join(' '),
               pending?.factGuard,
             );
             lastGuardedResponseRef.current = {
@@ -830,7 +836,10 @@ export function useAituberCore({
               stage: 'speech_plan_transform',
               actor: { type: 'system', id: 'response-guard' },
               at: Date.now(),
-              input: { version: speechPlan.version, beats: speechPlan.beats },
+              input: {
+                version: localSpeechPlan.version,
+                beats: localSpeechPlan.beats,
+              },
               sanitizedText: guarded.sanitizedText,
               output: { text: guarded.text },
               rewritten: guarded.rewritten,
@@ -843,12 +852,12 @@ export function useAituberCore({
                     version: 2,
                     beats: [
                       {
-                        ...speechPlan.beats[0],
+                        ...localSpeechPlan.beats[0],
                         text: guarded.text,
                         ttsText: formatTtsSpeechScript(guarded.text),
-                        prosody: speechPlan.beats[0].prosody
+                        prosody: localSpeechPlan.beats[0].prosody
                           ? Object.fromEntries(
-                              Object.entries(speechPlan.beats[0].prosody),
+                              Object.entries(localSpeechPlan.beats[0].prosody),
                             )
                           : undefined,
                         pauseAfterMs: 0,
@@ -858,7 +867,7 @@ export function useAituberCore({
                   }
                 : {
                     version: 2,
-                    beats: speechPlan.beats.map((beat) => {
+                    beats: localSpeechPlan.beats.map((beat) => {
                       const text = sanitizeSpeechText(beat.text);
                       return {
                         ...beat,
@@ -1047,12 +1056,15 @@ export function useAituberCore({
           },
         ]);
       }
-      pendingMemoryRef.current = null;
-      lastGuardedResponseRef.current = null;
       if (pending && viewerContent && pending.persistInteraction !== false) {
         onAssistantResponseRef.current?.(pending.input, viewerContent, pending);
       }
+      // Consume the prepared-draft callback before clearing its correlation
+      // record. Some providers reach this event without running the response
+      // transform, so this is the final authoritative delivery path.
       deliverPreparedDraft(noReply ? NO_REPLY_TOKEN : viewerContent);
+      pendingMemoryRef.current = null;
+      lastGuardedResponseRef.current = null;
       setPartialResponse('');
     });
 
@@ -1203,6 +1215,7 @@ export function useAituberCore({
         sourcesSeen: options?.sourcesSeen,
         sourceLabel: options?.sourceLabel,
         factGuard: options?.factGuard,
+        speechPlanHints: options?.speechPlanHints,
         persistInteraction: options?.persistInteraction,
         onPrepared: options?.onPrepared,
       };
@@ -1327,11 +1340,9 @@ export function useAituberCore({
           preparedSpeechPlan.beats.length > 0
             ? preparedSpeechPlan.beats
             : [{ text: spokenText, ttsText: spokenText }];
-        let speechStarted = false;
         let activeChunk: Record<string, unknown> | undefined;
         try {
           onSpeechStartRef.current?.({ text: spokenText });
-          speechStarted = true;
           for (const [index, beat] of beats.entries()) {
             const text = beat.text.trim();
             if (!text) continue;
@@ -1410,9 +1421,6 @@ export function useAituberCore({
               error: error instanceof Error ? error.message : String(error),
             });
           }
-          // SPEECH_END is paired only with a real start. Calling it for a
-          // provider failure can falsely complete a different queued item.
-          if (speechStarted) onSpeechEndRef.current?.();
           throw error;
         }
         return;

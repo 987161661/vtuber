@@ -1,86 +1,15 @@
 import { Screenplay, SpeechBeat, SpeechPlanV2 } from '../types';
 import { EmotionParser } from './emotionParser';
-
-const ALLOWED_EMOTIONS = new Set([
-  'neutral',
-  'happy',
-  'sad',
-  'angry',
-  'surprised',
-  'relaxed',
-  'bored',
-  'impatient',
-  'embarrassed',
-  'awkward',
-  'serious',
-]);
-const ALLOWED_DELIVERIES = new Set([
-  'natural',
-  'warm',
-  'playful',
-  'calm',
-  'excited',
-  'soft',
-  'serious',
-  'teasing',
-]);
-const ALLOWED_VOCAL_TAGS = new Set([
-  'laughs',
-  'chuckle',
-  'coughs',
-  'clear-throat',
-  'groans',
-  'breath',
-  'pant',
-  'inhale',
-  'exhale',
-  'gasps',
-  'sniffs',
-  'sighs',
-  'snorts',
-  'burps',
-  'lip-smacking',
-  'humming',
-  'hissing',
-  'emm',
-  'sneezes',
-]);
-const ALLOWED_MOTIONS = new Set([
-  'idle_cold',
-  'side_glance',
-  'lean_in',
-  'smirk',
-  'restrained_laugh',
-  'serious_report',
-  'thank_gift',
-  'dismissive',
-]);
-const ALLOWED_GAZES = new Set(['camera', 'left', 'right', 'down']);
-const ALLOWED_GESTURES = new Set(['still', 'subtle', 'expressive']);
-const PROSODY_KEYS = [
-  'pace',
-  'pitch',
-  'volume',
-  'warmth',
-  'tension',
-  'energy',
-  'assertiveness',
-  'breathiness',
-] as const;
-
-function normalizeProsody(value: unknown): Screenplay['prosody'] | undefined {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) {
-    return undefined;
-  }
-  const normalized: NonNullable<Screenplay['prosody']> = {};
-  for (const key of PROSODY_KEYS) {
-    const candidate = (value as Record<string, unknown>)[key];
-    if (typeof candidate === 'number' && Number.isFinite(candidate)) {
-      normalized[key] = Math.min(1, Math.max(-1, candidate));
-    }
-  }
-  return Object.keys(normalized).length ? normalized : undefined;
-}
+import {
+  ALLOWED_DELIVERIES,
+  ALLOWED_EMOTIONS,
+  ALLOWED_GAZES,
+  ALLOWED_GESTURES,
+  ALLOWED_MOTIONS,
+  ALLOWED_VOCAL_TAGS,
+  normalizeProsody,
+} from './speechPlanConstraints';
+import { buildSpeechPlanV2 } from './speechPlanBuilder';
 
 function normalizeStructuredScreenplay(
   value: Record<string, unknown>,
@@ -202,10 +131,7 @@ export function textToScreenplay(text: string): Screenplay {
 export function textToSpeechPlan(text: string): SpeechPlanV2 {
   const structured = parseStructuredSpeechPlan(text);
   if (structured) return structured;
-  return {
-    version: 2,
-    beats: [{ ...textToScreenplay(text), interruptibleAfter: true }],
-  };
+  return buildSpeechPlanV2(text);
 }
 
 /** Preserve the existing single-screenplay event and history surface. */

@@ -311,8 +311,15 @@ export interface DigitalHumanSettings {
   profiles: DigitalHumanProfile[];
 }
 
+export type SoulRuntimeMode = 'legacy' | 'shadow' | 'canary' | 'primary';
+
+export interface SoulSettings {
+  runtimeMode: SoulRuntimeMode;
+}
+
 export interface AppSettings {
   digitalHumans: DigitalHumanSettings;
+  soul: SoulSettings;
   llm: LLMSettings;
   tts: TTSSettings;
   visual: VisualSettings;

@@ -443,12 +443,7 @@ describe('ChatProcessor', () => {
       const emitSpy = vi.spyOn(chatProcessor as any, 'emit');
 
       // Act
-      try {
-        await (chatProcessor as any).processTextChat('Hello');
-      } catch (e) {
-        // catch error and do nothing
-        // Caught error in test
-      }
+      const completed = await (chatProcessor as any).processTextChat('Hello');
 
       // Assert
       // check each event individually
@@ -462,6 +457,7 @@ describe('ChatProcessor', () => {
       expect(errorEmitCalls.length).toBeGreaterThan(0);
       expect(errorEmitCalls[0][1]).toEqual(error);
       expect(processingEndCalls.length).toBeGreaterThan(0);
+      expect(completed).toBe(false);
     });
   });
 

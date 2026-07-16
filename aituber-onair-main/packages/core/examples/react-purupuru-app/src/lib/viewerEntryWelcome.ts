@@ -9,7 +9,17 @@ export type ViewerEntryObservation = {
 function promptField(value: string, maxLength = 48): string {
   return value
     .normalize('NFKC')
-    .replace(/[<>\r\n\u0000-\u001f\u007f]/g, ' ')
+    .split('')
+    .map((character) => {
+      const codePoint = character.charCodeAt(0);
+      return character === '<' ||
+        character === '>' ||
+        codePoint <= 0x1f ||
+        codePoint === 0x7f
+        ? ' '
+        : character;
+    })
+    .join('')
     .replace(/\s+/g, ' ')
     .trim()
     .slice(0, maxLength);

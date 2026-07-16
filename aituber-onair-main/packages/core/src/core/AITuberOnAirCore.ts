@@ -430,17 +430,22 @@ export class AITuberOnAirCore extends EventEmitter {
     options: { speak?: boolean; transientContext?: string } = {},
   ): Promise<boolean> {
     this.responseSpeechQueue.push(options.speak !== false);
-    return this.withProcessing(
+    const completed = await this.withProcessing(
       { text },
-      async () => {
-        await this.chatProcessor.processTextChat(
+      () =>
+        this.chatProcessor.processTextChat(
           text,
           'chatForm',
           options.transientContext,
-        );
-      },
+        ),
       'Error in processChat:',
     );
+    if (!completed) {
+      // No assistant response will consume this entry. Leaving it queued would
+      // apply the failed turn's speech policy to the next viewer response.
+      this.responseSpeechQueue.pop();
+    }
+    return completed;
   }
 
   /**
@@ -462,7 +467,7 @@ export class AITuberOnAirCore extends EventEmitter {
         }
 
         // Process image in ChatProcessor
-        await this.chatProcessor.processVisionChat(imageDataUrl);
+        return this.chatProcessor.processVisionChat(imageDataUrl);
       },
       'Error in processVisionChat:',
     );
@@ -470,7 +475,7 @@ export class AITuberOnAirCore extends EventEmitter {
 
   private async withProcessing(
     startPayload: Record<string, unknown>,
-    action: () => Promise<void>,
+    action: () => Promise<boolean | void>,
     errorMessage: string,
   ): Promise<boolean> {
     if (this.isProcessing) {
@@ -481,8 +486,8 @@ export class AITuberOnAirCore extends EventEmitter {
     try {
       this.isProcessing = true;
       this.emit(AITuberOnAirCoreEvent.PROCESSING_START, startPayload);
-      await action();
-      return true;
+      const completed = await action();
+      return completed !== false;
     } catch (error) {
       this.log(errorMessage, error);
       this.emit(AITuberOnAirCoreEvent.ERROR, error);
