@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   LiveResponseScheduler,
+  responseLane,
   type LiveLifecycleTransition,
 } from '../../examples/react-purupuru-app/src/lib/liveResponseScheduler';
 
@@ -21,6 +22,12 @@ function comment(
 }
 
 describe('LiveResponseScheduler', () => {
+  it('routes a city temperature question through the weather lane', () => {
+    expect(responseLane(comment('temp', '南京气温', 1_000, 'viewer-a'))).toBe(
+      'weather',
+    );
+  });
+
   it('selects the substantive earlier question before a later low-info ping', () => {
     let now = new Date('2026-07-12T01:13:28+08:00').getTime();
     const scheduler = new LiveResponseScheduler({

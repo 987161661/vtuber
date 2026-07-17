@@ -28,6 +28,17 @@ export type BroadcastRuntimeEvent = {
 };
 
 type Fault = { at: number; stage: string; reason?: string };
+type FaultRef = { nodeId: string; at: number; stage: string };
+
+export function isCurrentBroadcastFault(
+  reference: FaultRef | undefined,
+  current: Fault | undefined,
+): boolean {
+  if (!reference) return true;
+  return Boolean(
+    current && current.at === reference.at && current.stage === reference.stage,
+  );
+}
 export type BroadcastRuntimeHealth = {
   lastFaults?: Partial<
     Record<'soul' | 'model' | 'skill' | 'tts' | 'flashhead' | 'platform', Fault>
@@ -486,6 +497,7 @@ export function BroadcastTopologyPanel({
     title: string;
     text: string;
     action?: 'open-model-settings';
+    faultRef?: FaultRef;
   } | null>(null);
   const [copied, setCopied] = useState(false);
   const [now, setNow] = useState(() => Date.now());
@@ -551,6 +563,15 @@ export function BroadcastTopologyPanel({
   if (modelFault) nodeFaults.set('model', modelFault);
   if (ttsFault) nodeFaults.set('tts', ttsFault);
   if (rendererFault) nodeFaults.set('renderer', rendererFault);
+  const detailFaultIsCurrent = detail?.faultRef
+    ? isCurrentBroadcastFault(
+        detail.faultRef,
+        nodeFaults.get(detail.faultRef.nodeId as NodeId),
+      )
+    : true;
+  useEffect(() => {
+    if (detail?.faultRef && !detailFaultIsCurrent) setDetail(null);
+  }, [detail?.faultRef, detailFaultIsCurrent]);
   const itemAge = item ? now - item.updatedAt : 0;
   if (
     item?.status === 'preparing' &&
@@ -725,6 +746,11 @@ export function BroadcastTopologyPanel({
                 setDetail({
                   title: `节点故障：${node.label} / ${fault.stage}`,
                   text: fault.reason || '该节点报告故障，但没有附带更多原因。',
+                  faultRef: {
+                    nodeId: node.id,
+                    at: fault.at,
+                    stage: fault.stage,
+                  },
                   action:
                     fault.stage === 'generation_auth_failed'
                       ? 'open-model-settings'

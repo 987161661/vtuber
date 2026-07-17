@@ -786,6 +786,51 @@ export function useAituberCore({
       onPrepared(reply, speechPlan);
     };
 
+    const deliverVerifiedFactFallback = (error: unknown): boolean => {
+      const pending = pendingMemoryRef.current;
+      const requiredAnswer = sanitizeSpeechText(
+        pending?.factGuard?.requiredAnswer ?? '',
+      );
+      if (
+        !pending?.onPrepared ||
+        !pending.factGuard?.isWeather ||
+        !requiredAnswer
+      ) {
+        return false;
+      }
+      const guarded = guardViewerResponse(requiredAnswer, pending.factGuard);
+      const localSpeechPlan = buildSpeechPlanV2(
+        guarded.text,
+        pending.speechPlanHints,
+      );
+      const preparedSpeechPlan: PreparedSpeechPlan = {
+        version: 2,
+        beats: localSpeechPlan.beats.map((beat) => ({
+          ...beat,
+          text: sanitizeSpeechText(beat.text),
+          ttsText: formatTtsSpeechScript(beat.text),
+          prosody: beat.prosody
+            ? Object.fromEntries(Object.entries(beat.prosody))
+            : undefined,
+        })),
+      };
+      emitRuntimeTrace({
+        eventId: pending.eventId,
+        stage: 'verified_fact_generation_fallback',
+        actor: { type: 'system', id: 'response-guard' },
+        at: Date.now(),
+        reason: 'model-generation-failed-after-authoritative-tool-result',
+        error: error instanceof Error ? error.message : String(error),
+        output: { text: guarded.text },
+        factGuard: pending.factGuard,
+      });
+      deliverPreparedDraft(guarded.text, preparedSpeechPlan);
+      pendingMemoryRef.current = null;
+      lastGuardedResponseRef.current = null;
+      setPartialResponse('');
+      return true;
+    };
+
     const core = new AITuberOnAirCore({
       apiKey: llmApiKey.trim(),
       chatProvider: settings.llm.provider,
@@ -1015,9 +1060,9 @@ export function useAituberCore({
         at: Date.now(),
         provider: settings.llm.provider,
         model: settings.llm.model,
-        modelRawText:
-          responseData?.modelRawText ??
-          (typeof data === 'string' ? data : undefined),
+        // Raw provider text may contain private reasoning envelopes. Keep only
+        // the derived protocol inspection and the viewer-facing parse in the
+        // runtime log; the raw chain is neither an audit fact nor UI data.
         speechPlanEnvelope: inspectSpeechPlanEnvelope(
           responseData?.modelRawText ??
             (typeof data === 'string' ? data : undefined),
@@ -1127,6 +1172,10 @@ export function useAituberCore({
         }).catch(() => undefined);
       }
       setIsProcessing(false);
+      if (deliverVerifiedFactFallback(error)) {
+        onSpeechEndRef.current?.();
+        return;
+      }
       onChatErrorRef.current?.(error, {
         eventId: pendingMemoryRef.current?.eventId,
       });

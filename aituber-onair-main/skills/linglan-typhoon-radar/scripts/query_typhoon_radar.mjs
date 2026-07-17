@@ -386,9 +386,14 @@ function shortTime(value) {
 }
 
 export function extractNamedTyphoonQuery(question) {
-  const chinese = String(question || '').match(/^\s*([\u4e00-\u9fff]{2,4})(?:啊|呀|呢)?(?:现在|目前|后来)?(?:怎么样|如何|去哪|到哪|在哪|还在|登陆|消散|降级|减弱)/);
+  const normalizedQuestion = String(question || '')
+    .replace(/^.{0,80}?(?:的\s*)?(?:弹幕|消息)[：:]\s*/, '')
+    .replace(/^\s*(?:请)?(?:直接|认真|先)?(?:回答|说明|告诉我)[：:，,\s]*/, '');
+  const chinese = normalizedQuestion.match(
+    /^\s*([\u4e00-\u9fff]{2,4}?)(?:啊|呀|呢)?(?:现在|目前|后来)?(?:怎么样|如何|去哪|到哪|在哪|还在|登陆|消散|降级|减弱|哪来(?:的)?|从哪来|是什么|是几号|几号台风|什么时候|何时|存在过|有过|在?\d{4}年)/,
+  );
   if (chinese?.[1]) return chinese[1];
-  const english = String(question || '').match(/\b([A-Za-z]{3,})\b/);
+  const english = normalizedQuestion.match(/\b([A-Za-z]{3,})\b/);
   return english?.[1] || null;
 }
 
@@ -409,7 +414,20 @@ function historicalLifecycleAnswer(question, history) {
   const correction = ['热带低压', '热带风暴', '强热带风暴'].includes(stage)
     ? '，已经不再是台风级，不能再把它当作台风实况来称呼。'
     : '；上游随后已停止对它编号，它不属于当前活动台风。';
-  return `${history.nameZh}啊，它不是现在正在活动的台风。${lastObserved}${classification}${correction}`;
+  const numbered = String(history.id || '').match(/^(\d{4})(\d{2})$/);
+  const historicalIdentity = numbered
+    ? `它是${numbered[1]}年第${Number(numbered[2])}号台风，确实在${new Intl.DateTimeFormat('zh-CN', {
+        timeZone: 'Asia/Shanghai',
+        month: 'numeric',
+      }).format(new Date(history.lastObservedAt || history.endedAt))}期间存在过；`
+    : '';
+  return `${history.nameZh}不是凭空出现的。${historicalIdentity}它只是现在已经不再活动。${lastObserved}${classification}${correction}`;
+}
+
+function asksForCurrentStormCount(question) {
+  return /(?:现在|当前|目前).{0,8}(?:几个|几(?:个|号)?台风|多少(?:个)?台风)|(?:一共|总共).{0,8}(?:几个|多少).{0,4}台风|(?:几个|多少(?:个)?)(?:正在)?(?:活动|活跃)?台风/.test(
+    String(question || ''),
+  );
 }
 
 export function buildRequiredAnswer(question, intent, cityWind, defense, storms, sources, landfall) {
@@ -469,6 +487,9 @@ export function buildRequiredAnswer(question, intent, cityWind, defense, storms,
   }
   if (storm) {
     return `${storm.nameZh}最新实况为${storm.stage}，中心风速${storm.maxWindMps}米每秒、${storm.centerWindForceLevel}级，中心气压${storm.pressureHpa}百帕，时次${shortTime(storm.observedAt)}。`;
+  }
+  if (asksForCurrentStormCount(question)) {
+    return '当前活动台风列表是空的，也就是现在没有正在活动并被该信源持续编号的台风；这不代表2026年7月没有出现过台风。';
   }
   return '当前查询没有取得足够的台风或当地风力数据，不能给出具体数字。';
 }

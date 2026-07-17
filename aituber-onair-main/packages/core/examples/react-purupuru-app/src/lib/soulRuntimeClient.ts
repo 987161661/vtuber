@@ -2,8 +2,10 @@ import {
   createSoulRuntime,
   createSubjectiveFrame,
   InMemorySoulLedger,
+  inspectSoulLedgerReplay,
   isSoulReflectionReviewRecord,
   restoreSoulRuntime,
+  SoulSnapshotRestoreError,
   type OutcomeEventV1,
   type SemanticProposalV1,
   type SoulConstitutionV1,
@@ -28,6 +30,7 @@ export interface SoulModelResponseMetaV1 {
   firstContentLatencyMs?: number;
   fallback: boolean;
   fallbackReason?: string;
+  fallbackDetail?: string;
   repairApplied: boolean;
 }
 
@@ -39,6 +42,7 @@ export interface SoulTurnEvaluationV1 {
   meta: SoulModelResponseMetaV1;
   state: SoulStateV1;
   persistenceOk: boolean;
+  persistenceError?: string;
 }
 
 export interface SoulTurnContextV1 {
@@ -51,11 +55,13 @@ export interface SoulTurnContextV1 {
 export interface SoulOutcomeResultV1 {
   state: SoulStateV1;
   persistenceOk: boolean;
+  persistenceError?: string;
 }
 
 export interface BrowserSoulReflectionCommitResultV1
   extends SoulReflectionCommitResultV1 {
   persistenceOk: boolean;
+  persistenceError?: string;
 }
 
 export interface BrowserSoulRuntimeOptions {
@@ -82,6 +88,7 @@ export class BrowserSoulRuntimeSession {
   private readonly evaluations = new Map<string, SoulTurnEvaluationV1>();
   private readonly decisionsByEventId = new Map<string, SoulDecisionV1>();
   private lastSyncedLocalSequence = 0;
+  private lastPersistenceError: string | undefined;
 
   constructor(options: BrowserSoulRuntimeOptions) {
     this.constitution = structuredClone(options.constitution);
@@ -118,15 +125,13 @@ export class BrowserSoulRuntimeSession {
       `/api/soul/snapshot?${scopeQuery.toString()}`,
       { cache: 'no-store' },
     );
-    if (!snapshotResponse.ok) {
+    if (!snapshotResponse.ok && snapshotResponse.status !== 404) {
       throw new Error(`soul_snapshot_http_${snapshotResponse.status}`);
     }
-    const snapshotBody = (await snapshotResponse.json()) as {
-      snapshot?: SoulSnapshotV1;
-    };
-    if (!snapshotBody.snapshot) throw new Error('soul_snapshot_missing');
-
-    const ledger = new InMemorySoulLedger();
+    const snapshotBody = snapshotResponse.ok
+      ? ((await snapshotResponse.json()) as { snapshot?: SoulSnapshotV1 })
+      : {};
+    let ledger = new InMemorySoulLedger();
     let afterSequence = 0;
     for (;;) {
       const pageQuery = new URLSearchParams(scopeQuery);
@@ -175,18 +180,91 @@ export class BrowserSoulRuntimeSession {
       afterSequence = entries[entries.length - 1].sequence;
     }
 
+    const loadedEntries = await ledger.list();
+    const initialState = createSoulRuntime({
+      constitution: options.constitution,
+      profile: options.profile,
+      scope: options.scope,
+      now: snapshotBody.snapshot
+        ? () => snapshotBody.snapshot!.state.createdAt
+        : options.now,
+    }).getState();
+    const inspection = inspectSoulLedgerReplay(
+      initialState,
+      options.profile,
+      loadedEntries,
+      { quarantineInvalidReflectionReviews: true },
+    );
+    if (inspection.quarantinedReflectionEntryIds.length > 0) {
+      const quarantined = new Set(
+        inspection.quarantinedReflectionEntryIds,
+      );
+      const validatedLedger = new InMemorySoulLedger();
+      for (const entry of loadedEntries) {
+        if (quarantined.has(entry.id)) continue;
+        await validatedLedger.append({
+          id: entry.id,
+          kind: entry.kind,
+          scope: entry.scope,
+          occurredAt: entry.occurredAt,
+          payload: entry.payload,
+        });
+      }
+      ledger = validatedLedger;
+    }
+
     const session = new BrowserSoulRuntimeSession(options);
-    session.runtime = await restoreSoulRuntime({
-      constitution: session.constitution,
-      profile: session.profile,
-      scope: session.scope,
-      ledger,
-      snapshot: snapshotBody.snapshot,
-      now: options.now,
-    });
-    session.lastSyncedLocalSequence = (
-      await session.runtime.getLedger().list()
-    ).length;
+    let rebuiltFromLedger = false;
+    if (snapshotBody.snapshot) {
+      try {
+        session.runtime = await restoreSoulRuntime({
+          constitution: session.constitution,
+          profile: session.profile,
+          scope: session.scope,
+          ledger,
+          snapshot: snapshotBody.snapshot,
+          now: options.now,
+        });
+      } catch (error) {
+        if (!isLedgerCheckpointRestoreError(error)) throw error;
+        // The append-only ledger is authoritative. A checkpoint can become
+        // unverifiable after a repaired/corrupt ledger segment is replaced;
+        // replay the complete validated ledger and immediately supersede the
+        // stale snapshot instead of starting from version zero.
+        session.runtime = createSoulRuntime({
+          constitution: session.constitution,
+          profile: session.profile,
+          scope: session.scope,
+          ledger,
+          // The snapshot hash was valid; retain its immutable creation clock
+          // while recomputing every mutable projection from the ledger.
+          now: () => snapshotBody.snapshot!.state.createdAt,
+        });
+        await session.runtime.replay();
+        rebuiltFromLedger = true;
+      }
+    } else {
+      session.runtime = createSoulRuntime({
+        constitution: session.constitution,
+        profile: session.profile,
+        scope: session.scope,
+        ledger,
+        now: options.now,
+      });
+      await session.runtime.replay();
+    }
+    const restoredEntries = await session.runtime.getLedger().list();
+    session.lastSyncedLocalSequence = restoredEntries.length;
+    for (const entry of restoredEntries) {
+      if (entry.kind !== 'decision') continue;
+      const decision = entry.payload as SoulDecisionV1;
+      session.decisionsByEventId.set(decision.eventId, structuredClone(decision));
+    }
+    if (rebuiltFromLedger && !(await session.persistProjection())) {
+      throw new Error(
+        `soul_snapshot_rebuild_failed:${session.lastPersistenceError ?? 'unknown'}`,
+      );
+    }
     return session;
   }
 
@@ -199,11 +277,20 @@ export class BrowserSoulRuntimeSession {
     return decision ? structuredClone(decision) : undefined;
   }
 
+  getPersistenceError(): string | undefined {
+    return this.lastPersistenceError;
+  }
+
   async reserveDecision(eventId: string): Promise<SoulOutcomeResultV1> {
     const decision = this.decisionsByEventId.get(eventId);
     if (!decision) throw new Error(`Unknown Soul event ${eventId}`);
     const state = await this.runtime.reserve(decision, this.now());
-    return { state, persistenceOk: await this.persistProjection() };
+    const persistenceOk = await this.persistProjection();
+    return {
+      state,
+      persistenceOk,
+      persistenceError: this.lastPersistenceError,
+    };
   }
 
   async evaluate(
@@ -250,6 +337,7 @@ export class BrowserSoulRuntimeSession {
       meta,
       state: this.runtime.getState(),
       persistenceOk,
+      persistenceError: this.lastPersistenceError,
     };
     this.evaluations.set(event.id, structuredClone(result));
     return result;
@@ -279,7 +367,12 @@ export class BrowserSoulRuntimeSession {
       feedbackGoalEvidence: options.feedbackGoalEvidence,
     };
     const state = await this.runtime.applyOutcome(outcome);
-    return { state, persistenceOk: await this.persistProjection() };
+    const persistenceOk = await this.persistProjection();
+    return {
+      state,
+      persistenceOk,
+      persistenceError: this.lastPersistenceError,
+    };
   }
 
   /**
@@ -291,9 +384,11 @@ export class BrowserSoulRuntimeSession {
     input: SoulReflectionCommitInputV1,
   ): Promise<BrowserSoulReflectionCommitResultV1> {
     const result = await this.runtime.commitReflection(input);
+    const persistenceOk = await this.persistProjection();
     return {
       ...result,
-      persistenceOk: await this.persistProjection(),
+      persistenceOk,
+      persistenceError: this.lastPersistenceError,
     };
   }
 
@@ -349,6 +444,7 @@ export class BrowserSoulRuntimeSession {
   }
 
   private async persistProjection(): Promise<boolean> {
+    this.lastPersistenceError = undefined;
     try {
       const entries = await this.runtime.getLedger().list({
         afterSequence: this.lastSyncedLocalSequence,
@@ -365,7 +461,13 @@ export class BrowserSoulRuntimeSession {
             payload: entry.payload,
           }),
         });
-        if (!response.ok) return false;
+        if (!response.ok) {
+          this.lastPersistenceError = await persistenceHttpError(
+            'soul_ledger',
+            response,
+          );
+          return false;
+        }
         this.lastSyncedLocalSequence = entry.sequence;
       }
       const snapshot = await this.runtime.snapshot(this.now());
@@ -374,11 +476,50 @@ export class BrowserSoulRuntimeSession {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(snapshot),
       });
-      return snapshotResponse.ok;
-    } catch {
+      if (!snapshotResponse.ok) {
+        this.lastPersistenceError = await persistenceHttpError(
+          'soul_snapshot',
+          snapshotResponse,
+        );
+        return false;
+      }
+      return true;
+    } catch (error) {
+      this.lastPersistenceError =
+        error instanceof Error
+          ? error.message.slice(0, 240)
+          : 'soul_persistence_network_error';
       return false;
     }
   }
+}
+
+async function persistenceHttpError(
+  prefix: string,
+  response: Response,
+): Promise<string> {
+  let detail = '';
+  try {
+    const body = (await response.json()) as { error?: unknown };
+    detail = typeof body.error === 'string' ? body.error.trim() : '';
+  } catch {
+    // Status remains sufficient when the gateway did not return JSON.
+  }
+  return `${prefix}_http_${response.status}${detail ? `:${detail}` : ''}`.slice(
+    0,
+    240,
+  );
+}
+
+function isLedgerCheckpointRestoreError(
+  error: unknown,
+): error is SoulSnapshotRestoreError {
+  return (
+    error instanceof SoulSnapshotRestoreError &&
+    (error.message ===
+      'Snapshot ledger checkpoint is missing from the supplied ledger' ||
+      error.message === 'Snapshot ledger head does not match the supplied ledger')
+  );
 }
 
 function createLocalFallbackProposal(event: SoulEventV1): SemanticProposalV1 {

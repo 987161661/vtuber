@@ -93,6 +93,39 @@ export type OperatorQueueItem = {
 
 export const MAX_READY_REPLY_AGE_MS = 45_000;
 
+const DELIVERY_REGRESSING_ACTIONS = new Set([
+  'edit-reply',
+  'skip',
+  'fail',
+  'retry',
+  'ready',
+]);
+
+/**
+ * Delivery evidence is monotonic. Once every planned beat produced audio, a
+ * late cancellation, failure callback, or generation callback cannot rewrite
+ * the item into an unspoken state. This also covers the short race between
+ * the final beat callback and the subsequent `done` mutation.
+ */
+export function wouldRegressCompletedDelivery(
+  item: {
+    status: string;
+    beatCount?: number;
+    completedBeatCount?: number;
+    audioByteLength?: number;
+  },
+  action: string,
+): boolean {
+  if (!DELIVERY_REGRESSING_ACTIONS.has(action)) return false;
+  if (item.status === 'done') return true;
+  const beatCount = Math.max(0, item.beatCount ?? 0);
+  return (
+    beatCount > 0 &&
+    (item.completedBeatCount ?? 0) >= beatCount &&
+    (item.audioByteLength ?? 0) > 0
+  );
+}
+
 /**
  * A generated reply becomes misleading once the live room has already moved
  * on. Operator-authored speech is exempt because it is an explicit command.

@@ -292,6 +292,29 @@ describe('routeTyphoonSkillWithAgent', () => {
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
+  it('routes a terse city temperature message to verified city weather', async () => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal('fetch', fetchMock);
+    const wrapped = '001号人类 的弹幕：南京气温';
+
+    expect(extractWeatherLocation(wrapped)).toBe('南京');
+    await expect(
+      routeTyphoonSkillWithAgent({
+        text: wrapped,
+        sourceLabel: '直播弹幕 · typhoon-radar',
+        turns: [],
+      }),
+    ).resolves.toMatchObject({
+      reason: 'city_weather_fact_route',
+      mode: 'weather',
+      intent: 'city_weather_query',
+      skillIds: ['city-weather'],
+      skillQuery: '南京',
+      inheritTyphoon: false,
+    });
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
   it('keeps a weather-host identity challenge in companion conversation', async () => {
     const fetchMock = vi.fn();
     vi.stubGlobal('fetch', fetchMock);

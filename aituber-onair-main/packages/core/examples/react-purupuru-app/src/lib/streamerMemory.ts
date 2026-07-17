@@ -393,6 +393,21 @@ export function isSafeMemoryText(text: string): boolean {
   );
 }
 
+/** A radar/city query is an action the viewer took, not where they live. */
+export function isNonAttributableViewerCommand(
+  record: Pick<StreamerMemoryRecord, 'content' | 'subjectType' | 'sourceType'>,
+): boolean {
+  if (
+    record.subjectType !== 'viewer' ||
+    !['live_event', 'user_observation'].includes(record.sourceType)
+  ) {
+    return false;
+  }
+  return /(?:^|弹幕[：:])\s*@[\p{Script=Han}·]{2,20}\s*[?？]?\s*$/u.test(
+    record.content.normalize('NFKC'),
+  );
+}
+
 export function buildMemoryContext(
   records: StreamerMemoryRecord[],
   input: string,
@@ -437,7 +452,8 @@ export function buildMemoryContext(
         (isLongTermMemory(record) || isRecentViewerTrace(record)) &&
         (record.visibility !== 'private' || isSameViewerPrivateMemory(record)) &&
         (!record.expiresAt || record.expiresAt > Date.now()) &&
-        (!record.subjectId || !viewerId || record.subjectId === viewerId),
+        (!record.subjectId || !viewerId || record.subjectId === viewerId) &&
+        !isNonAttributableViewerCommand(record),
     )
     .sort((a, b) => score(b) - score(a))
     .slice(0, 8);
@@ -445,7 +461,7 @@ export function buildMemoryContext(
   const lines: string[] = [];
   if (selected.some(isRecentViewerTrace)) {
     lines.push(
-      '- [使用规则] 近期私有记忆只是当前观众本人这样说过，必须记住并可自然承接；但不能据此断言第三方或客观事件为真。',
+      '- [使用规则] 近期私有记忆只是带 actor 身份的历史话语，不是观众档案。只能归给同一 viewerId；提问、@城市、技能命令和话题提及不得推断为住址、偏好或身份。只有“我住在/我来自/我喜欢”等明确自述才能作为低置信 viewer claim 承接，且不能据此断言第三方或客观事件为真。',
     );
   }
   for (const r of selected) {

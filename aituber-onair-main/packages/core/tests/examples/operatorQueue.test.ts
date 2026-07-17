@@ -1,46 +1,46 @@
 import { describe, expect, it } from 'vitest';
-import {
-  type OperatorQueueItem,
-  isStaleReadyReply,
-} from '../../examples/react-purupuru-app/src/lib/operatorQueue';
+import { wouldRegressCompletedDelivery } from '../../examples/react-purupuru-app/src/lib/operatorQueue';
 
-function queueItem(input: Partial<OperatorQueueItem> = {}): OperatorQueueItem {
-  return {
-    eventId: 'event-1',
-    text: '观众问题',
-    source: 'bilibili',
-    sourcesSeen: ['bilibili'],
-    createdAt: 1_000,
-    updatedAt: 1_000,
-    order: 1,
-    status: 'ready',
-    preparedReply: '主播回复',
-    skills: [],
-    ...input,
-  };
-}
-
-describe('isStaleReadyReply', () => {
-  it('drops an old generated reply before it reaches speech', () => {
-    expect(isStaleReadyReply(queueItem(), 46_001)).toBe(true);
-  });
-
-  it('keeps a fresh generated reply', () => {
-    expect(isStaleReadyReply(queueItem(), 46_000)).toBe(false);
-  });
-
-  it('never expires an explicit operator broadcast', () => {
+describe('operator queue delivery monotonicity', () => {
+  it('rejects a late skip after the item is done', () => {
     expect(
-      isStaleReadyReply(
-        queueItem({ source: 'operator-manual' }),
-        Number.MAX_SAFE_INTEGER,
+      wouldRegressCompletedDelivery(
+        {
+          status: 'done',
+          beatCount: 1,
+          completedBeatCount: 1,
+          audioByteLength: 128,
+        },
+        'skip',
+      ),
+    ).toBe(true);
+  });
+
+  it('protects the final-beat race before done is persisted', () => {
+    expect(
+      wouldRegressCompletedDelivery(
+        {
+          status: 'speaking',
+          beatCount: 2,
+          completedBeatCount: 2,
+          audioByteLength: 256,
+        },
+        'fail',
+      ),
+    ).toBe(true);
+  });
+
+  it('still permits cancellation before any complete delivery', () => {
+    expect(
+      wouldRegressCompletedDelivery(
+        {
+          status: 'ready',
+          beatCount: 2,
+          completedBeatCount: 0,
+          audioByteLength: 0,
+        },
+        'skip',
       ),
     ).toBe(false);
-  });
-
-  it('only evaluates items that are ready to speak', () => {
-    expect(isStaleReadyReply(queueItem({ status: 'preparing' }), 100_000)).toBe(
-      false,
-    );
   });
 });

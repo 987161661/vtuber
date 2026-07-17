@@ -27,7 +27,66 @@ const SEMANTIC_FAMILIES: Array<[string, RegExp]> = [
   ['room_presence', /直播间|房间|在场|安静|没人|观众/u],
   ['relationships', /朋友|女朋友|男朋友|家人|关系|认识/u],
   ['weather', /天气|台风|下雨|雷达|气温|风雨/u],
+  ['hazards', /洪灾|洪水|雨灾|水灾|内涝|积水|山洪|泥石流|灾情|预警/u],
 ];
+
+function semanticFamilies(text: string) {
+  return SEMANTIC_FAMILIES.flatMap(([family, pattern]) =>
+    pattern.test(text) ? [family] : [],
+  );
+}
+
+function normalizedComparableText(text: string) {
+  return text
+    .normalize('NFKC')
+    .toLowerCase()
+    .replace(/[\p{P}\p{S}\s]/gu, '')
+    .replace(/(?:这个|那个|现在|目前|就是|其实|一下|已经|还是|可以)/gu, '');
+}
+
+function bigrams(text: string) {
+  const chars = Array.from(normalizedComparableText(text));
+  const values = new Set<string>();
+  for (let index = 0; index < chars.length - 1; index += 1) {
+    values.add(`${chars[index]}${chars[index + 1]}`);
+  }
+  return values;
+}
+
+/**
+ * Final deterministic guard for low-priority proactive speech. It compares
+ * meaning-bearing topic families first and lexical overlap second, so a model
+ * cannot repeat the just-finished audience topic merely by paraphrasing it.
+ */
+export function isRecentSemanticTopicRepeat(
+  candidate: string,
+  recentTexts: readonly string[],
+) {
+  const candidateFamilies = new Set(semanticFamilies(candidate));
+  const candidateNormalized = normalizedComparableText(candidate);
+  const candidateBigrams = bigrams(candidate);
+  if (!candidateNormalized || candidateBigrams.size < 2) return false;
+  return recentTexts.some((recentText) => {
+    const recentFamilies = semanticFamilies(recentText);
+    if (recentFamilies.some((family) => candidateFamilies.has(family))) {
+      return true;
+    }
+    const recentNormalized = normalizedComparableText(recentText);
+    if (
+      Math.min(candidateNormalized.length, recentNormalized.length) >= 8 &&
+      (candidateNormalized.includes(recentNormalized) ||
+        recentNormalized.includes(candidateNormalized))
+    ) {
+      return true;
+    }
+    const recentBigrams = bigrams(recentText);
+    const intersection = [...candidateBigrams].filter((value) =>
+      recentBigrams.has(value),
+    ).length;
+    const union = new Set([...candidateBigrams, ...recentBigrams]).size;
+    return union > 0 && intersection / union >= 0.45;
+  });
+}
 
 function normalizedTokens(text: string) {
   return text

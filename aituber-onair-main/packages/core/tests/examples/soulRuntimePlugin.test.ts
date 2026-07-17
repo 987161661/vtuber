@@ -5,6 +5,7 @@ import {
   type SoulReflectRequestV1,
   type SoulReflectionProposalV1,
   buildSoulFastMessages,
+  createFastFallbackProposal,
   createReflectionLedgerInput,
   normalizeSemanticProposal,
   parseSoulModelJson,
@@ -228,6 +229,76 @@ describe('soul runtime server protocol helpers', () => {
       id: 'open-topic-1',
       action: 'open-topic',
     });
+  });
+
+  it('normalizes bounded M3 proposal and action field drift', () => {
+    const proposal = normalizeSemanticProposal(
+      {
+        proposal: {
+          confidence: 0.6,
+          attribution: 'viewer',
+          actionCandidates: {
+            actionType: 'respond',
+            speech: '我先直接回答你。',
+            goalEffects: [],
+            relationshipBenefit: 0.2,
+            programValue: 0.3,
+            novelty: 0.1,
+            repetitionCost: 0,
+            interruptionCost: 0,
+            manipulationRisk: 0,
+            factSafetyRisk: 0,
+            socialRisks: [],
+            reasonCodes: ['direct-answer'],
+          },
+        },
+      },
+      { eventId: 'event-1', scope },
+    );
+
+    expect(proposal.candidates).toHaveLength(1);
+    expect(proposal.candidates[0]).toMatchObject({
+      action: 'answer',
+      utterance: '我先直接回答你。',
+    });
+  });
+
+  it('normalizes nested Chinese action drift and degrades missing speech safely', () => {
+    const proposal = normalizeSemanticProposal(
+      {
+        output: {
+          candidate_list: [
+            { type: '修复', message: '刚才是我没接好。', reasonCodes: ['repair'] },
+            { type: '回应', reasonCodes: ['missing-speech'] },
+          ],
+        },
+      },
+      { eventId: 'event-1', scope },
+    );
+
+    expect(proposal.candidates[0]).toMatchObject({
+      action: 'repair',
+      utterance: '刚才是我没接好。',
+    });
+    expect(proposal.candidates[1]).toMatchObject({ action: 'delay' });
+    expect(proposal.candidates[1]?.reasonCodes).toContain(
+      'missing-utterance-degraded-to-delay',
+    );
+  });
+
+  it('uses a non-defensive local repair when the provider fails on exclusion', () => {
+    const request = fastRequest();
+    const proposal = createFastFallbackProposal({
+      ...request.event,
+      data: { text: '小雨 的弹幕：我呢？我不是人？' },
+    });
+
+    expect(proposal.candidates[0]).toMatchObject({ action: 'repair' });
+    expect(proposal.candidates[0]?.utterance).toContain('被落下');
+    expect(proposal.evidence.map((item) => item.dimension)).toEqual([
+      'social-evaluation',
+      'attention-competition',
+    ]);
   });
 
   it('builds a causal, non-scenario prompt and keeps credentials out', () => {

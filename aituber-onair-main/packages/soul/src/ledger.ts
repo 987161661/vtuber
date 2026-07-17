@@ -18,6 +18,7 @@ import {
 import {
   applySoulReflectionReviewRecord,
   isSoulReflectionReviewRecord,
+  SoulReflectionReviewError,
   type SoulReflectionReviewRecordV1,
 } from './reflection.js';
 import { deepClone, hashValue, stableStringify } from './utils.js';
@@ -204,6 +205,28 @@ export function replaySoulLedger(
   profile: SoulProfileV1,
   entries: readonly SoulLedgerEntryV1[],
 ): SoulStateV1 {
+  return inspectSoulLedgerReplay(initialState, profile, entries, {
+    quarantineInvalidReflectionReviews: false,
+  }).state;
+}
+
+export interface SoulLedgerReplayInspectionV1 {
+  state: SoulStateV1;
+  quarantinedReflectionEntryIds: readonly string[];
+}
+
+/**
+ * Replays an authoritative ledger while optionally identifying legacy
+ * reflection-review records that cannot be proven against the state at their
+ * original position. The records remain in the server audit ledger; callers
+ * may exclude only the returned ids from a reconstructed state projection.
+ */
+export function inspectSoulLedgerReplay(
+  initialState: SoulStateV1,
+  profile: SoulProfileV1,
+  entries: readonly SoulLedgerEntryV1[],
+  options: { quarantineInvalidReflectionReviews: boolean },
+): SoulLedgerReplayInspectionV1 {
   const appraisals = new Map<string, SoulAppraisalV1>();
   for (const entry of entries) {
     if (entry.kind === 'appraisal') {
@@ -213,6 +236,7 @@ export function replaySoulLedger(
   }
   let state = deepClone(initialState);
   const decisions = new Map<string, SoulDecisionV1>();
+  const quarantinedReflectionEntryIds: string[] = [];
   for (const entry of entries) {
     if (entry.kind === 'event') {
       const event = entry.payload as SoulEventV1;
@@ -253,10 +277,20 @@ export function replaySoulLedger(
       entry.kind === 'reflection' &&
       isSoulReflectionReviewRecord(entry.payload)
     ) {
-      state = applySoulReflectionReviewRecord(state, profile, entry.payload);
+      try {
+        state = applySoulReflectionReviewRecord(state, profile, entry.payload);
+      } catch (error) {
+        if (
+          !options.quarantineInvalidReflectionReviews ||
+          !(error instanceof SoulReflectionReviewError)
+        ) {
+          throw error;
+        }
+        quarantinedReflectionEntryIds.push(entry.id);
+      }
     }
   }
-  return state;
+  return { state, quarantinedReflectionEntryIds };
 }
 
 export function createSoulSnapshot(

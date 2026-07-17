@@ -97,8 +97,12 @@ function formatPromptTime(at: number) {
   return new Date(at).toLocaleString('zh-CN', { hour12: false });
 }
 
+export function minimumQuietIntervalMs(settings: EmptyRoomAwarenessSettings) {
+  return Math.max(2 * 60_000, settings.minIntervalMs);
+}
+
 function scheduleDelay(settings: EmptyRoomAwarenessSettings, random: () => number) {
-  const min = Math.max(2 * 60_000, settings.minIntervalMs);
+  const min = minimumQuietIntervalMs(settings);
   const max = Math.max(min, settings.maxIntervalMs);
   return Math.round(min + clampRandom(random()) * (max - min));
 }

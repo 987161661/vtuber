@@ -12,6 +12,7 @@ import {
   defaultCoreMemories,
   memoryId,
   streamerMemoryStore,
+  isNonAttributableViewerCommand,
 } from '../lib/streamerMemory';
 import type {
   MemoryInteraction,
@@ -213,6 +214,7 @@ export function useStreamerMemory(
             !['suppressed', 'archived'].includes(record.status) &&
             (!record.expiresAt || record.expiresAt > now) &&
             (!record.subjectId || record.subjectId === viewer?.id) &&
+            !isNonAttributableViewerCommand(record) &&
             (record.visibility !== 'private' ||
               Boolean(viewer?.id && record.subjectId === viewer.id)),
         )

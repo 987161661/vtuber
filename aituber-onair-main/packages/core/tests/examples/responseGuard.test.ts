@@ -42,6 +42,23 @@ describe('guardViewerResponse', () => {
     expect(result.text).toBe('这条回复出了点问题，稍后再说。');
   });
 
+  it('removes gift-based pressure to stay', () => {
+    const result = guardViewerResponse('在呢，辣条都收了还能跑了你？', {
+      isWeather: false,
+    });
+    expect(result.reasons).toContain('gift_retention_pressure');
+    expect(result.text).toBe('心意我收到了，谢谢你；来去都由你，别有压力。');
+  });
+
+  it('does not turn paid support into a follow CTA', () => {
+    const result = guardViewerResponse('谢谢礼物，赶紧点个关注吧。', {
+      isWeather: false,
+      engagementSignals: ['gift'],
+    });
+    expect(result.reasons).toContain('paid_support_cta');
+    expect(result.text).not.toContain('关注');
+  });
+
   it('fails closed on a malformed structured JSON fragment', () => {
     const result = guardViewerResponse('{"text":"会下雨","emotion":"neutral"');
     expect(result.unsafeArtifacts).toBe(true);
@@ -172,6 +189,49 @@ describe('guardViewerResponse', () => {
 
     expect(result.text).toBe('刚才答偏了，你可以再问我一次。');
     expect(result.reasons).toContain('off_topic');
+  });
+
+  it('accepts an evidence-backed city temperature answer as weather', () => {
+    const result = guardViewerResponse(
+      '南京现在30.8度，体感36度，晴间多云。今天预计28.3到34.4度，最高降水概率49%。',
+      {
+        isWeather: true,
+        viewerText: '001号人类 的弹幕：南京气温',
+        requiredAnswer:
+          '南京当前气温30.8℃，体感36℃。今天预计28.3到34.4℃，最高降水概率49%。',
+        claims: [
+          { text: '南京当前气温30.8℃，体感36℃，晴间多云' },
+          { text: '今天预计28.3到34.4℃，最高降水概率49%' },
+        ],
+      },
+    );
+
+    expect(result.rewritten).toBe(false);
+    expect(result.reasons).toEqual([]);
+    expect(result.text).toContain('南京现在30.8度');
+  });
+
+  it('replaces unsupported naming lore when the viewer asked for a storm lifecycle', () => {
+    const requiredAnswer =
+      '海神不是凭空出现的。它是2026年第11号台风，确实在7月期间存在过；它只是现在已经不再活动。';
+    const result = guardViewerResponse(
+      '海神是台风命名表上的名字，由中国提交。',
+      {
+        isWeather: true,
+        viewerText: '海神哪来的？',
+        requiredAnswer,
+        claims: [
+          {
+            type: 'official_observation',
+            text: requiredAnswer,
+          },
+        ],
+      },
+    );
+
+    expect(result.reasons).toContain('unanswered_intent');
+    expect(result.text).toContain('2026年第11号台风');
+    expect(result.text).not.toContain('命名表');
   });
 
   it('caps ordinary live replies without cutting in the middle of a later sentence', () => {

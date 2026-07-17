@@ -320,4 +320,37 @@ describe('action utility and constitutional constraints', () => {
 
     expect(decision.selectedCandidateId).toBe('literal');
   });
+
+  it('rejects speaking candidates without an utterance and responds safely to a viewer', () => {
+    const event = makeEvent({
+      id: 'missing-draft',
+      data: { text: '海神是怎么回事？', truthDomain: 'weather' },
+    });
+    const proposal = makeProposal(event, {
+      candidates: [
+        makeCandidate({
+          id: 'null-answer',
+          action: 'answer',
+          utterance: undefined,
+          programValue: 1,
+        }),
+      ],
+    });
+    const transition = applySoulEvent(makeState(), profile, event, proposal);
+    const decision = arbitrateSoulActions(
+      constitution,
+      profile,
+      transition.state,
+      event,
+      transition.appraisal,
+      proposal,
+      { now: 2_100 },
+    );
+
+    expect(decision.action).toBe('acknowledge');
+    expect(decision.utterance).toMatch(/已经核实/);
+    expect(decision.candidateScores[0].reasonCodes).toContain(
+      'missing-utterance-for-speaking-action',
+    );
+  });
 });

@@ -50,6 +50,7 @@ import {
   type AcceptanceLedger,
   type AcceptanceResult,
 } from './src/lib/acceptanceLedger';
+import { wouldRegressCompletedDelivery } from './src/lib/operatorQueue';
 
 let runtimeSettings: string | null = null;
 let runtimeSettingsRevision = 0;
@@ -4385,6 +4386,9 @@ function liveRuntimeMonitorPlugin(): Plugin {
               const eventId = String(body.eventId || '').trim();
               const item = operatorQueue.get(eventId);
               if (!item) throw new Error('queue item not found');
+              if (wouldRegressCompletedDelivery(item, action)) {
+                throw new Error('completed delivery is immutable');
+              }
               if (action === 'delete') {
                 item.status = 'deleted';
               } else if (action === 'move') {
@@ -4791,6 +4795,15 @@ function liveRuntimeMonitorPlugin(): Plugin {
             const now = finiteTimestamp(event.at) ?? Date.now();
             const eventId = String(event.eventId || event.id || 'runtime');
             const stage = String(event.stage || event.kind || 'event');
+            if (stage === 'model_output') {
+              // Provider response objects may carry private reasoning even if
+              // the current browser client omits it. Enforce the boundary at
+              // the persistence owner as defense in depth, including against
+              // stale clients that are still open during an HMR rollout.
+              delete event.modelRawText;
+              delete event.rawText;
+              delete event.parsedText;
+            }
             liveRuntimeState.lastEventAt = now;
             if (stage === 'runtime-owner-heartbeat') {
               const ownerId = String(event.ownerId || '').trim();
@@ -4875,6 +4888,10 @@ function liveRuntimeMonitorPlugin(): Plugin {
               typeof event.fallbackReason === 'string'
                 ? event.fallbackReason
                 : undefined;
+            const soulFallbackDetail =
+              typeof event.fallbackDetail === 'string'
+                ? event.fallbackDetail.slice(0, 120)
+                : undefined;
             const intentionalSoulFallbacks = new Set([
               'cognition-frozen',
               'operator-neutral-fallback',
@@ -4883,13 +4900,23 @@ function liveRuntimeMonitorPlugin(): Plugin {
             ]);
             if (
               stage === 'soul_shadow_decision' &&
-              event.fallback !== true
+              event.fallback !== true &&
+              event.persistenceOk === true
+            ) {
+              delete liveRuntimeState.lastFaults.soul;
+            }
+            if (
+              stage === 'soul_snapshot_recovered' &&
+              liveRuntimeState.lastFaults.soul?.stage ===
+                'soul_snapshot_recovery_failed'
             ) {
               delete liveRuntimeState.lastFaults.soul;
             }
             if (
               (stage.startsWith('soul_') &&
                 /failed|failure|timeout|error/.test(stage)) ||
+              (stage.startsWith('soul_') &&
+                event.persistenceOk === false) ||
               (stage === 'soul_shadow_decision' &&
                 event.fallback === true &&
                 soulFallbackReason &&
@@ -4901,7 +4928,16 @@ function liveRuntimeMonitorPlugin(): Plugin {
                   stage === 'soul_shadow_decision'
                     ? 'soul_fast_fallback'
                     : stage,
-                reason: soulFallbackReason || reason,
+                reason:
+                  soulFallbackDetail ||
+                  soulFallbackReason ||
+                  (typeof event.persistenceError === 'string'
+                    ? event.persistenceError
+                    : undefined) ||
+                  reason ||
+                  (event.persistenceOk === false
+                    ? 'soul_persistence_failed'
+                    : undefined),
               };
             }
             if (
@@ -5596,7 +5632,9 @@ export default defineConfig({
       // cutoff even with thinking disabled. This remains below the plugin's
       // absolute 10s safety bound and does not add a retry/model call.
       fastTimeoutMs: 8_000,
-      fastMaxCompletionTokens: 420,
+      // Prompt target remains 420; this hard ceiling leaves room for a final
+      // brace instead of turning an otherwise valid M3 object into truncation.
+      fastMaxCompletionTokens: 600,
       paths: {
         ledgerPath: join(APP_ROOT, '.runtime', 'soul', 'ledger.jsonl'),
         snapshotPath: join(APP_ROOT, '.runtime', 'soul', 'snapshot.json'),

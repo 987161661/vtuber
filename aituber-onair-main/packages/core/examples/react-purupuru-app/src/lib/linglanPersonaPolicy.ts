@@ -69,7 +69,7 @@ function planForScene(
         ...plan,
         stance: 'playful_challenge', primaryMove: 'join_bit', secondaryMove: 'offer_choice',
         mustDo: ['先轻微调侃无聊本身', '给一个低门槛可接的互动'],
-        mustAvoid: ['责怪观众', '泛泛问想聊什么', '强行转天气'],
+        mustAvoid: ['责怪观众', '泛泛问想聊什么', '强行转天气', '把熬夜、作息、所在地或私人经历的猜测说成事实'],
         responseShape: { beats: 1, questionPolicy: 'one', maxChars: 72 },
         deliveryTarget: {
           emotion: 'bored', delivery: 'teasing', intensity: [0.38, 0.54],
@@ -96,6 +96,20 @@ function planForScene(
         deliveryTarget: {
           emotion: 'embarrassed', delivery: 'soft', intensity: [0.4, 0.58],
           prosody: { pace: -0.12, pitch: -0.04, warmth: 0.35, tension: 0.12, energy: -0.12, assertiveness: -0.1 },
+        },
+      };
+    case 'relationship_repair':
+      return {
+        ...plan,
+        stance: 'accountable_softness',
+        primaryMove: 'repair',
+        secondaryMove: 'acknowledge',
+        mustDo: ['先承认对方刚才有被落下的感受', '为当前疏漏负责', '自然把对方重新接回对话'],
+        mustAvoid: ['用“刚才不是回过你了吗”驳回感受', '拿礼物或消费证明关系', '反过来让观众内疚', '假装房间里只有一个观众'],
+        responseShape: { beats: 1, questionPolicy: 'optional', maxChars: 65 },
+        deliveryTarget: {
+          emotion: 'surprised', delivery: 'warm', intensity: [0.46, 0.64],
+          prosody: { pace: -0.08, pitch: 0.03, warmth: 0.58, tension: 0.08, energy: 0.08, assertiveness: -0.12 },
         },
       };
     case 'boundary':

@@ -37,6 +37,7 @@ import {
   createSoulQuietEventData,
   EmptyRoomAwarenessPlanner,
   isQuietRoomInteraction,
+  minimumQuietIntervalMs,
 } from './lib/emptyRoomAwareness';
 import { parseFlashHeadBundle } from './lib/flashheadBundle';
 import { resolveEffectiveLiveRoomStatus } from './lib/liveRoomRuntimeState';
@@ -77,6 +78,7 @@ import {
   type PersonaRuntimeTransition,
   type ProactiveIntentPlanV1,
 } from './lib/personaRuntimeState';
+import { isRecentSemanticTopicRepeat } from './lib/personaTopicLedger';
 import {
   buildViewerEntryWelcomePrompt,
   shouldWelcomeViewerEntry,
@@ -124,6 +126,9 @@ import {
   buildLiveResponseContract,
   buildLiveRoomTranscript,
   mergeRecentLiveTurns,
+  projectObservedLiveTurn,
+  projectRoomInteractionSamples,
+  recentParticipantEvidence,
 } from './lib/liveConversationContext';
 import {
   ROOM_ACTOR_ID,
@@ -293,6 +298,32 @@ function getOrCreateSoulSessionId(
   } catch {
     return `soul-session:${crypto.randomUUID()}`;
   }
+}
+
+const soulRecoveryInFlight = new Map<
+  string,
+  Promise<BrowserSoulRuntimeSession>
+>();
+
+function recoverSoulRuntimeOnce(
+  scopeKey: string,
+  scope: SoulScopeV1,
+): { promise: Promise<BrowserSoulRuntimeSession>; started: boolean } {
+  const existing = soulRecoveryInFlight.get(scopeKey);
+  if (existing) return { promise: existing, started: false };
+  const promise = BrowserSoulRuntimeSession.recover({
+    constitution: LINGLAN_SOUL_CONSTITUTION,
+    profile: LINGLAN_SOUL_PROFILE,
+    scope,
+  });
+  soulRecoveryInFlight.set(scopeKey, promise);
+  const clear = () => {
+    if (soulRecoveryInFlight.get(scopeKey) === promise) {
+      soulRecoveryInFlight.delete(scopeKey);
+    }
+  };
+  void promise.then(clear, clear);
+  return { promise, started: true };
 }
 
 function soulEvidenceLevel(options: {
@@ -854,14 +885,19 @@ export default function App() {
         : null,
     [runtimeProfile.id, soulScope],
   );
-  const [recoveredSoulSession, setRecoveredSoulSession] = useState<{
+  const [soulRecoveryState, setSoulRecoveryState] = useState<{
     scopeKey: string;
-    session: BrowserSoulRuntimeSession;
-  } | null>(null);
+    status: 'loading' | 'ready' | 'failed';
+    session?: BrowserSoulRuntimeSession;
+    error?: string;
+  }>(() => ({ scopeKey: soulScopeKey, status: 'loading' }));
   const soulSession =
-    recoveredSoulSession?.scopeKey === soulScopeKey
-      ? recoveredSoulSession.session
-      : baseSoulSession;
+    soulRuntimeMode === 'legacy'
+      ? baseSoulSession
+      : soulRecoveryState.scopeKey === soulScopeKey &&
+          soulRecoveryState.status === 'ready'
+        ? soulRecoveryState.session ?? null
+        : null;
   const soulCanonRepository = useMemo(
     () =>
       runtimeProfile.id === LINGLAN_SOUL_CONSTITUTION.personaId
@@ -1192,6 +1228,73 @@ export default function App() {
       soulScope,
     ],
   );
+  const emitSoulRecoveryEventRef = useRef(emitRuntimeEvent);
+  emitSoulRecoveryEventRef.current = emitRuntimeEvent;
+  useEffect(() => {
+    if (
+      runtimeProfile.id !== LINGLAN_SOUL_CONSTITUTION.personaId ||
+      soulRuntimeMode === 'legacy'
+    ) {
+      return;
+    }
+    let cancelled = false;
+    setSoulRecoveryState({ scopeKey: soulScopeKey, status: 'loading' });
+    const recovery = recoverSoulRuntimeOnce(soulScopeKey, soulScope);
+    if (recovery.started) {
+      emitSoulRecoveryEventRef.current({
+        stage: 'soul_snapshot_recovery_started',
+        at: Date.now(),
+        scope: soulScope,
+        reason: 'automatic-runtime-open',
+      });
+    }
+    void recovery.promise
+      .then((session) => {
+        if (cancelled) return;
+        setSoulRecoveryState({
+          scopeKey: soulScopeKey,
+          status: 'ready',
+          session,
+        });
+        emitSoulRecoveryEventRef.current({
+          stage: 'soul_snapshot_recovered',
+          at: Date.now(),
+          scope: soulScope,
+          reason: 'automatic-runtime-open',
+          stateVersion: session.getState().version,
+        });
+      })
+      .catch((error) => {
+        if (cancelled) return;
+        const message = error instanceof Error ? error.message : String(error);
+        setSoulRecoveryState({
+          scopeKey: soulScopeKey,
+          status: 'failed',
+          error: message,
+        });
+        setSoulControlState((state) => ({
+          ...state,
+          cognitionFrozen: true,
+          cognitionFreezeOrigin: 'snapshot-recovery',
+          neutralFallbackActive: true,
+        }));
+        emitSoulRecoveryEventRef.current({
+          stage: 'soul_snapshot_recovery_failed',
+          at: Date.now(),
+          scope: soulScope,
+          reason: 'automatic-runtime-open',
+          error: message,
+        });
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    runtimeProfile.id,
+    soulRuntimeMode,
+    soulScope,
+    soulScopeKey,
+  ]);
   useEffect(() => {
     let cancelled = false;
     const refresh = async () => {
@@ -2362,7 +2465,7 @@ export default function App() {
       if (!session) return Promise.resolve();
       const finalizing = session
         .applyOutcome(eventId, status, options)
-        .then(({ state, persistenceOk }) => {
+        .then(({ state, persistenceOk, persistenceError }) => {
           setSoulInspectorTrace((previous) =>
             previous?.event.id === eventId
               ? {
@@ -2387,6 +2490,7 @@ export default function App() {
             deliveredFraction: options.deliveredFraction,
             reasonCode: options.reasonCode,
             persistenceOk,
+            persistenceError,
             stateVersion: state.version,
           });
         })
@@ -3846,7 +3950,12 @@ export default function App() {
         // During a local Vite reload, the in-page ledger still preserves the
         // current conversation and avoids delaying the live reply.
       }
-      return buildLiveRoomTranscript(recentLiveTurnsRef.current, viewerId);
+      return buildLiveRoomTranscript(
+        recentLiveTurnsRef.current,
+        viewerId,
+        Date.now(),
+        eventPlatform,
+      );
     },
     [conversationHistoryScopeFor],
   );
@@ -4055,18 +4164,42 @@ export default function App() {
         stage: 'started',
         turn,
       });
-      const shortTermLiveContext = isProactive
-        ? ''
-        : await getShortTermLiveContext(
-            options?.createdAt,
-            options?.viewerId,
-            options?.sourcesSeen?.[0],
-          );
+      // The simulator/control panel and the authoritative OBS runtime may be
+      // different browser pages. Rehydrate actor-tagged rolling evidence from
+      // the queue payload before routing; page-local refs alone cannot carry
+      // pending viewers across that boundary.
+      if (options?.roomContext?.samples.length) {
+        recentLiveTurnsRef.current = projectRoomInteractionSamples(
+          recentLiveTurnsRef.current,
+          options.roomContext.samples,
+          options.sourcesSeen?.[0] || options.sourceLabel,
+        );
+      }
+      const shortTermLiveContext = await getShortTermLiveContext(
+        options?.createdAt,
+        options?.viewerId,
+        options?.sourcesSeen?.[0],
+      );
       const routerTurns = isProactive
         ? []
         : recentLiveTurnsRef.current
             .filter((turn) => Date.now() - turn.at <= 90_000)
             .slice(-8);
+      const observedParticipants = recentParticipantEvidence(
+        recentLiveTurnsRef.current,
+      );
+      const liveRoomSnapshot = liveDirector.getRoomSnapshot();
+      const effectiveRoomContext = options?.roomContext
+        ? {
+            ...options.roomContext,
+            participantCount: Math.max(
+              options.roomContext.participantCount,
+              observedParticipants.length,
+            ),
+            platformAudienceEstimate: liveRoomSnapshot.estimatedAudience,
+            participantCountIsExact: false,
+          }
+        : undefined;
       const weatherLocationClarification =
         getWeatherLocationClarification(displayText);
       const routingInput = {
@@ -4141,7 +4274,7 @@ export default function App() {
             ),
             name: options?.viewerName,
           }),
-          room: options?.roomContext,
+          room: effectiveRoomContext,
         };
         const localPlan = planPersonaInteraction(
           personaInput,
@@ -4264,7 +4397,7 @@ export default function App() {
         }
         personaContext = formatPersonaInteractionPlan(
           personaPlan,
-          options?.roomContext,
+          effectiveRoomContext,
         );
         if (personaPlan.source !== 'rules') {
           emitRuntimeEvent({
@@ -4544,7 +4677,7 @@ export default function App() {
             ? createSoulQuietEventData({
                 durationMs:
                   Date.now() - liveHostSnapshot.lastAudienceActivityAt,
-                roomContext: options?.roomContext,
+                roomContext: effectiveRoomContext,
                 sourceLabel: options?.sourceLabel,
                 // Soul focus has no authoritative activity lease yet. Keep
                 // this false instead of inferring engagement from legacy drives.
@@ -4559,7 +4692,7 @@ export default function App() {
                   text: displayText,
                 }),
                 engagementSignals: options?.engagementSignals,
-                roomConflict: options?.roomContext?.conflictLevel,
+                roomConflict: effectiveRoomContext?.conflictLevel,
                 routeMode: routing.mode,
                 routeIntent: routing.intent,
                 truthDomain: enrichment.isDomainSensitive
@@ -4643,10 +4776,24 @@ export default function App() {
         if (!soulOwnsTurn) {
           runShadowSoulEvaluation = () => {
             void evaluateSoulTurn()
-              .then((evaluation) => {
+              .then(async (evaluation) => {
+                const reserved = await soulSession.reserveDecision(eventId);
+                const outcome = await soulSession.applyOutcome(
+                  eventId,
+                  'skipped',
+                  {
+                    deliveredFraction: 0,
+                    reasonCode: 'shadow-non-authoritative',
+                  },
+                );
+                const persistenceOk =
+                  evaluation.persistenceOk &&
+                  reserved.persistenceOk &&
+                  outcome.persistenceOk;
                 const trace = projectSoulEvaluation(evaluation, soulEvent);
                 setSoulInspectorTrace({
                   ...trace,
+                  state: projectSoulState(outcome.state),
                   outcome: {
                     status: 'skipped',
                     occurredAt: Date.now(),
@@ -4667,7 +4814,25 @@ export default function App() {
                   modelLatencyMs: evaluation.meta.latencyMs,
                   fallback: evaluation.meta.fallback,
                   fallbackReason: evaluation.meta.fallbackReason,
-                  persistenceOk: evaluation.persistenceOk,
+                  fallbackDetail: evaluation.meta.fallbackDetail,
+                  persistenceOk,
+                  persistenceError:
+                    evaluation.persistenceError ??
+                    reserved.persistenceError ??
+                    outcome.persistenceError,
+                });
+                emitRuntimeEvent({
+                  eventId,
+                  stage: 'soul_shadow_outcome_committed',
+                  at: Date.now(),
+                  status: 'skipped',
+                  reasonCode: 'shadow-non-authoritative',
+                  persistenceOk,
+                  persistenceError:
+                    evaluation.persistenceError ??
+                    reserved.persistenceError ??
+                    outcome.persistenceError,
+                  stateVersion: outcome.state.version,
                 });
               })
               .catch((error) => {
@@ -4703,7 +4868,9 @@ export default function App() {
             modelFirstContentLatencyMs: evaluation.meta.firstContentLatencyMs,
             fallback: evaluation.meta.fallback,
             fallbackReason: evaluation.meta.fallbackReason,
+            fallbackDetail: evaluation.meta.fallbackDetail,
             persistenceOk: evaluation.persistenceOk,
+            persistenceError: evaluation.persistenceError,
           });
 
           const reserved = await soulSession.reserveDecision(eventId);
@@ -4963,6 +5130,7 @@ export default function App() {
           rawEvidence: payload,
           catchup: options?.catchup,
           forceFallback: enrichment.forceFallback,
+          engagementSignals: options?.engagementSignals,
         },
         speechPlanHints: legacySpeechPlanHints,
         // Generate silently, then let the one-shot coordinator permission
@@ -4974,6 +5142,15 @@ export default function App() {
           // both MiniMax requests concurrently starved the Soul stream before
           // its first content and made every trace look like a provider fault.
           runShadowSoulEvaluation?.();
+          const repeatsRecentTopic =
+            isProactive &&
+            isRecentSemanticTopicRepeat(
+              reply,
+              recentLiveTurnsRef.current
+                .filter((recent) => Date.now() - recent.at <= 5 * 60_000)
+                .flatMap((recent) => [recent.input, recent.reply ?? ''])
+                .filter(Boolean),
+            );
           processingLiveEventIdsRef.current.delete(eventId);
           dispatchLiveHostEvent({
             type: 'generation',
@@ -4983,6 +5160,18 @@ export default function App() {
             turn,
           });
           if (options?.onPrepared) {
+            if (repeatsRecentTopic) {
+              emitRuntimeEvent({
+                eventId,
+                stage: 'proactive_semantic_repeat_suppressed',
+                at: Date.now(),
+                source: options.source,
+                sourceLabel: options.sourceLabel,
+                reason: 'recent-topic-semantic-overlap',
+              });
+              options.onPrepared(NO_REPLY_TOKEN, enrichment.skills, speechPlan);
+              return;
+            }
             options.onPrepared(reply, enrichment.skills, speechPlan);
             return;
           }
@@ -5404,6 +5593,25 @@ export default function App() {
       busy?: boolean;
     }) => {
       const eventId = `proactive:${crypto.randomUUID()}`;
+      const lastAudienceActivityAt = liveHostSnapshot.lastAudienceActivityAt;
+      const quietForMs = lastAudienceActivityAt
+        ? Math.max(0, Date.now() - lastAudienceActivityAt)
+        : Number.POSITIVE_INFINITY;
+      const requiredQuietMs = minimumQuietIntervalMs(
+        emptyRoomAwarenessSettings,
+      );
+      if (quietForMs < requiredQuietMs) {
+        emitRuntimeEvent({
+          eventId,
+          stage: 'dropped',
+          at: Date.now(),
+          source: 'quiet-room-awareness',
+          reason: 'recent_audience_activity',
+          quietForMs,
+          requiredQuietMs,
+        });
+        return;
+      }
       const decisions = dispatchLiveHostEvent({
         type: 'quiet-candidate',
         at: Date.now(),
@@ -5514,7 +5722,9 @@ export default function App() {
       dispatchLiveHostEvent,
       emitRuntimeEvent,
       enqueueOperatorMessage,
+      emptyRoomAwarenessSettings,
       hostCoordinatorV2Enabled,
+      liveHostSnapshot.lastAudienceActivityAt,
       soulPublicBehaviorEnabled,
     ],
   );
@@ -6582,6 +6792,7 @@ export default function App() {
         viewerName: options?.viewerName,
         sourcesSeen: options?.sourcesSeen,
         roomContext: options?.roomContext,
+        createdAt: options?.commentAt,
       });
       return Promise.resolve();
     },
@@ -6968,7 +7179,20 @@ export default function App() {
         cancelQueuedProactiveSpeech('engagement_waits_for_next_beat');
       }
       if (coordinatorAccepted) {
-        enqueueLiveRoomEvents([routeSimulatorEventForQueue(comment)]);
+        const queuedComment = routeSimulatorEventForQueue(comment);
+        recentLiveTurnsRef.current = projectObservedLiveTurn(
+          recentLiveTurnsRef.current,
+          {
+            eventId: queuedComment.id,
+            at: queuedComment.timestamp || Date.now(),
+            input: queuedComment.text,
+            viewerId: queuedComment.author.id,
+            viewerName: queuedComment.author.name,
+            sourceLabel: platform,
+            sourcesSeen: [platform],
+          },
+        );
+        enqueueLiveRoomEvents([queuedComment]);
       } else {
         emitRuntimeEvent({
           eventId: comment.id,
@@ -7570,8 +7794,9 @@ export default function App() {
                   scope: soulScope,
                 });
                 soulSessionByEventIdRef.current.clear();
-                setRecoveredSoulSession({
+                setSoulRecoveryState({
                   scopeKey: soulScopeKey,
+                  status: 'ready',
                   session: restored,
                 });
                 setSoulInspectorTrace((previous) =>

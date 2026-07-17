@@ -20,12 +20,14 @@ export {
 export {
   InMemorySoulLedger,
   createSoulSnapshot,
+  inspectSoulLedgerReplay,
   replaySoulEvents,
   replaySoulLedger,
   verifySoulLedgerExport,
   verifySoulSnapshot,
 } from './ledger.js';
 export type {
+  SoulLedgerReplayInspectionV1,
   SoulLedgerEntryV1,
   SoulLedgerExportV1,
   SoulLedgerInputV1,

@@ -27,6 +27,9 @@ export type RoomInteractionSnapshot = RoomBatchContext & {
   ambiguous: boolean;
   clearOffenderIds: string[];
   observedAt: number;
+  /** Platform-reported or locally estimated audience; never assumed exact. */
+  platformAudienceEstimate?: number;
+  participantCountIsExact?: boolean;
 };
 
 const HOSTILE = /(?:滚|闭嘴|垃圾|废物|恶心|骗子|傻逼|蠢货|找打|去死)/u;
@@ -120,7 +123,17 @@ export class RoomInteractionTracker {
       this.lastConflictAt = now;
     }
     const conflictLevel = this.conflictLevel;
-    const samples = (batch?.samples ?? active).slice(-12);
+    // A scheduler batch describes what is being answered, not the whole room.
+    // Merge it with the rolling observation window so a single selected
+    // comment cannot erase another viewer who interacted seconds earlier.
+    const samples = [
+      ...new Map(
+        [...active, ...(batch?.samples ?? [])].map((sample) => [
+          sample.id,
+          sample,
+        ]),
+      ).values(),
+    ].slice(-12);
     const participants = new Set(samples.map((event) => event.viewerId));
     const laneCounts = { ...(batch?.laneCounts ?? {}) };
     if (!batch?.laneCounts) {
@@ -130,8 +143,11 @@ export class RoomInteractionTracker {
       }
     }
     return {
-      totalCount: batch?.totalCount ?? samples.length,
-      participantCount: batch?.participantCount ?? participants.size,
+      totalCount: Math.max(batch?.totalCount ?? 0, samples.length),
+      participantCount: Math.max(
+        batch?.participantCount ?? 0,
+        participants.size,
+      ),
       catchup: batch?.catchup ?? false,
       mergedCount: batch?.mergedCount ?? samples.length,
       laneCounts,

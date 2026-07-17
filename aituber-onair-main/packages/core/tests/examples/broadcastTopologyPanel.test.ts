@@ -1,10 +1,29 @@
 import { describe, expect, it } from 'vitest';
 import {
+  isCurrentBroadcastFault,
   isProductionEvent,
   routeFor,
 } from '../../examples/react-purupuru-app/src/components/BroadcastTopologyPanel';
 
 describe('Soul-aware broadcast topology', () => {
+  it('closes a fault detail after the runtime fault is cleared or replaced', () => {
+    const reference = { nodeId: 'persona', at: 100, stage: 'soul_fast_fallback' };
+
+    expect(
+      isCurrentBroadcastFault(reference, {
+        at: 100,
+        stage: 'soul_fast_fallback',
+      }),
+    ).toBe(true);
+    expect(isCurrentBroadcastFault(reference, undefined)).toBe(false);
+    expect(
+      isCurrentBroadcastFault(reference, {
+        at: 200,
+        stage: 'soul_fast_fallback',
+      }),
+    ).toBe(false);
+  });
+
   it('keeps Soul runtime stages in the production event stream', () => {
     expect(
       isProductionEvent({

@@ -24,11 +24,69 @@ test('answers a historical named storm from its archived final classification', 
     source: '浙江省水利厅台风路径公开接口',
   };
   const answer = buildRequiredAnswer('巴威怎么样了', 'storm', null, null, [], [], { records: [] }, null, history);
-  assert.match(answer, /巴威啊/);
-  assert.match(answer, /不是现在正在活动的台风/);
+  assert.match(answer, /巴威不是凭空出现的/);
+  assert.match(answer, /不是凭空出现的/);
+  assert.match(answer, /2026年第9号台风/);
+  assert.match(answer, /现在已经不再活动/);
   assert.match(answer, /减弱为热带风暴/);
   assert.match(answer, /不能再把它当作台风实况来称呼/);
   assert.equal(extractNamedTyphoonQuery('巴威怎么样了'), '巴威');
+  assert.equal(extractNamedTyphoonQuery('海神哪来的？'), '海神');
+});
+
+test('ignores the live-chat delivery prefix when extracting a named storm', () => {
+  assert.equal(
+    extractNamedTyphoonQuery(
+      '001号人类 的弹幕：海神是几号台风？它在2026年7月是否真实存在过？',
+    ),
+    '海神',
+  );
+  assert.equal(
+    extractNamedTyphoonQuery(
+      '001号人类 的弹幕：请直接回答：海神在2026年7月是第几号台风？',
+    ),
+    '海神',
+  );
+});
+
+test('preserves recent historical identity instead of treating a named storm as invented', () => {
+  const history = {
+    id: '202611',
+    nameZh: '海神',
+    nameEn: 'HAISHEN',
+    aliases: ['海神', 'HAISHEN'],
+    status: 'ceased-numbering',
+    finalStage: '热带低压',
+    lastObservedAt: '2026-07-14T03:00:00.000Z',
+  };
+  const answer = buildRequiredAnswer(
+    '海神哪来的？',
+    'storm',
+    null,
+    null,
+    [],
+    [],
+    { records: [] },
+    null,
+    history,
+  );
+  assert.match(answer, /2026年第11号台风/);
+  assert.match(answer, /7月期间存在过/);
+  assert.match(answer, /现在已经不再活动/);
+});
+
+test('reports an empty active list without erasing recent typhoon history', () => {
+  const answer = buildRequiredAnswer(
+    '现在一共有几个台风？分别叫什么？',
+    'storm',
+    null,
+    null,
+    [],
+    [],
+    { records: [] },
+  );
+  assert.match(answer, /当前活动台风列表是空的/);
+  assert.match(answer, /不代表2026年7月没有出现过台风/);
 });
 
 test('answers a named storm that left the active feed as ended, not unavailable', () => {
