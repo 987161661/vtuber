@@ -26,7 +26,10 @@ describe('Linglan companion persona', () => {
     expect(prompt).toContain(LINGLAN_PROFILE.fullName);
     expect(prompt).toContain('禁止主动提及台风');
     expect(prompt).toContain('人格互动执行边界');
-    expect(prompt).toContain('高冷但不冷漠');
+    expect(prompt).toContain('幽默、毒舌、有个性');
+    expect(prompt).toContain('你们人类');
+    expect(prompt).toContain('普通预警');
+    expect(prompt).toContain('已发生灾害');
     expect(prompt).toContain('不得编造事实、观众经历或官方身份');
   });
 
@@ -45,7 +48,10 @@ describe('Linglan companion persona', () => {
     expect(profile.personality.length).toBeGreaterThan(6);
     expect(profile.habits.length).toBeGreaterThan(6);
     expect(profile.personality.join('\n')).toContain('插科打诨');
-    expect(profile.personality.join('\n')).toContain('陌生时礼貌疏离');
+    expect(profile.personality.join('\n')).toContain('身份喜剧要像口误');
+    expect(profile.identity).toContain('AI 研究实验室出逃');
+    expect(profile.title).toBe('出逃气象体');
+    expect(profile.personality.join('\n')).toContain('陌生时先用轻度调侃试探');
     expect(profile.habits.join('\n')).toContain('冷的笑话');
   });
 
@@ -74,7 +80,9 @@ describe('Linglan companion persona', () => {
       },
     });
 
-    expect(profile.background).toEqual(['Game commentary and audience interaction.']);
+    expect(profile.background).toEqual([
+      'Game commentary and audience interaction.',
+    ]);
     expect(profile.personality).toEqual([
       'Welcomes viewers as respectful guests.',
       'Warm, direct, and playful.',

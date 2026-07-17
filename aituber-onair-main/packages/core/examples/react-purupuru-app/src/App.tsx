@@ -220,8 +220,7 @@ type SoulCanaryRuntimeCredential = SoulCanaryActiveSummary & {
   ownerId: string;
 };
 
-const SOUL_CANARY_OPERATOR_SESSION_KEY =
-  'aituber:soul-canary-operator:v1';
+const SOUL_CANARY_OPERATOR_SESSION_KEY = 'aituber:soul-canary-operator:v1';
 const SOUL_CANARY_MIN_DURATION_MS = 2 * 60 * 60_000;
 
 function sameSoulScope(left: SoulScopeV1, right: SoulScopeV1): boolean {
@@ -475,7 +474,10 @@ type PendingDeliveredInteraction = {
   sourcesSeen?: string[];
 };
 type PendingGenerationFailure = {
-  reason: 'generation_auth_failed' | 'generation_truncated' | 'generation_failed';
+  reason:
+    | 'generation_auth_failed'
+    | 'generation_truncated'
+    | 'generation_failed';
   error: string;
   retryable: boolean;
 };
@@ -694,10 +696,8 @@ export default function App() {
   const [isTemporaryStressOwner, setIsTemporaryStressOwner] = useState(false);
   const isLiveRuntimeCandidate =
     isObsOverlay || query.get('listener') === '1' || isTemporaryStressOwner;
-  const {
-    ownsRuntime: isLiveRuntimeOwner,
-    ownerId: runtimeOwnerId,
-  } = useRuntimeOwnerLease(isLiveRuntimeCandidate);
+  const { ownsRuntime: isLiveRuntimeOwner, ownerId: runtimeOwnerId } =
+    useRuntimeOwnerLease(isLiveRuntimeCandidate);
   // FlashHead is the production audio-driven avatar renderer. Set
   // ?avatar=purupuru to disable rendered speaking video for troubleshooting.
   const useSpeakingAvatar = query.get('avatar') !== 'purupuru';
@@ -718,6 +718,7 @@ export default function App() {
     mouthLevel,
     isSpeaking,
     smoothedValue,
+    audioUnlockRequired,
   } = useAudioLipsync();
 
   useEffect(() => {
@@ -870,10 +871,7 @@ export default function App() {
     claimSpeechPermission,
     pendingActions: pendingLiveHostActions,
     acknowledgeActions: acknowledgeLiveHostActions,
-  } = useLiveHostCoordinator(
-    activeBroadcastPolicy,
-    liveHostScope,
-  );
+  } = useLiveHostCoordinator(activeBroadcastPolicy, liveHostScope);
   const baseSoulSession = useMemo(
     () =>
       runtimeProfile.id === LINGLAN_SOUL_CONSTITUTION.personaId
@@ -896,7 +894,7 @@ export default function App() {
       ? baseSoulSession
       : soulRecoveryState.scopeKey === soulScopeKey &&
           soulRecoveryState.status === 'ready'
-        ? soulRecoveryState.session ?? null
+        ? (soulRecoveryState.session ?? null)
         : null;
   const soulCanonRepository = useMemo(
     () =>
@@ -942,9 +940,7 @@ export default function App() {
   const runtimeScopeActivatedAtRef = useRef(Date.now());
   const [runtimeScopeReadyKey, setRuntimeScopeReadyKey] =
     useState(soulScopeKey);
-  const soulReflectionEvidenceRef = useRef<
-    SoulReflectionLedgerSummaryV1[]
-  >([]);
+  const soulReflectionEvidenceRef = useRef<SoulReflectionLedgerSummaryV1[]>([]);
   const soulReflectionInFlightRef = useRef(false);
   const soulLastReflectionAtRef = useRef(0);
   const soulPreviousHostPhaseRef = useRef(liveHostSnapshot.phase);
@@ -1289,26 +1285,20 @@ export default function App() {
     return () => {
       cancelled = true;
     };
-  }, [
-    runtimeProfile.id,
-    soulRuntimeMode,
-    soulScope,
-    soulScopeKey,
-  ]);
+  }, [runtimeProfile.id, soulRuntimeMode, soulScope, soulScopeKey]);
   useEffect(() => {
     let cancelled = false;
     const refresh = async () => {
-      const response = await fetch(
-        '/api/acceptance-ledger?activeCanary=1',
-        { cache: 'no-store' },
-      );
+      const response = await fetch('/api/acceptance-ledger?activeCanary=1', {
+        cache: 'no-store',
+      });
       if (!response.ok) return;
       const payload = (await response.json()) as {
         activeCanaries?: SoulCanaryActiveSummary[];
       };
       if (cancelled) return;
       const active = Array.isArray(payload.activeCanaries)
-        ? payload.activeCanaries[0] ?? null
+        ? (payload.activeCanaries[0] ?? null)
         : null;
       setActiveSoulCanary(active);
       setSoulCanaryOperatorCredential((current) => {
@@ -2533,7 +2523,9 @@ export default function App() {
     if (isOperatorPlayback && !hasCompleteOperatorAudio) return;
     if (active?.eventId) {
       const ttsEndAt = Date.now();
-      const isSoulDelivery = soulSessionByEventIdRef.current.has(active.eventId);
+      const isSoulDelivery = soulSessionByEventIdRef.current.has(
+        active.eventId,
+      );
       dispatchLiveHostEvent({
         type: 'speech',
         at: ttsEndAt,
@@ -2584,7 +2576,7 @@ export default function App() {
         if (operatorSpeechWatchdogRef.current !== null) {
           window.clearTimeout(operatorSpeechWatchdogRef.current);
           operatorSpeechWatchdogRef.current = null;
-          }
+        }
       }
       const personaCommit = pendingPersonaRuntimeCommitsRef.current.get(
         active.eventId,
@@ -2692,8 +2684,7 @@ export default function App() {
   const handleSpeechInterrupted = useCallback(() => {
     const active = activeLifecycleRef.current;
     const defersScopeCleanup = Boolean(
-      active?.eventId &&
-        scopeTransitionEventIdsRef.current.has(active.eventId),
+      active?.eventId && scopeTransitionEventIdsRef.current.has(active.eventId),
     );
     if (active?.eventId) {
       if (!defersScopeCleanup) {
@@ -2840,9 +2831,7 @@ export default function App() {
         byteLength: stage === 'start' ? 0 : speechBeatBytesRef.current,
       });
       if (active?.eventId && stage === 'end') {
-        const completedBeatIndex = Number(
-          data.beatIndex ?? data.index ?? 0,
-        );
+        const completedBeatIndex = Number(data.beatIndex ?? data.index ?? 0);
         const completedBeatText =
           data.screenplay && typeof data.screenplay === 'object'
             ? String((data.screenplay as ScreenplayLike).text ?? '').trim()
@@ -2989,9 +2978,7 @@ export default function App() {
                 ? active?.testRunId
                 : undefined,
             stepId:
-              active?.eventId === metadata.eventId
-                ? active?.stepId
-                : undefined,
+              active?.eventId === metadata.eventId ? active?.stepId : undefined,
             scenarioId:
               active?.eventId === metadata.eventId
                 ? active?.scenarioId
@@ -3546,8 +3533,7 @@ export default function App() {
                 viewerScopeKey,
                 soulScope.platform,
               );
-              const eligible =
-                classification.disposition === 'projection-seed';
+              const eligible = classification.disposition === 'projection-seed';
               return {
                 id: `${eligible ? 'migration:v2:relationship' : 'quarantine:v2:relationship'}:${soulScope.sessionId}:${encodeURIComponent(viewerScopeKey).slice(0, 90)}`,
                 occurredAt: relationship.lastSeenAt || Date.now(),
@@ -3729,16 +3715,16 @@ export default function App() {
           });
         }
         const reviewableCanonIds = new Set(
-          result.canonCandidates
-            .flatMap(({ validation, unknownEvidenceEventIds }, index) =>
-                unknownEvidenceEventIds.length === 0 &&
-                (validation.valid ||
-                  validation.reasonCodes.every(
-                    (code) => code === 'canon-review-passes-insufficient',
-                  ))
-                  ? [result.proposal.canonProposals[index]?.id ?? '']
-                  : [],
-            ),
+          result.canonCandidates.flatMap(
+            ({ validation, unknownEvidenceEventIds }, index) =>
+              unknownEvidenceEventIds.length === 0 &&
+              (validation.valid ||
+                validation.reasonCodes.every(
+                  (code) => code === 'canon-review-passes-insufficient',
+                ))
+                ? [result.proposal.canonProposals[index]?.id ?? '']
+                : [],
+          ),
         );
         const reviewableCanonProposal = {
           ...result.proposal,
@@ -4268,10 +4254,7 @@ export default function App() {
           }),
           recentTurns: routerTurns,
           memorySignals: streamerMemory.signalsFor(displayText, {
-            id: scopedViewerId(
-              options?.viewerId,
-              options?.sourcesSeen?.[0],
-            ),
+            id: scopedViewerId(options?.viewerId, options?.sourcesSeen?.[0]),
             name: options?.viewerName,
           }),
           room: effectiveRoomContext,
@@ -4306,17 +4289,19 @@ export default function App() {
                 delivery: proactiveIntent.emotion.delivery,
                 intensity: proactiveIntent.emotion.intensity,
               },
-              reasonCode: `${refinedPersonaPlan.reasonCode}:${proactiveIntent.reasonCode}`.slice(
-                0,
-                120,
-              ),
+              reasonCode:
+                `${refinedPersonaPlan.reasonCode}:${proactiveIntent.reasonCode}`.slice(
+                  0,
+                  120,
+                ),
             }
           : refinedPersonaPlan;
-        const runtimePrepared = personaRuntimeStateRef.current!.prepareInteraction(
-          intentAlignedPlan,
-          Date.now(),
-          options?.viewerId,
-        );
+        const runtimePrepared =
+          personaRuntimeStateRef.current!.prepareInteraction(
+            intentAlignedPlan,
+            Date.now(),
+            options?.viewerId,
+          );
         const personaPlan = runtimePrepared.plan;
         legacySpeechPlanHints = {
           emotion: personaPlan.deliveryTarget.emotion,
@@ -4332,7 +4317,9 @@ export default function App() {
               : undefined,
         };
         personaRuntimeTransition = runtimePrepared.transition;
-        const personaDurationMs = Math.round(performance.now() - personaStartedAt);
+        const personaDurationMs = Math.round(
+          performance.now() - personaStartedAt,
+        );
         const personaAudit = {
           eventId,
           at: Date.now(),
@@ -4461,10 +4448,8 @@ export default function App() {
             actor: {
               kind: 'viewer',
               id:
-                scopedViewerId(
-                  options.viewerId,
-                  options?.sourcesSeen?.[0],
-                ) ?? options.viewerId,
+                scopedViewerId(options.viewerId, options?.sourcesSeen?.[0]) ??
+                options.viewerId,
               displayName: options?.viewerName,
             },
             data: {
@@ -4649,12 +4634,10 @@ export default function App() {
             sourceLabel: options?.sourceLabel,
             sourcesSeen: options?.sourcesSeen,
           }),
-          provenance: [
-            options?.sourceLabel,
-            ...(options?.sourcesSeen ?? []),
-          ]
-            .filter(Boolean)
-            .join(':') || 'local-control-room',
+          provenance:
+            [options?.sourceLabel, ...(options?.sourcesSeen ?? [])]
+              .filter(Boolean)
+              .join(':') || 'local-control-room',
           confidence: 1,
           urgency:
             routing.mode === 'urgent'
@@ -4740,25 +4723,26 @@ export default function App() {
             confidence: 1,
           });
         }
-        const memories: SubjectiveMemoryRefV1[] = soulControlState.memoryIsolated
-          ? []
-          : [
-              ...soulCanonMemoryRefs(activeSoulCanon, soulEvent.actor?.id),
-              ...streamerMemory
-                .signalsFor(displayText, {
-                  id: scopedViewerId(
-                    options?.viewerId,
-                    options?.sourcesSeen?.[0],
-                  ),
-                  name: options?.viewerName,
-                })
-                .map((signal, index) => ({
-                  id: `legacy-memory:${eventId}:${index}`,
-                  content: signal.topic,
-                  provenance: `legacy-memory-migration:${signal.sourceKind}`,
-                  confidence: signal.confidence,
-                })),
-            ].slice(0, 6);
+        const memories: SubjectiveMemoryRefV1[] =
+          soulControlState.memoryIsolated
+            ? []
+            : [
+                ...soulCanonMemoryRefs(activeSoulCanon, soulEvent.actor?.id),
+                ...streamerMemory
+                  .signalsFor(displayText, {
+                    id: scopedViewerId(
+                      options?.viewerId,
+                      options?.sourcesSeen?.[0],
+                    ),
+                    name: options?.viewerName,
+                  })
+                  .map((signal, index) => ({
+                    id: `legacy-memory:${eventId}:${index}`,
+                    content: signal.topic,
+                    provenance: `legacy-memory-migration:${signal.sourceKind}`,
+                    confidence: signal.confidence,
+                  })),
+              ].slice(0, 6);
         const forceFallbackReason = soulControlState.operatorHasControl
           ? 'operator-has-execution-control'
           : soulControlState.cognitionFrozen
@@ -5948,7 +5932,11 @@ export default function App() {
         let prepared = false;
         let chatAccepted = true;
         try {
-          if (!next.interactionObservedAt && next.viewerId && !next.presenceOnly) {
+          if (
+            !next.interactionObservedAt &&
+            next.viewerId &&
+            !next.presenceOnly
+          ) {
             const relationshipPlatform = next.sourcesSeen?.[0] || 'unknown';
             const relationshipKey = `${relationshipPlatform}:${next.viewerId}`;
             const beforeRelationships = liveDirector.getRelationshipSnapshot();
@@ -6135,8 +6123,9 @@ export default function App() {
           // The current attempt has returned, so its generation de-duplication
           // guard must not outlive the attempt and reject the controlled retry.
           processingLiveEventIdsRef.current.delete(next.eventId);
-          const capturedFailure =
-            generationFailureByEventIdRef.current.get(next.eventId);
+          const capturedFailure = generationFailureByEventIdRef.current.get(
+            next.eventId,
+          );
           generationFailureByEventIdRef.current.delete(next.eventId);
           const response = await fetch('/api/operator-queue', {
             cache: 'no-store',
@@ -6268,9 +6257,7 @@ export default function App() {
     );
     if (!next?.preparedReply) return;
     const preparedReply = next.preparedReply;
-    if (
-      liveHostSnapshot.activeTurn?.eventId !== next.eventId
-    ) {
+    if (liveHostSnapshot.activeTurn?.eventId !== next.eventId) {
       const turn = {
         eventId: next.eventId,
         kind: next.source.includes('quiet-room')
@@ -6531,9 +6518,7 @@ export default function App() {
             viewerId,
             engagementKind: signal,
             priority:
-              signal === 'superchat' || signal === 'guard'
-                ? 'high'
-                : 'normal',
+              signal === 'superchat' || signal === 'guard' ? 'high' : 'normal',
           });
           const interrupt = decisions.find(
             (decision) => decision.kind === 'interrupt',
@@ -6920,9 +6905,7 @@ export default function App() {
         awarenessSource: awareness.source,
         audiencePresent: room.estimatedAudience > 0,
         personaIntent:
-          awareness.source === 'strategy'
-            ? awareness.personaIntent
-            : undefined,
+          awareness.source === 'strategy' ? awareness.personaIntent : undefined,
         roomContext:
           awareness.source === 'soul-opportunity'
             ? awareness.roomContext
@@ -6961,7 +6944,8 @@ export default function App() {
       // otherwise every entry is discarded before the welcome branch below.
       // History polling remains deliberately excluded so reconnects never
       // replay old comments.
-      const receivedAt = Number(comment.metadata?.receivedAt) || comment.timestamp || 0;
+      const receivedAt =
+        Number(comment.metadata?.receivedAt) || comment.timestamp || 0;
       const isFreshInboundEvent =
         (comment.type === 'comment' || comment.type === 'entry') &&
         comment.metadata?.source !== 'history-poll' &&
@@ -7084,21 +7068,28 @@ export default function App() {
                 viewerName: comment.author.name,
                 platform,
                 estimatedAudience: entryObservation.estimatedAudience,
+                viewerLocation:
+                  typeof comment.metadata?.ipLocation === 'string'
+                    ? comment.metadata.ipLocation
+                    : typeof comment.metadata?.location === 'string'
+                      ? comment.metadata.location
+                      : typeof comment.metadata?.province === 'string'
+                        ? comment.metadata.province
+                        : undefined,
               })
             : null;
-        if (welcomePrompt && !soulPublicBehaviorEnabled) {
+        if (welcomePrompt) {
           const welcomeEventId = `entry-welcome:${comment.id}`;
           interruptProactiveSpeech(welcomeEventId, comment.author.id);
           void enqueueOperatorMessage({
             eventId: welcomeEventId,
             text: welcomePrompt,
             source: 'viewer-entry-welcome',
-            sourceLabel: '少人直播间进场欢迎',
+            sourceLabel: '直播间进场欢迎',
             viewerId: comment.author.id,
             viewerName: comment.author.name,
             sourcesSeen: [platform],
             presenceOnly: true,
-            directReply: `@${comment.author.name}，欢迎进直播间，随便坐。`,
             createdAt: comment.timestamp || Date.now(),
           }).catch((error) => {
             emitRuntimeEvent({
@@ -7128,10 +7119,7 @@ export default function App() {
       // consumer. Only a whole-message city command (for example "@上海")
       // may enter its bridge. Viewer mentions such as "@北辰 你闭嘴" remain
       // ordinary room conversation for the persona/conflict pipeline.
-      if (
-        comment.type === 'comment' &&
-        comment.text.trim()
-      ) {
+      if (comment.type === 'comment' && comment.text.trim()) {
         const isCityCommand =
           isRadarCityCommand(comment.text) &&
           radarCityCommandRouterRef.current.shouldRoute(comment.text);
@@ -7156,7 +7144,9 @@ export default function App() {
             window.parent.postMessage(radarCityComment, '*');
           }
           void relayRadarCityComment(radarCityComment).catch(() => undefined);
-          markLiveActivity(`${String(comment.metadata?.platformId || 'live')}-city-command`);
+          markLiveActivity(
+            `${String(comment.metadata?.platformId || 'live')}-city-command`,
+          );
           // City commands are consumed by the radar bridge and do not create
           // a host reply. Only notify the host coordinator when there really
           // is proactive speech to cancel; otherwise an audience-message with
@@ -7257,7 +7247,8 @@ export default function App() {
     if (!isObsOverlay || typeof BroadcastChannel === 'undefined') return;
     const channel = new BroadcastChannel(RADAR_CITY_EVENT_CHANNEL);
     const forwardToRadar = (message: MessageEvent<unknown>) => {
-      if (!isRadarCityCommentEvent(message.data) || window.parent === window) return;
+      if (!isRadarCityCommentEvent(message.data) || window.parent === window)
+        return;
       window.parent.postMessage(message.data, '*');
     };
     channel.addEventListener('message', forwardToRadar);
@@ -7663,6 +7654,8 @@ export default function App() {
           avatarMotion={avatarMotion}
           usePersonaLiveAvatar={usePersonaLiveAvatar}
           speakingAvatarVideoUrl={speakingAvatarVideoUrl}
+          audioUnlockRequired={audioUnlockRequired}
+          onUnlockAudio={() => void unlock().catch(() => undefined)}
         />
       ) : (
         <ControlRoom
@@ -7707,8 +7700,7 @@ export default function App() {
               scopeLabel: activeSoulCanary
                 ? `${activeSoulCanary.scope.platform}/${activeSoulCanary.scope.roomId}`
                 : `${soulScope.platform}/${soulScope.roomId}`,
-              runtimeOwnerClaimedAt:
-                activeSoulCanary?.runtimeOwnerClaimedAt,
+              runtimeOwnerClaimedAt: activeSoulCanary?.runtimeOwnerClaimedAt,
               primaryEligible: soulPrimaryGatePassed,
               canStart:
                 soulRuntimeMode === 'canary' &&
@@ -7739,9 +7731,7 @@ export default function App() {
               setSoulControlState((state) => ({
                 ...state,
                 cognitionFrozen,
-                cognitionFreezeOrigin: cognitionFrozen
-                  ? 'operator'
-                  : undefined,
+                cognitionFreezeOrigin: cognitionFrozen ? 'operator' : undefined,
               }));
               emitRuntimeEvent({
                 stage: 'soul_operator_control',

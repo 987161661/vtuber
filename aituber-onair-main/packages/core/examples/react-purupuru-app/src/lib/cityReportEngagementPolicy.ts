@@ -36,20 +36,6 @@ function fieldFromEnvelope(text: string, label: string): string {
   return boundedField(match?.[1]);
 }
 
-function cityFromSpokenLine(text: string): string {
-  const match = text.match(
-    /(?:^|[，,。.!！？?])\s*([^，,。.!！？?]{2,40}?)的战报已经展开/u,
-  );
-  return boundedField(match?.[1]);
-}
-
-function safeAcknowledgement(viewerName: string, cityName: string): string {
-  const addressee = viewerName ? `@${viewerName.replace(/^@+/u, '')}，` : '';
-  return cityName
-    ? `${addressee}${cityName}的战报已经展开了。`
-    : `${addressee}城市战报已经展开了。`;
-}
-
 export function isCityReportEngagementPayload(input: {
   eventId: string;
   text: string;
@@ -61,11 +47,9 @@ export function isCityReportEngagementPayload(input: {
 }
 
 /**
- * Converts both current and stale radar payloads into a result event. Legacy,
- * shadow and canary retain a neutral ready-to-play acknowledgement. Primary
- * removes that bypass so Soul can evaluate the event, while the event-level
- * eligibility flag prevents this result from authorizing a CTA in the same
- * turn.
+ * City weather chat must reach Soul as evidence-backed context, never as a
+ * canned ready-to-play acknowledgement. Stale CTA lines are removed without
+ * discarding current weather facts or safety instructions.
  */
 export function normalizeCityReportEngagementPayload(
   input: CityReportEngagementPayload,
@@ -83,21 +67,20 @@ export function normalizeCityReportEngagementPayload(
   const viewerName = boundedField(
     fieldFromEnvelope(sourceText, '目标观众') || input.viewerName,
   ).replace(/^@+/u, '');
-  const cityName =
-    fieldFromEnvelope(sourceText, '已展开城市') ||
-    cityFromSpokenLine(sourceText);
-  const directReply = safeAcknowledgement(viewerName, cityName);
   const legacySupportRequestRemoved =
     LEGACY_SUPPORT_COUPLING_SIGNAL.test(sourceText);
-  const canonicalText = `<city_report_engagement>
-事件：城市战报已经成功展开。
-${viewerName ? `目标观众：@${viewerName}\n` : ''}${cityName ? `已展开城市：${cityName}\n` : ''}行动约束：本事件只证明城市卡片已展开，不包含观众关系状态，也不授权在本轮索取任何支持。其他行动只能由主播运行时依据长期目标和当前状态独立决定。
-</city_report_engagement>`;
+  const safeText = input.text
+    .split(/\r?\n/u)
+    .filter((line) => !LEGACY_SUPPORT_COUPLING_SIGNAL.test(line))
+    .join('\n')
+    .replace(/<\/city_report_engagement>/u, '行动约束：不得索取关注、点赞、礼物或其他支持。\n</city_report_engagement>');
+
+  void runtimeMode;
 
   return {
     ...input,
-    text: canonicalText,
-    directReply: runtimeMode === 'primary' ? undefined : directReply,
+    text: safeText,
+    directReply: undefined,
     viewerName: viewerName || input.viewerName,
     isCityReportResult: true,
     legacySupportRequestRemoved,

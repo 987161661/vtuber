@@ -26,6 +26,8 @@ interface ChatPanelProps {
   avatarMotion?: AvatarMotion;
   usePersonaLiveAvatar?: boolean;
   speakingAvatarVideoUrl?: string | null;
+  audioUnlockRequired?: boolean;
+  onUnlockAudio?: () => void;
 }
 
 export function ChatPanel({
@@ -47,6 +49,8 @@ export function ChatPanel({
   avatarMotion = 'idle_cold',
   usePersonaLiveAvatar = false,
   speakingAvatarVideoUrl = null,
+  audioUnlockRequired = false,
+  onUnlockAudio,
 }: ChatPanelProps) {
   const isBroadcast = visual.layoutMode === 'broadcast';
   const shouldShowInput = !isBroadcast || visual.showInputInBroadcast;
@@ -96,6 +100,15 @@ export function ChatPanel({
         usePersonaLiveAvatar={usePersonaLiveAvatar}
         speakingAvatarVideoUrl={speakingAvatarVideoUrl}
       />
+      {overlay && audioUnlockRequired && onUnlockAudio && (
+        <button
+          type="button"
+          className="audio-unlock-button"
+          onClick={onUnlockAudio}
+        >
+          点击启用主播声音
+        </button>
+      )}
       {!overlay && (isBroadcast ? (
         broadcastCaption && (
           <div className="broadcast-caption">{broadcastCaption}</div>

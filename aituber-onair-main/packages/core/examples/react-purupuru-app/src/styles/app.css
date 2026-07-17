@@ -4657,6 +4657,29 @@ body:has(.app-obs-overlay) {
   overflow: visible;
 }
 
+.audio-unlock-button {
+  position: absolute;
+  left: 50%;
+  bottom: 18px;
+  z-index: 8;
+  transform: translateX(-50%);
+  border: 1px solid rgba(112, 214, 255, 0.72);
+  border-radius: 999px;
+  padding: 8px 16px;
+  background: rgba(6, 20, 36, 0.88);
+  color: #eafaff;
+  font-size: 13px;
+  cursor: pointer;
+  pointer-events: auto;
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.28);
+}
+
+.audio-unlock-button:hover,
+.audio-unlock-button:focus-visible {
+  background: rgba(9, 39, 65, 0.96);
+  outline: 2px solid rgba(112, 214, 255, 0.5);
+}
+
 .chat-settings-button {
   position: absolute;
   top: 12px;

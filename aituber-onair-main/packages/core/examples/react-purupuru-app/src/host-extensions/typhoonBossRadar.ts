@@ -82,6 +82,9 @@ export function createTyphoonBossRadarExtension(options: {
     id: TYPHOON_BOSS_RADAR_EXTENSION_ID,
     async enrich(input) {
       if (!options.enabled) return null;
+      // Radar already supplies verified city facts for this result event.
+      // Do not let a previously inherited typhoon skill replace its host brief.
+      if (input.query.includes('<city_report_engagement>')) return null;
       const inherited = input.inheritedSkillIds.some(
         (id) => id === TYPHOON_BOSS_RADAR_EXTENSION_ID || id === LEGACY_TYPHOON_SKILL_ID,
       );

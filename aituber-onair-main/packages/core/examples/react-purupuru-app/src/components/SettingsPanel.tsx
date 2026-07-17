@@ -2162,7 +2162,7 @@ export function SettingsPanel({
                 </div>
                 <div className="settings-field">
                   <label htmlFor="tts-minimax-speaker">
-                    MiniMax 音色（凌岚女王）
+                    MiniMax 音色（凌岚）
                   </label>
                   <select
                     id="tts-minimax-speaker"
@@ -2405,7 +2405,7 @@ export function SettingsPanel({
               <div className="settings-file-actions">
                 <span className="settings-file-status">
                   {avatarPackageSource === 'default'
-                    ? '凌岚女王（默认）已加载'
+                    ? '凌岚（默认）已加载'
                     : avatarPackage
                       ? `${avatarPackage.name} 已加载`
                       : '尚未加载形象'}

@@ -16,6 +16,23 @@ $controlRoomUrl = if ($UseMuseTalkFallback) {
   'http://127.0.0.1:5173/?listener=1'
 }
 
+function Ensure-LinglanWorkspacePackage {
+  param(
+    [Parameter(Mandatory = $true)][string]$PackageName,
+    [Parameter(Mandatory = $true)][string]$EntryPath
+  )
+
+  if (Test-Path -LiteralPath $EntryPath -PathType Leaf) {
+    return
+  }
+
+  Write-Host "Building missing Linglan workspace package: $PackageName"
+  & 'npm.cmd' --prefix $PSScriptRoot run build "--workspace=$PackageName"
+  if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $EntryPath -PathType Leaf)) {
+    throw "Linglan workspace package failed to build: $PackageName"
+  }
+}
+
 if (Test-Path -LiteralPath $baseLauncher -PathType Leaf) {
   # Start the canonical gateway, renderer and Vite chain without opening its
   # display-only page. The listener page opened below is the sole runtime owner.
@@ -32,6 +49,15 @@ if (Test-Path -LiteralPath $baseLauncher -PathType Leaf) {
   if (-not (Test-Path -LiteralPath (Join-Path $appPath 'node_modules'))) {
     throw "Digital-human dependencies are missing: $appPath\\node_modules"
   }
+  # Vite resolves these local workspaces through their package exports. A
+  # missing dist entry still lets `/` return HTTP 200, but App.tsx then fails
+  # during import analysis and the control room/OBS iframe renders blank.
+  Ensure-LinglanWorkspacePackage `
+    -PackageName '@aituber-onair/soul' `
+    -EntryPath (Join-Path $PSScriptRoot 'packages\soul\dist\index.js')
+  Ensure-LinglanWorkspacePackage `
+    -PackageName '@aituber-onair/live-companion' `
+    -EntryPath (Join-Path $PSScriptRoot 'packages\live-companion\dist\index.js')
   if (Test-Path -LiteralPath $gatewayLauncher -PathType Leaf) {
     & $gatewayLauncher
   }
@@ -56,14 +82,17 @@ do {
   try {
     $response = Invoke-WebRequest -UseBasicParsing -TimeoutSec 2 `
       'http://127.0.0.1:5173/'
-    if ($response.StatusCode -eq 200) { break }
+    $appModule = Invoke-WebRequest -UseBasicParsing -TimeoutSec 8 `
+      'http://127.0.0.1:5173/src/App.tsx'
+    if ($response.StatusCode -eq 200 -and $appModule.StatusCode -eq 200) { break }
   } catch {
+    $response = $null
     Start-Sleep -Milliseconds 500
   }
 } while ((Get-Date) -lt $deadline)
 
-if (-not $response -or $response.StatusCode -ne 200) {
-  throw 'Digital-human control room did not become ready on http://127.0.0.1:5173/ within 30 seconds.'
+if (-not $response -or $response.StatusCode -ne 200 -or $appModule.StatusCode -ne 200) {
+  throw 'Digital-human control room did not become ready on http://127.0.0.1:5173/ within 30 seconds. Check logs\vite.err.log for module import failures.'
 }
 
 if (-not $NoBrowser) {
