@@ -4,6 +4,10 @@ import type {
 } from '../types/settings';
 import type { LiveRoomEventType } from '../services/live-platform/types';
 import type { RoomInteractionSnapshot } from './roomInteractionTracker';
+import type {
+  AudienceActivityMode,
+  AudienceRestingBelief,
+} from './audienceAwareness';
 import {
   formatProactiveIntent,
   PersonaRuntimeState,
@@ -34,6 +38,10 @@ export interface EmptyRoomAwarenessContext {
   isLive: boolean;
   audiencePresent: boolean;
   participantCount: number;
+  activeAudienceCount: number;
+  engageableAudienceCount: number;
+  audienceActivityMode: AudienceActivityMode;
+  likelyRestingMembers: AudienceRestingBelief[];
   busy: boolean;
   interfaceContext: string;
   memoryCues: EmptyRoomMemoryCue[];
@@ -78,6 +86,20 @@ export function createSoulQuietEventData(input: {
       : 0,
     audiencePresent: participantCount > 0,
     participantCount,
+    audienceActivityMode: input.roomContext?.audienceActivityMode ??
+      (participantCount > 0 ? 'passive' : 'empty'),
+    activeAudienceCount: Math.max(
+      0,
+      Math.floor(input.roomContext?.activeAudienceCount ?? 0),
+    ),
+    engageableAudienceCount: Math.max(
+      0,
+      Math.floor(input.roomContext?.engageableAudienceCount ?? 0),
+    ),
+    likelyRestingAudienceCount: Math.max(
+      0,
+      Math.floor(input.roomContext?.likelyRestingAudienceCount ?? 0),
+    ),
     selfDirectedEngagement: input.selfDirectedEngagement === true,
     sourceLabel: input.sourceLabel,
   };
@@ -133,6 +155,16 @@ function chooseStrategy(
 }
 
 function audienceContext(context: EmptyRoomAwarenessContext) {
+  if (context.audienceActivityMode === 'likely-resting') {
+    const names = context.likelyRestingMembers
+      .map((member) => member.name)
+      .filter(Boolean)
+      .join('、');
+    return `- 最近活跃观众为 0。${names ? `${names} ` : '有观众'}曾明确表示准备休息或道晚安，因此只能推断其可能正在休息；这不是“已经睡着”的已验证事实。\n- 当前进入免打扰状态：不得点名、提问、催回应，也不得假装对方仍在听。任何新的真实发言都会立即撤销该推断。`;
+  }
+  if (context.audienceActivityMode === 'passive') {
+    return `- 平台在线估算为 ${context.participantCount}，但最近 5 分钟活跃观众为 0。在线占位不等于正在听，也不是可安全点名或提问的证据。`;
+  }
   if (!context.audienceMembers.length) {
     return context.audiencePresent
       ? '- 平台报告有人在场，但当前没有可安全点名的身份。'
@@ -149,6 +181,7 @@ export class EmptyRoomAwarenessPlanner {
   private readonly random: () => number;
   private readonly personaRuntime: PersonaRuntimeState;
   private nextAt = 0;
+  private lastPassiveSpeechAt = 0;
 
   constructor(
     random: () => number = Math.random,
@@ -164,6 +197,7 @@ export class EmptyRoomAwarenessPlanner {
 
   reset() {
     this.nextAt = 0;
+    this.lastPassiveSpeechAt = 0;
   }
 
   getNextAt() {
@@ -185,9 +219,20 @@ export class EmptyRoomAwarenessPlanner {
     }
     if (at < this.nextAt) return false;
     this.markActivity(settings, at);
-    return (
-      isInsideLocalSchedule(settings, at) && context.isLive && !context.busy
-    );
+    if (!isInsideLocalSchedule(settings, at) || !context.isLive || context.busy) {
+      return false;
+    }
+    if (context.audienceActivityMode === 'likely-resting') return false;
+    if (context.engageableAudienceCount <= 0) {
+      if (
+        this.lastPassiveSpeechAt > 0 &&
+        at - this.lastPassiveSpeechAt < 30 * 60_000
+      ) {
+        return false;
+      }
+      this.lastPassiveSpeechAt = at;
+    }
+    return true;
   }
 
   poll(
@@ -213,6 +258,10 @@ export class EmptyRoomAwarenessPlanner {
 观众状态：${context.audiencePresent ? '有人在场' : '当前无人'}。
 界面真实状态：${context.interfaceContext.trim() || '没有额外界面状态'}
 </live_context>
+
+<audience_activity mode="${context.audienceActivityMode}" reported_count="${context.participantCount}" active_count="${context.activeAudienceCount}" engageable_count="${context.engageableAudienceCount}">
+平台在线估算、最近活跃人数和可互动人数是三个不同事实。不得把在线占位表述为仍在听。
+</audience_activity>
 
 <audience_presence>
 ${audienceContext(context)}
@@ -265,6 +314,10 @@ ${formatProactiveIntent(personaIntent)}
 界面真实状态：${context.interfaceContext.trim() || '没有额外界面状态'}
 </observed_context>
 
+<audience_activity mode="${context.audienceActivityMode}" reported_count="${context.participantCount}" active_count="${context.activeAudienceCount}" engageable_count="${context.engageableAudienceCount}">
+平台在线估算、最近活跃人数和可互动人数是三个不同事实。不得把在线占位表述为仍在听。
+</audience_activity>
+
 <audience_presence>
 ${audienceContext(context)}
 </audience_presence>
@@ -294,6 +347,10 @@ ${audienceContext(context)}
         ambiguous: false,
         clearOffenderIds: [],
         observedAt: at,
+        audienceActivityMode: context.audienceActivityMode,
+        activeAudienceCount: context.activeAudienceCount,
+        engageableAudienceCount: context.engageableAudienceCount,
+        likelyRestingAudienceCount: context.likelyRestingMembers.length,
       },
       scheduledNextAt: this.nextAt,
     };

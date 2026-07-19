@@ -1,5 +1,8 @@
 import { describe, expect, it } from 'vitest';
-import { isRecentSemanticTopicRepeat } from '../../examples/react-purupuru-app/src/lib/personaTopicLedger';
+import {
+  isRecentSemanticTopicRepeat,
+  isSingleUseEngagementEcho,
+} from '../../examples/react-purupuru-app/src/lib/personaTopicLedger';
 
 describe('proactive semantic topic guard', () => {
   it('blocks a paraphrase of the weather topic that just finished', () => {
@@ -16,5 +19,23 @@ describe('proactive semantic topic guard', () => {
         '上海当前气温偏高，外出注意补水。',
       ]),
     ).toBe(false);
+  });
+
+  it('blocks support acknowledgements from becoming proactive monologues', () => {
+    expect(isSingleUseEngagementEcho('赞收好，岚台又亮了一格。')).toBe(true);
+    expect(
+      isRecentSemanticTopicRepeat('今晚岚台的灯全靠你们点亮了。', [
+        '小雨 的弹幕：点赞',
+        '谢谢小雨，点赞收到。',
+      ]),
+    ).toBe(true);
+  });
+
+  it('treats repeated time-and-mood hooks as one topic family', () => {
+    expect(
+      isRecentSemanticTopicRepeat('周五下午还挂在这里，是不是在摸鱼？', [
+        '下班没处去，还是想找个地方躲清静？',
+      ]),
+    ).toBe(true);
   });
 });

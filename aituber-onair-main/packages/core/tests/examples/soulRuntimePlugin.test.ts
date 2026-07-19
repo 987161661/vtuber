@@ -8,6 +8,7 @@ import {
   createFastFallbackProposal,
   createReflectionLedgerInput,
   normalizeSemanticProposal,
+  isSnapshotReplacementAuthorized,
   parseSoulModelJson,
   resolveMiniMaxCredentials,
   scopeFromSearch,
@@ -472,5 +473,41 @@ describe('soul runtime server protocol helpers', () => {
         }),
       ),
     ).toThrow('snapshot_query_scope_incomplete');
+  });
+
+  it('allows snapshot rebuild replacement only with an exact state-hash CAS', () => {
+    const existing = {
+      stateHash: 'old-state-hash',
+      state: { profileId: 'linglan-v1', constitutionId: 'constitution-v1' },
+    };
+    const rebuilt = {
+      state: { profileId: 'linglan-v1', constitutionId: 'constitution-v1' },
+    };
+    expect(
+      isSnapshotReplacementAuthorized(
+        existing as never,
+        rebuilt as never,
+        'old-state-hash',
+      ),
+    ).toBe(true);
+    expect(
+      isSnapshotReplacementAuthorized(
+        existing as never,
+        rebuilt as never,
+        'stale-state-hash',
+      ),
+    ).toBe(false);
+    expect(
+      isSnapshotReplacementAuthorized(
+        existing as never,
+        {
+          state: {
+            profileId: 'another-persona',
+            constitutionId: 'constitution-v1',
+          },
+        } as never,
+        'old-state-hash',
+      ),
+    ).toBe(false);
   });
 });

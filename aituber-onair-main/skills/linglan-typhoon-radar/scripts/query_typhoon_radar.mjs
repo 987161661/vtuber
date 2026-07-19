@@ -280,6 +280,7 @@ async function readJsonFile(filePath, fallback) {
 
 export function intentFor(question) {
   if (/\u96e8\u707e|\u6c34\u707e|\u6d2a\u6c34|\u5185\u6d9d|\u79ef\u6c34|\u5c71\u6d2a|\u6ce5\u77f3\u6d41|\u6df9\u6c34|\u5012\u704c/.test(question)) return 'hazard';
+  if (/台风胚胎|热带扰动|生成概率|成台概率|发展成(?:台风|热带气旋)|下一个台风|未来.{0,8}台风|预测区域/.test(question)) return 'outlook';
   if (/在哪里|在哪儿|位置|到哪(?:里|儿)?了|走到哪/.test(question)) return 'location';
   if (/(?:北京|天津|上海|重庆|河北|山西|辽宁|吉林|黑龙江|江苏|浙江|安徽|福建|江西|山东|河南|湖北|湖南|广东|广西|海南|四川|贵州|云南|西藏|陕西|甘肃|青海|宁夏|新疆|台湾|香港|澳门).*(?:什么情况|怎么样|怎样了|有影响吗?)/.test(question)) return 'impact';
   if (/来源|哪里查|哪查|数据.*哪|依据|接口/.test(question)) return 'source';
@@ -288,6 +289,44 @@ export function intentFor(question) {
   if (/几级|风力|风速|风大|有没有风|多大风|没.{0,2}风|无风|有风|没.{0,2}雨|雨停|下雨/.test(question)) return 'wind';
   if (/影响|怎么样|如何|严重|危险/.test(question)) return 'impact';
   return 'storm';
+}
+
+function outlookCoordinate(center) {
+  if (!Number.isFinite(center?.latitude) || !Number.isFinite(center?.longitude)) return '中心位置待核验';
+  const latitude = `${Math.abs(center.latitude).toFixed(1)}°${center.latitude >= 0 ? 'N' : 'S'}`;
+  const longitude = `${Math.abs(center.longitude).toFixed(1)}°${center.longitude >= 0 ? 'E' : 'W'}`;
+  return `${latitude}、${longitude}`;
+}
+
+function outlookTime(value) {
+  const parsed = Date.parse(value);
+  if (!Number.isFinite(parsed)) return '研判时间待核验';
+  const parts = new Intl.DateTimeFormat('zh-CN', {
+    timeZone: 'Asia/Shanghai', month: 'numeric', day: 'numeric',
+    hour: '2-digit', minute: '2-digit', hour12: false,
+  }).formatToParts(new Date(parsed));
+  const get = (type) => parts.find((part) => part.type === type)?.value || '';
+  return `${get('month')}月${get('day')}日 ${get('hour')}:${get('minute')}（北京时间）`;
+}
+
+export function buildOutlookRequiredAnswer(outlook) {
+  if (!outlook) return '当前还没有取得可核验的台风生成研判，暂时不能判断台风胚胎位置或生成概率。';
+  const lines = [`研判生成于${outlookTime(outlook.generatedAt)}。`];
+  const disturbances = Array.isArray(outlook.nearTermDisturbances) ? outlook.nearTermDisturbances : [];
+  if (disturbances.length === 0) {
+    lines.push('JTWC未来24小时当前未列出西北太平洋热带扰动；这不等于零概率。');
+  } else {
+    const potentialLabels = { low: '低', medium: '中', high: '高' };
+    lines.push(...disturbances.map((item) =>
+      `JTWC扰动${item.id || ''}位于${outlookCoordinate({ latitude: item.latitude, longitude: item.longitude })}，未来${item.timeWindowHours || 24}小时发展潜势${potentialLabels[item.potential] || '待核验'}。`,
+    ));
+  }
+  const areas = Array.isArray(outlook.extendedRangeAreas) ? outlook.extendedRangeAreas : [];
+  lines.push(...areas.map((area) =>
+    `NOAA CPC第${area.week}周区域生成概率${area.probabilityPercent}%，几何中心约${outlookCoordinate(area.center)}${area.validPeriod ? `，有效期${area.validPeriod}` : ''}。`,
+  ));
+  if (areas.length > 0) lines.push('这个百分比是区域内至少生成一次热带气旋的概率，不是单个胚胎的定点成台概率。');
+  return lines.join('');
 }
 
 function compactStorm(storm) {
@@ -430,13 +469,23 @@ function asksForCurrentStormCount(question) {
   );
 }
 
-export function buildRequiredAnswer(question, intent, cityWind, defense, storms, sources, landfall) {
-  const lifecycle = arguments[7] || null;
-  const history = arguments[8] || null;
+export function buildRequiredAnswer(
+  question,
+  intent,
+  cityWind,
+  defense,
+  storms,
+  sources,
+  landfall,
+  lifecycle = null,
+  history = null,
+  outlook = null,
+) {
   if (intent === 'hazard') {
     const place = cityWind?.city ? `${cityWind.city}` : '\u5f53\u5730';
     return `\u5f53\u524d\u6280\u80fd\u6ca1\u6709\u53d6\u5f97${place}\u53ef\u6838\u5b9e\u7684\u96e8\u707e\u3001\u6d2a\u6c34\u3001\u5185\u6d9d\u6216\u5b98\u65b9\u9884\u8b66\u8d44\u6599\uff0c\u6240\u4ee5\u4e0d\u80fd\u5224\u65ad\u73b0\u5728\u6709\u6ca1\u6709\u96e8\u707e\u3002\u8bf7\u67e5\u770b\u5f53\u5730\u6c14\u8c61\u3001\u5e94\u6025\u548c\u6c34\u52a1\u90e8\u95e8\u7684\u6700\u65b0\u9884\u8b66\uff1b\u82e5\u5df2\u51fa\u73b0\u79ef\u6c34\u4e0a\u6da8\u6216\u5012\u704c\uff0c\u5148\u8fdc\u79bb\u4f4e\u6d3c\u5904\u3002`;
   }
+  if (intent === 'outlook') return buildOutlookRequiredAnswer(outlook);
   const historicalAnswer = historicalLifecycleAnswer(question, history);
   if (historicalAnswer) return historicalAnswer;
   if (lifecycle && lifecycleMatchesQuestion(question, lifecycle)) {
@@ -513,9 +562,32 @@ function buildDeliveryGuide(question, intent, defense) {
   return { emotion: 'relaxed', delivery: 'warm', emotionIntensity: 0.55, reason: '数字解释保持清楚且有人味' };
 }
 
-function buildClaims(question, cityWind, defense, storms, sources, lifecycle = null, history = null) {
+function buildClaims(question, cityWind, defense, storms, sources, lifecycle = null, history = null, outlook = null) {
   const claims = [];
   if (intentFor(question) === 'hazard') return claims;
+  if (intentFor(question) === 'outlook') {
+    for (const disturbance of outlook?.nearTermDisturbances || []) {
+      claims.push({
+        id: disturbance.factRef || `jtwc-disturbance-${disturbance.id}`,
+        type: 'official_forecast',
+        text: `JTWC扰动${disturbance.id || ''}未来${disturbance.timeWindowHours || 24}小时发展潜势${disturbance.potential}。`,
+        source: 'JTWC Western North Pacific Significant Tropical Weather Advisory',
+        observedAt: outlook.generatedAt,
+        confidence: 'medium',
+      });
+    }
+    for (const area of outlook?.extendedRangeAreas || []) {
+      claims.push({
+        id: area.factRef,
+        type: 'official_forecast',
+        text: `NOAA CPC第${area.week}周区域生成概率${area.probabilityPercent}%，几何中心${outlookCoordinate(area.center)}。`,
+        source: 'NOAA CPC Global Tropics Hazards Outlook',
+        observedAt: outlook.generatedAt,
+        confidence: 'medium',
+      });
+    }
+    return claims;
+  }
   if (lifecycle && lifecycleMatchesQuestion(question, lifecycle)) {
     claims.push({
       id: `storm-lifecycle-${lifecycle.id}`,
@@ -612,7 +684,7 @@ export async function queryTyphoonRadar(question, options = {}) {
   const baseUrl = options.baseUrl || DEFAULT_BASE_URL;
   const documentPath = `${root}/${DOCUMENT_NAME}`;
   const intent = intentFor(question);
-  const needsStormTrack = !['source', 'wind'].includes(intent);
+  const needsStormTrack = !['source', 'wind', 'outlook'].includes(intent);
   const namedTyphoon = needsStormTrack ? extractNamedTyphoonQuery(question) : null;
   const [content, metadata, stormsPayload, entityPayload, evolutionState] = await Promise.all([
     readFile(documentPath, 'utf8'),
@@ -671,19 +743,20 @@ export async function queryTyphoonRadar(question, options = {}) {
     { fields: '台风位置、强度、气压、风圈、路径预报', name: document.source || '浙江省水利厅台风路径公开接口', url: document.sourceUrl },
     { fields: '代表坐标10米模式预报风速、风力等级、风向', name: document.cityWindSource || 'MET Norway Locationforecast 2.0 模式预报', url: 'https://api.met.no/weatherapi/locationforecast/2.0/compact' },
   ];
-  const claims = buildClaims(question, cityWind, defense, storms, sources, lifecycle, history);
+  const outlook = evolutionState?.lastDisturbanceOutlook || null;
+  const claims = buildClaims(question, cityWind, defense, storms, sources, lifecycle, history, outlook);
   const landfall = buildLandfallStatus(question, storms);
   return {
     queryTimeBeijing: toBeijingTime(new Date().toISOString()),
     timeZone: 'Asia/Shanghai',
     intent, question, place, placeResolution: placeResult.resolution,
-    cityWind, defense, storms, lifecycle, history, claims,
+    cityWind, defense, storms, lifecycle, history, outlook, claims,
     landfall,
     document: {
       runAt: document.runAt, modifiedAt: document.modifiedAt, stale: document.stale,
     },
     sources,
-    requiredAnswer: buildRequiredAnswer(question, intent, cityWind, defense, storms, sources, landfall, lifecycle, history),
+    requiredAnswer: buildRequiredAnswer(question, intent, cityWind, defense, storms, sources, landfall, lifecycle, history, outlook),
     deliveryGuide: buildDeliveryGuide(question, intent, defense),
     answerRules: [
       ...(intent === 'location'
@@ -694,6 +767,7 @@ export async function queryTyphoonRadar(question, options = {}) {
           ]
         : []),
       '先直接回答数字和结论，再说明数据时次与口径。',
+      'CPC百分比是区域内至少一次热带气旋生成概率，不得改写为单个胚胎或几何中心点的成台概率。',
       '不得把台风中心风力当作当地风力。',
       '不得把路径预报点说成已确认登陆。',
       'landfall.status=not_provided 只表示本次结果未附带记录，不表示未登陆；禁止据此说“没登陆”或“还在海里”。',

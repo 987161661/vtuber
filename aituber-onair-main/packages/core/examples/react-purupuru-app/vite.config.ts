@@ -8,8 +8,13 @@ import {
   stat,
   writeFile,
 } from 'node:fs/promises';
-import type { IncomingMessage, ServerResponse } from 'node:http';
+import type {
+  IncomingHttpHeaders,
+  IncomingMessage,
+  ServerResponse,
+} from 'node:http';
 import { execFile } from 'node:child_process';
+import { Readable } from 'node:stream';
 import { dirname, join } from 'node:path';
 import { createHash, createHmac, randomBytes, randomUUID } from 'node:crypto';
 import { defineConfig, type Plugin } from 'vite';
@@ -19,6 +24,21 @@ import {
   type StressIngestMessage,
 } from './stressTestRuntime';
 import { createSoulRuntimePlugin } from './soulRuntimePlugin';
+import {
+  createAtomicJsonFileAdapter,
+  createSerializedJsonStore,
+} from './server/serializedJsonStore';
+import { createOperatorQueueRuntime } from './server/operatorQueueRuntime';
+import { createOperatorQueueHttpRequestHandler } from './server/operatorQueueHttpRequest';
+import { createLiveRuntimeMonitor } from './server/liveRuntimeMonitor';
+import { createLiveRuntimeEventRequestHandler } from './server/liveRuntimeEventRequest';
+import { fetchRadarCityWeather } from './server/cityWeatherRadarAdapter';
+import { forwardRadarCityEvent } from './server/radarCityEventForwarder';
+import { resolveClientChunk } from './clientChunkStrategy';
+import {
+  exposeRuntimePluginInPreview,
+  shareRuntimeProxyWithPreview,
+} from './server/runtimeVitePlugin';
 import {
   hasUnsafeSpeechArtifacts,
   sanitizeSpeechText,
@@ -50,7 +70,7 @@ import {
   type AcceptanceLedger,
   type AcceptanceResult,
 } from './src/lib/acceptanceLedger';
-import { wouldRegressCompletedDelivery } from './src/lib/operatorQueue';
+import { type OperatorQueueItem } from './src/lib/operatorQueue';
 
 let runtimeSettings: string | null = null;
 let runtimeSettingsRevision = 0;
@@ -80,6 +100,64 @@ function resolveMinimaxServerCredential(serialized = runtimeSettings): string {
     // The caller reports either a missing credential or the provider's error.
   }
   return '';
+}
+
+/**
+ * Own the credential boundary instead of relying on Vite's proxy event hook.
+ * Some Vite/http-proxy startup paths forwarded these routes without firing the
+ * hook that injects Authorization, which made a verified server-held key look
+ * like a provider-side 401 to the live runtime.
+ */
+async function forwardMinimaxRequest(
+  req: IncomingMessage,
+  res: ServerResponse,
+  endpoint: string,
+): Promise<void> {
+  const key = resolveMinimaxServerCredential();
+  if (!key || isServerManagedCredential(key)) {
+    res.statusCode = 401;
+    res.setHeader('Content-Type', 'application/json; charset=utf-8');
+    res.end(JSON.stringify({ error: 'minimax_server_credential_missing' }));
+    return;
+  }
+  const chunks: Buffer[] = [];
+  let size = 0;
+  for await (const chunk of req) {
+    const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    size += buffer.length;
+    if (size > 1024 * 1024) {
+      res.statusCode = 413;
+      res.end(JSON.stringify({ error: 'minimax_request_too_large' }));
+      return;
+    }
+    chunks.push(buffer);
+  }
+  try {
+    const upstream = await fetch(endpoint, {
+      method: req.method || 'POST',
+      headers: {
+        Authorization: `Bearer ${key}`,
+        'Content-Type': req.headers['content-type'] || 'application/json',
+      },
+      body: chunks.length ? Buffer.concat(chunks) : undefined,
+      signal: AbortSignal.timeout(60_000),
+    });
+    res.statusCode = upstream.status;
+    const contentType = upstream.headers.get('content-type');
+    if (contentType) res.setHeader('Content-Type', contentType);
+    res.setHeader('Cache-Control', 'no-store');
+    if (!upstream.body) {
+      res.end();
+      return;
+    }
+    Readable.fromWeb(upstream.body as import('node:stream/web').ReadableStream)
+      .on('error', () => res.destroy())
+      .pipe(res);
+  } catch {
+    res.statusCode = 502;
+    res.setHeader('Content-Type', 'application/json; charset=utf-8');
+    res.end(JSON.stringify({ error: 'minimax_upstream_unreachable' }));
+  }
 }
 
 function runtimeModelHealth(serialized = runtimeSettings) {
@@ -173,7 +251,11 @@ function removePrivateCredentialMarkers<T>(input: T): {
   const value = JSON.parse(JSON.stringify(input)) as T;
   const removedPaths: string[] = [];
   const visit = (candidate: unknown, path: string[]) => {
-    if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate)) {
+    if (
+      !candidate ||
+      typeof candidate !== 'object' ||
+      Array.isArray(candidate)
+    ) {
       return;
     }
     for (const [key, child] of Object.entries(
@@ -536,181 +618,56 @@ const externalChatQueue = new Map<
   }
 >();
 
-type OperatorQueueStatus =
-  | 'pending'
-  | 'preparing'
-  | 'ready'
-  | 'speaking'
-  | 'done'
-  | 'skipped'
-  | 'failed'
-  | 'deleted';
-type SanitizedRoomContext = {
-  totalCount: number;
-  participantCount: number;
-  catchup: boolean;
-  mergedCount: number;
-  laneCounts: Record<string, number>;
-  samples: Array<{
-    id: string;
-    viewerId: string;
-    viewerName: string;
-    text: string;
-    at: number;
-    hostile: boolean;
-    threat: boolean;
-    targetViewerId?: string;
-  }>;
-  conflictLevel: 'calm' | 'friction' | 'escalating' | 'attack';
-  ambiguous: boolean;
-  clearOffenderIds: string[];
-  observedAt: number;
-};
-type OperatorQueueItem = {
-  eventId: string;
-  text: string;
-  prompt?: string;
-  source: string;
-  sourceLabel?: string;
-  viewerId?: string;
-  viewerName?: string;
-  sourcesSeen: string[];
-  createdAt: number;
-  updatedAt: number;
-  order: number;
-  status: OperatorQueueStatus;
-  preparedReply?: string;
-  preparedSpeechPlan?: PreparedSpeechPlan;
-  preparedAt?: number;
-  doneAt?: number;
-  skipReason?: string;
-  skills: string[];
-  testRunId?: string;
-  stepId?: string;
-  scenarioId?: string;
-  finishReason?: string;
-  retryCount?: number;
-  beatCount?: number;
-  completedBeatCount?: number;
-  replyHash?: string;
-  faultKind?:
-    | 'typhoon-skill-timeout'
-    | 'model-truncation'
-    | 'tts-first-beat-failure'
-    | 'prepare-lease-expiry';
-  faultConsumed?: boolean;
-  interactionObservedAt?: number;
-  presenceOnly?: boolean;
-  engagementAppliedAt?: number;
-  engagementSignals?: Array<'follow' | 'like' | 'gift' | 'superchat' | 'guard'>;
-  leaseOwnerId?: string;
-  leaseExpiresAt?: number;
-  audioByteLength?: number;
-  panelObservedAt?: number;
-  relationshipVisitDelta?: number;
-  otherViewerRelationshipMutated?: boolean;
-  assignedOwnerId?: string;
-  roomContext?: SanitizedRoomContext;
-};
-type PreparedSpeechPlan = {
-  version: 2;
-  beats: Array<{
-    text: string;
-    ttsText?: string;
-    emotion?: string;
-    delivery?: string;
-    emotionIntensity?: number;
-    prosody?: Record<string, number>;
-    pauseAfterMs?: number;
-    motion?: string;
-    gaze?: string;
-    gesture?: string;
-    interruptibleAfter?: boolean;
-  }>;
-};
-
-function sanitizePreparedSpeechPlan(
-  value: unknown,
-): PreparedSpeechPlan | undefined {
-  if (!value || typeof value !== 'object') return undefined;
-  const source = value as { version?: unknown; beats?: unknown };
-  if (source.version !== 2 || !Array.isArray(source.beats)) return undefined;
-  const prosodyKeys = new Set([
-    'pace',
-    'pitch',
-    'volume',
-    'warmth',
-    'tension',
-    'energy',
-    'assertiveness',
-    'breathiness',
-  ]);
-  const beats = source.beats.slice(0, 3).flatMap((raw) => {
-    if (!raw || typeof raw !== 'object') return [];
-    const beat = raw as Record<string, unknown>;
-    const text = sanitizeSpeechText(String(beat.text || '')).slice(0, 1_200);
-    if (!text) return [];
-    const prosody = Object.fromEntries(
-      Object.entries(
-        (beat.prosody &&
-        typeof beat.prosody === 'object' &&
-        !Array.isArray(beat.prosody)
-          ? beat.prosody
-          : {}) as Record<string, unknown>,
-      )
-        .filter(
-          ([key, number]) =>
-            prosodyKeys.has(key) &&
-            typeof number === 'number' &&
-            Number.isFinite(number),
-        )
-        .map(([key, number]) => [
-          key,
-          Math.min(1, Math.max(-1, number as number)),
-        ]),
-    );
-    const string = (key: string, max = 80) =>
-      typeof beat[key] === 'string'
-        ? beat[key].trim().slice(0, max) || undefined
-        : undefined;
-    const numeric = (key: string, min: number, max: number) =>
-      typeof beat[key] === 'number' && Number.isFinite(beat[key])
-        ? Math.min(max, Math.max(min, beat[key] as number))
-        : undefined;
-    return [
-      {
-        text,
-        ttsText: string('ttsText', 1_400),
-        emotion: string('emotion'),
-        delivery: string('delivery'),
-        emotionIntensity: numeric('emotionIntensity', 0, 1),
-        prosody: Object.keys(prosody).length ? prosody : undefined,
-        pauseAfterMs: numeric('pauseAfterMs', 0, 2_500),
-        motion: string('motion'),
-        gaze: string('gaze'),
-        gesture: string('gesture'),
-        interruptibleAfter:
-          typeof beat.interruptibleAfter === 'boolean'
-            ? beat.interruptibleAfter
-            : undefined,
-      },
-    ];
-  });
-  return beats.length ? { version: 2, beats } : undefined;
-}
 // The control-room tab and the overlay iframe do not share React state. This
 // small in-process queue is their explicit, authoritative control protocol.
-const operatorQueue = new Map<string, OperatorQueueItem>();
+const operatorQueueStore = createSerializedJsonStore<OperatorQueueItem[]>({
+  adapter: createAtomicJsonFileAdapter(OPERATOR_QUEUE_PATH),
+  validate: (value): value is OperatorQueueItem[] => Array.isArray(value),
+});
 const PREPARE_LEASE_MS = 120_000;
+const SPEAK_LEASE_MS = 60_000;
+const MAX_QUEUE_RETRIES = 4;
+const operatorQueueRuntime = createOperatorQueueRuntime({
+  maxRetries: MAX_QUEUE_RETRIES,
+  prepareLeaseMs: PREPARE_LEASE_MS,
+  speakLeaseMs: SPEAK_LEASE_MS,
+  store: operatorQueueStore,
+  onPersistenceError: (error) => {
+    console.error('Operator queue persistence failed.', error);
+  },
+});
+const executeOperatorQueueHttpRequest = createOperatorQueueHttpRequestHandler({
+  runtime: operatorQueueRuntime,
+  appendAuditEntry,
+});
+const liveRuntimeMonitor = createLiveRuntimeMonitor();
+const handleLiveRuntimeEventRequest = createLiveRuntimeEventRequestHandler({
+  monitor: liveRuntimeMonitor,
+  attestEvent: (headers, event, serverReceivedAt) =>
+    attestSoulCanaryRuntimeEvent(headers, event, serverReceivedAt),
+  appendRuntimeEvent: async (event) => {
+    await mkdir(dirname(LIVE_RUNTIME_LOG_PATH), { recursive: true });
+    await appendFile(
+      LIVE_RUNTIME_LOG_PATH,
+      `${JSON.stringify(event)}\n`,
+      'utf8',
+    );
+  },
+  appendAuditEntry,
+  forwardEvent: async (event) => {
+    await fetch(DIGITAL_HOST_EVENT_SINK_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(event),
+    });
+  },
+});
 // A verified MiniMax response can legitimately play for more than one minute.
 // This lease must outlive the client-side no-progress watchdog; otherwise a
 // healthy playback is requeued and can be announced twice.
-const SPEAK_LEASE_MS = 60_000;
 // A core recovery rebuilds React state asynchronously.  Allow the recovered
 // owner to become ready before treating a no-draft completion as terminal.
 // This remains bounded so a genuine provider failure is still observable.
-const MAX_QUEUE_RETRIES = 4;
-const RUNTIME_OWNER_HEARTBEAT_TTL_MS = 15_000;
 const RUNTIME_OWNER_LEASE_MS = 10_000;
 let runtimeOwnerLease: { ownerId: string; expiresAt: number } | undefined;
 type LiveProgramMode = 'companion' | 'weather' | 'urgent' | 'variety';
@@ -720,10 +677,6 @@ const liveProgramState: {
   updatedAt: number;
 } = { mode: 'companion', locked: false, updatedAt: Date.now() };
 const liveSafetyGateway = new LiveSafetyGateway();
-const runtimeOwnerHeartbeats = new Map<
-  string,
-  { seenAt: number; availableForStress: boolean; ttsConfigured: boolean }
->();
 
 type StressDiagnosticLevel = 'pass' | 'warning' | 'error';
 type StressDiagnosticCheck = {
@@ -740,27 +693,6 @@ type StressDiagnosticSnapshot = {
 };
 
 let lastStressDiagnostics: StressDiagnosticSnapshot | undefined;
-
-function runtimeOwnerAvailability(now = Date.now()): {
-  active: boolean;
-  available: boolean;
-  ttsConfigured: boolean;
-} {
-  for (const [ownerId, heartbeat] of runtimeOwnerHeartbeats) {
-    if (now - heartbeat.seenAt > RUNTIME_OWNER_HEARTBEAT_TTL_MS) {
-      runtimeOwnerHeartbeats.delete(ownerId);
-    }
-  }
-  return {
-    active: runtimeOwnerHeartbeats.size > 0,
-    available: [...runtimeOwnerHeartbeats.values()].some(
-      (heartbeat) => heartbeat.availableForStress,
-    ),
-    ttsConfigured: [...runtimeOwnerHeartbeats.values()].some(
-      (heartbeat) => heartbeat.ttsConfigured,
-    ),
-  };
-}
 
 function runtimeOwnerLeasePlugin(): Plugin {
   return {
@@ -888,7 +820,7 @@ function radarCityRelayPlugin(): Plugin {
         }
         const chunks: Buffer[] = [];
         req.on('data', (chunk: Buffer) => chunks.push(chunk));
-        req.on('end', () => {
+        req.on('end', async () => {
           try {
             const event = JSON.parse(
               Buffer.concat(chunks).toString('utf8'),
@@ -911,8 +843,24 @@ function radarCityRelayPlugin(): Plugin {
             radarCityEvents.push({ sequence: ++radarCityEventSequence, event });
             if (radarCityEvents.length > 200)
               radarCityEvents.splice(0, radarCityEvents.length - 200);
+            let forwarded = false;
+            try {
+              await forwardRadarCityEvent({
+                baseUrl: LIVE_RADAR_BASE_URL,
+                event: event as Parameters<
+                  typeof forwardRadarCityEvent
+                >[0]['event'],
+              });
+              forwarded = true;
+            } catch {
+              // Keep the digital-host relay available while the radar restarts.
+            }
             res.end(
-              JSON.stringify({ ok: true, sequence: radarCityEventSequence }),
+              JSON.stringify({
+                ok: true,
+                forwarded,
+                sequence: radarCityEventSequence,
+              }),
             );
           } catch (error) {
             res.statusCode = 400;
@@ -1049,7 +997,7 @@ function diagnosticErrorSummary(snapshot: StressDiagnosticSnapshot): string {
  */
 async function collectStressDiagnostics(): Promise<StressDiagnosticSnapshot> {
   const checks: StressDiagnosticCheck[] = [];
-  const owner = runtimeOwnerAvailability();
+  const owner = liveRuntimeMonitor.ownerAvailability(Date.now());
   const tts = parseRuntimeTtsSettings();
   if (!owner.active) {
     checks.push({
@@ -1238,9 +1186,11 @@ async function collectStressDiagnostics(): Promise<StressDiagnosticSnapshot> {
     }
   }
 
-  const activeQueueCount = operatorQueueSnapshot().filter((item) =>
-    ['pending', 'preparing', 'ready', 'speaking'].includes(item.status),
-  ).length;
+  const activeQueueCount = operatorQueueRuntime
+    .snapshot()
+    .filter((item) =>
+      ['pending', 'preparing', 'ready', 'speaking'].includes(item.status),
+    ).length;
   checks.push({
     id: 'operator-queue',
     level: activeQueueCount ? 'warning' : 'pass',
@@ -1256,107 +1206,47 @@ async function collectStressDiagnostics(): Promise<StressDiagnosticSnapshot> {
   };
 }
 
-function releaseExpiredOperatorLeases(now = Date.now()): boolean {
-  let changed = false;
-  for (const item of operatorQueue.values()) {
-    if (
-      !['preparing', 'speaking'].includes(item.status) ||
-      !item.leaseExpiresAt ||
-      item.leaseExpiresAt > now
-    ) {
-      continue;
-    }
-    item.status = item.preparedReply ? 'ready' : 'pending';
-    item.finishReason = 'lease_expired_requeued';
-    item.leaseOwnerId = undefined;
-    item.leaseExpiresAt = undefined;
-    item.updatedAt = now;
-    changed = true;
-  }
-  if (changed) void persistOperatorQueue();
-  return changed;
-}
-
-async function restoreOperatorQueue() {
-  try {
-    const saved = JSON.parse(
-      await readFile(OPERATOR_QUEUE_PATH, 'utf8'),
-    ) as OperatorQueueItem[];
-    if (!Array.isArray(saved)) return;
-    for (const item of saved) {
-      if (!item?.eventId || item.status === 'deleted') continue;
-      // Browser audio cannot survive a local Vite restart. Requeue any
-      // in-flight work instead of leaving the scheduler permanently locked.
-      if (item.status === 'speaking')
-        item.status = item.preparedReply ? 'ready' : 'pending';
-      if (item.status === 'preparing') item.status = 'pending';
-      operatorQueue.set(item.eventId, item);
-    }
-    normalizeOperatorQueueOrder();
-  } catch {
-    // The first run has no saved operator queue yet.
-  }
-}
-
-async function persistOperatorQueue() {
-  await mkdir(dirname(OPERATOR_QUEUE_PATH), { recursive: true });
-  await writeFile(
-    OPERATOR_QUEUE_PATH,
-    JSON.stringify(operatorQueueSnapshot()),
-    'utf8',
-  );
-}
-
-function operatorQueueSnapshot() {
-  releaseExpiredOperatorLeases();
-  return [...operatorQueue.values()]
-    .filter((item) => item.status !== 'deleted')
-    .sort(
-      (left, right) =>
-        left.order - right.order || left.createdAt - right.createdAt,
-    );
-}
-
-function normalizeOperatorQueueOrder() {
-  operatorQueueSnapshot().forEach((item, index) => {
-    item.order = index;
-  });
-}
-
 function ingestStressQueueItem(message: StressIngestMessage) {
   const now = Date.now();
-  if (operatorQueue.has(message.eventId)) return;
-  operatorQueue.set(message.eventId, {
-    ...message,
-    sourcesSeen: ['stress-test'],
-    updatedAt: now,
-    order: operatorQueueSnapshot().length,
-    status: message.forceDuplicateOfStepId ? 'skipped' : 'pending',
-    skipReason: message.forceDuplicateOfStepId ? 'duplicate_text' : undefined,
-    finishReason: message.forceDuplicateOfStepId ? 'duplicate_text' : undefined,
-    skills: [],
-    retryCount: 0,
-    beatCount: 0,
-    completedBeatCount: 0,
-    engagementSignals: message.engagementSignals?.map((signal) => signal.kind),
-    assignedOwnerId: message.assignedOwnerId,
-  });
-  void persistOperatorQueue();
+  void operatorQueueRuntime
+    .execute({
+      action: 'ingest',
+      item: {
+        ...message,
+        turnVersion: 2,
+        attemptId: `${message.eventId}:attempt:1`,
+        sourcesSeen: ['stress-test'],
+        updatedAt: now,
+        order: operatorQueueRuntime.snapshot().length,
+        status: message.forceDuplicateOfStepId ? 'skipped' : 'pending',
+        skipReason: message.forceDuplicateOfStepId
+          ? 'duplicate_text'
+          : undefined,
+        finishReason: message.forceDuplicateOfStepId
+          ? 'duplicate_text'
+          : undefined,
+        skills: [],
+        retryCount: 0,
+        beatCount: 0,
+        completedBeatCount: 0,
+        engagementSignals: message.engagementSignals?.map(
+          (signal) => signal.kind,
+        ),
+        assignedOwnerId: message.assignedOwnerId,
+      },
+    })
+    .catch((error) => {
+      console.error('Stress queue ingestion failed.', error);
+    });
 }
 
 const stressTestController = createStressTestController(
   {
     ingest: (message) => ingestStressQueueItem(message),
-    snapshot: () => operatorQueueSnapshot(),
+    snapshot: () => operatorQueueRuntime.snapshot(),
     update: () => undefined,
     remove: async (testRunId) => {
-      let removed = 0;
-      for (const [eventId, item] of operatorQueue) {
-        if (item.testRunId !== testRunId) continue;
-        operatorQueue.delete(eventId);
-        removed += 1;
-      }
-      await persistOperatorQueue();
+      const removed = await operatorQueueRuntime.removeTestRun(testRunId);
       await withHistoryMutation(async () => {
         try {
           const raw = await readFile(CONVERSATION_LOG_PATH, 'utf8');
@@ -1397,182 +1287,10 @@ async function withHistoryMutation<T>(task: () => Promise<T>): Promise<T> {
   return run;
 }
 
-const liveRuntimeState = {
-  queued: new Map<string, number>(),
-  duplicateDrops: 0,
-  sanitizerFailures: 0,
-  ttsRateLimitTimes: [] as number[],
-  lastSpeechAt: 0,
-  lastGeneratedAt: 0,
-  lastEventAt: 0,
-  reportedQueueDepth: 0,
-  reportedOldestQueueAgeMs: 0,
-  isSpeaking: false,
-  hostTelemetry: {} as Record<string, unknown>,
-  lastFaults: {} as Partial<
-    Record<
-      | 'soul'
-      | 'model'
-      | 'skill'
-      | 'tts'
-      | 'flashhead'
-      | 'platform'
-      | 'director',
-      {
-        at: number;
-        stage: string;
-        reason?: string;
-      }
-    >
-  >,
-};
-
-// Client lifecycle events are best-effort. A browser refresh can lose the
-// terminal `done` event, so they must never outlive the authoritative operator
-// queue indefinitely and turn a historical turn into a false director stall.
-const RUNTIME_QUEUE_EVENT_TTL_MS = 2 * 60_000;
-
-function reconcileRuntimeQueueTelemetry(now: number) {
-  let reconciled = 0;
-  for (const [eventId, queuedAt] of liveRuntimeState.queued) {
-    if (now - queuedAt <= RUNTIME_QUEUE_EVENT_TTL_MS) continue;
-    liveRuntimeState.queued.delete(eventId);
-    reconciled += 1;
-  }
-  if (reconciled) {
-    liveRuntimeState.lastFaults.director = {
-      at: now,
-      stage: 'director_telemetry_reconciled',
-      reason: `cleared_${reconciled}_stale_client_queue_event(s)`,
-    };
-  }
-  return reconciled;
-}
-
 function finiteTimestamp(value: unknown): number | undefined {
   return typeof value === 'number' && Number.isFinite(value) && value > 0
     ? value
     : undefined;
-}
-
-function boundedInteger(value: unknown, max: number): number {
-  const number = Number(value);
-  return Number.isFinite(number)
-    ? Math.max(0, Math.min(max, Math.floor(number)))
-    : 0;
-}
-
-function sanitizeRoomContext(value: unknown): SanitizedRoomContext | undefined {
-  if (!value || typeof value !== 'object') return undefined;
-  const record = value as Record<string, unknown>;
-  const rawSamples = Array.isArray(record.samples) ? record.samples : [];
-  const samples = rawSamples.slice(0, 12).flatMap((sample) => {
-    if (!sample || typeof sample !== 'object') return [];
-    const entry = sample as Record<string, unknown>;
-    const text = typeof entry.text === 'string' ? entry.text.slice(0, 240) : '';
-    const viewerId =
-      typeof entry.viewerId === 'string' ? entry.viewerId.slice(0, 120) : '';
-    if (!text || !viewerId) return [];
-    return [
-      {
-        id: typeof entry.id === 'string' ? entry.id.slice(0, 120) : '',
-        viewerId,
-        viewerName:
-          typeof entry.viewerName === 'string'
-            ? entry.viewerName.slice(0, 120)
-            : viewerId,
-        text,
-        at: finiteTimestamp(entry.at) ?? Date.now(),
-        hostile: entry.hostile === true,
-        threat: entry.threat === true,
-        targetViewerId:
-          typeof entry.targetViewerId === 'string'
-            ? entry.targetViewerId.slice(0, 120)
-            : undefined,
-      },
-    ];
-  });
-  const rawLanes =
-    record.laneCounts && typeof record.laneCounts === 'object'
-      ? Object.entries(record.laneCounts as Record<string, unknown>).slice(0, 8)
-      : [];
-  const conflictLevel = ['calm', 'friction', 'escalating', 'attack'].includes(
-    String(record.conflictLevel),
-  )
-    ? (record.conflictLevel as SanitizedRoomContext['conflictLevel'])
-    : 'calm';
-  return {
-    totalCount: boundedInteger(record.totalCount, 10_000),
-    participantCount: boundedInteger(record.participantCount, 10_000),
-    catchup: record.catchup === true,
-    mergedCount: boundedInteger(record.mergedCount, 10_000),
-    laneCounts: Object.fromEntries(
-      rawLanes.map(([key, count]) => [
-        key.slice(0, 40),
-        boundedInteger(count, 10_000),
-      ]),
-    ),
-    samples,
-    conflictLevel,
-    ambiguous: record.ambiguous === true,
-    clearOffenderIds: Array.isArray(record.clearOffenderIds)
-      ? record.clearOffenderIds
-          .filter((id): id is string => typeof id === 'string')
-          .slice(0, 12)
-          .map((id) => id.slice(0, 120))
-      : [],
-    observedAt: finiteTimestamp(record.observedAt) ?? Date.now(),
-  };
-}
-
-function mergeRoomContext(
-  current?: SanitizedRoomContext,
-  incoming?: SanitizedRoomContext,
-): SanitizedRoomContext | undefined {
-  if (!current) return incoming;
-  if (!incoming) return current;
-  const rank: Record<SanitizedRoomContext['conflictLevel'], number> = {
-    calm: 0,
-    friction: 1,
-    escalating: 2,
-    attack: 3,
-  };
-  const stronger =
-    rank[incoming.conflictLevel] > rank[current.conflictLevel]
-      ? incoming
-      : current;
-  const samples = new Map(
-    [...current.samples, ...incoming.samples].map((sample) => [
-      sample.id,
-      sample,
-    ]),
-  );
-  const laneKeys = new Set([
-    ...Object.keys(current.laneCounts),
-    ...Object.keys(incoming.laneCounts),
-  ]);
-  return {
-    ...stronger,
-    totalCount: Math.max(current.totalCount, incoming.totalCount),
-    participantCount: Math.max(
-      current.participantCount,
-      incoming.participantCount,
-    ),
-    mergedCount: Math.max(current.mergedCount, incoming.mergedCount),
-    catchup: current.catchup || incoming.catchup,
-    laneCounts: Object.fromEntries(
-      [...laneKeys].map((lane) => [
-        lane,
-        Math.max(current.laneCounts[lane] ?? 0, incoming.laneCounts[lane] ?? 0),
-      ]),
-    ),
-    samples: [...samples.values()].slice(-12),
-    ambiguous: current.ambiguous || incoming.ambiguous,
-    clearOffenderIds: [
-      ...new Set([...current.clearOffenderIds, ...incoming.clearOffenderIds]),
-    ].slice(0, 12),
-    observedAt: Math.max(current.observedAt, incoming.observedAt),
-  };
 }
 
 function percentile(values: number[], ratio: number): number | null {
@@ -2053,10 +1771,14 @@ function runtimeSettingsPlugin(): Plugin {
     name: 'local-runtime-settings',
     configureServer(server) {
       void ensureRuntimeSettingsHydrated().then(publishRuntimeSettings);
-      server.middlewares.use('/api/minimax-chat', async (_req, res, next) => {
+      server.middlewares.use('/api/minimax-chat', async (req, res) => {
         await ensureRuntimeSettingsHydrated();
         if (resolveMinimaxServerCredential()) {
-          next();
+          await forwardMinimaxRequest(
+            req,
+            res,
+            'https://api.minimaxi.com/v1/chat/completions',
+          );
           return;
         }
         // Use the authentication status that survives provider adapters which
@@ -2074,6 +1796,14 @@ function runtimeSettingsPlugin(): Plugin {
                 'MiniMax server credential is missing. Re-enter the existing key in the producer settings; key rotation is not required.',
             },
           }),
+        );
+      });
+      server.middlewares.use('/api/minimax-tts', async (req, res) => {
+        await ensureRuntimeSettingsHydrated();
+        await forwardMinimaxRequest(
+          req,
+          res,
+          'https://api.minimaxi.com/v1/t2a_v2',
         );
       });
       server.middlewares.use('/api/runtime-settings', (req, res) => {
@@ -2807,7 +2537,9 @@ function stressTestPlugin(): Plugin {
             const action = String(body.action || 'start');
             auditAction = action;
             auditRequest = body;
-            let ownerAvailability = runtimeOwnerAvailability();
+            let ownerAvailability = liveRuntimeMonitor.ownerAvailability(
+              Date.now(),
+            );
             let claimedRuntimeOwner = false;
             const provisionalOwnerId = String(
               body.provisionalOwnerId || '',
@@ -2817,13 +2549,18 @@ function stressTestPlugin(): Plugin {
               !ownerAvailability.active &&
               provisionalOwnerId
             ) {
-              runtimeOwnerHeartbeats.set(provisionalOwnerId, {
-                seenAt: Date.now(),
-                availableForStress: true,
-                ttsConfigured: body.ttsConfigured === true,
-              });
+              liveRuntimeMonitor.recordOwnerHeartbeat(
+                provisionalOwnerId,
+                {
+                  availableForStress: true,
+                  ttsConfigured: body.ttsConfigured === true,
+                },
+                Date.now(),
+              );
               claimedRuntimeOwner = true;
-              ownerAvailability = runtimeOwnerAvailability();
+              ownerAvailability = liveRuntimeMonitor.ownerAvailability(
+                Date.now(),
+              );
             }
             if (action === 'start' || action === 'diagnose') {
               lastStressDiagnostics = await collectStressDiagnostics();
@@ -3411,13 +3148,13 @@ function sameCanaryScope(left: unknown, right: SoulCanaryScope): boolean {
 }
 
 async function attestSoulCanaryRuntimeEvent(
-  req: IncomingMessage,
+  headers: IncomingHttpHeaders,
   event: Record<string, unknown>,
   receivedAt: number,
 ): Promise<Record<string, unknown>> {
-  const runHeader = req.headers['x-soul-canary-run'];
-  const tokenHeader = req.headers['x-soul-canary-token'];
-  const ownerHeader = req.headers['x-runtime-owner-id'];
+  const runHeader = headers['x-soul-canary-run'];
+  const tokenHeader = headers['x-soul-canary-token'];
+  const ownerHeader = headers['x-runtime-owner-id'];
   const runId = Array.isArray(runHeader) ? runHeader[0] : runHeader;
   const eventToken = Array.isArray(tokenHeader) ? tokenHeader[0] : tokenHeader;
   const ownerId = Array.isArray(ownerHeader) ? ownerHeader[0] : ownerHeader;
@@ -3723,7 +3460,7 @@ function acceptanceLedgerPlugin(): Plugin {
                 ) {
                   throw new Error('soul_canary_already_active');
                 }
-                if (!runtimeOwnerAvailability().active) {
+                if (!liveRuntimeMonitor.ownerAvailability(Date.now()).active) {
                   throw new Error('runtime_owner_required');
                 }
                 const run: SoulCanaryRun = {
@@ -3963,19 +3700,12 @@ function liveRuntimeMonitorPlugin(): Plugin {
   return {
     name: 'live-runtime-monitor',
     configureServer(server) {
-      void restoreOperatorQueue();
+      void operatorQueueRuntime.restore();
       const sendHealth = async (res: ServerResponse) => {
         const now = Date.now();
-        const reconciledRuntimeQueueEvents =
-          reconcileRuntimeQueueTelemetry(now);
-        liveRuntimeState.ttsRateLimitTimes =
-          liveRuntimeState.ttsRateLimitTimes.filter(
-            (value) => now - value <= 60_000,
-          );
-        const oldestQueuedAt = Math.min(
-          ...liveRuntimeState.queued.values(),
-          Number.POSITIVE_INFINITY,
-        );
+        const monitorHealth = liveRuntimeMonitor.healthSnapshot(now);
+        const oldestQueuedAt =
+          monitorHealth.oldestQueuedAt ?? Number.POSITIVE_INFINITY;
         const [supervisor, obs] = (await Promise.all([
           fetch('http://127.0.0.1:8197/health', {
             cache: 'no-store',
@@ -3996,9 +3726,11 @@ function liveRuntimeMonitorPlugin(): Plugin {
         const measuredOldestAge = Number.isFinite(oldestQueuedAt)
           ? Math.max(0, now - oldestQueuedAt)
           : 0;
-        const authoritativeQueue = operatorQueueSnapshot().filter((item) =>
-          ['pending', 'preparing', 'ready', 'speaking'].includes(item.status),
-        );
+        const authoritativeQueue = operatorQueueRuntime
+          .snapshot()
+          .filter((item) =>
+            ['pending', 'preparing', 'ready', 'speaking'].includes(item.status),
+          );
         const authoritativeOldestAge = authoritativeQueue.length
           ? Math.max(
               0,
@@ -4017,7 +3749,7 @@ function liveRuntimeMonitorPlugin(): Plugin {
           ? Math.max(authoritativeQueue.length, externalChatQueue.size)
           : 0;
         const hostPhase = String(
-          liveRuntimeState.hostTelemetry.hostPhase || 'unknown',
+          monitorHealth.hostTelemetry.hostPhase || 'unknown',
         );
         const directorStatus =
           hostPhase === 'offline'
@@ -4026,7 +3758,7 @@ function liveRuntimeMonitorPlugin(): Plugin {
               ? 'queue_active'
               : 'idle';
         const alerts = [
-          ...(runtimeOwnerAvailability(now).active
+          ...(monitorHealth.runtimeOwner.active
             ? []
             : ['runtime_owner_missing']),
           ...(oldestQueueAgeMs > 15_000 ? ['queue_wait_over_15s'] : []),
@@ -4044,39 +3776,36 @@ function liveRuntimeMonitorPlugin(): Plugin {
           Number(supervisor.connectedClients || 0) === 0
             ? ['bilibili_listener_disconnected']
             : []),
-          ...(liveRuntimeState.ttsRateLimitTimes.length >= 3
-            ? ['tts_rate_limit']
-            : []),
-          ...(liveRuntimeState.sanitizerFailures > 0
-            ? ['sanitizer_failure']
-            : []),
+          ...(monitorHealth.ttsRateLimitCount >= 3 ? ['tts_rate_limit'] : []),
+          ...(monitorHealth.sanitizerFailures > 0 ? ['sanitizer_failure'] : []),
         ];
         const acceptance30m = await recentAcceptanceMetrics(now);
         res.end(
           JSON.stringify({
             queueDepth,
             oldestQueueAgeMs,
-            duplicateDrops: liveRuntimeState.duplicateDrops,
-            sanitizerFailures: liveRuntimeState.sanitizerFailures,
-            ttsRateLimitCount: liveRuntimeState.ttsRateLimitTimes.length,
-            lastSpeechAt: liveRuntimeState.lastSpeechAt || null,
-            lastGeneratedAt: liveRuntimeState.lastGeneratedAt || null,
-            lastEventAt: liveRuntimeState.lastEventAt || null,
-            isSpeaking: liveRuntimeState.isSpeaking,
+            duplicateDrops: monitorHealth.duplicateDrops,
+            sanitizerFailures: monitorHealth.sanitizerFailures,
+            ttsRateLimitCount: monitorHealth.ttsRateLimitCount,
+            lastSpeechAt: monitorHealth.lastSpeechAt || null,
+            lastGeneratedAt: monitorHealth.lastGeneratedAt || null,
+            lastEventAt: monitorHealth.lastEventAt || null,
+            isSpeaking: monitorHealth.isSpeaking,
             model: runtimeModelHealth(),
-            runtimeOwner: runtimeOwnerAvailability(now),
+            runtimeOwner: monitorHealth.runtimeOwner,
             obs,
-            host: liveRuntimeState.hostTelemetry,
+            host: monitorHealth.hostTelemetry,
             directorStatus,
-            reconciledRuntimeQueueEvents,
-            lastFaults: liveRuntimeState.lastFaults,
+            reconciledRuntimeQueueEvents:
+              monitorHealth.reconciledRuntimeQueueEvents,
+            lastFaults: monitorHealth.lastFaults,
             recoveryCount:
-              Number(liveRuntimeState.hostTelemetry.recoveryCount) || 0,
+              Number(monitorHealth.hostTelemetry.recoveryCount) || 0,
             unsupportedAvatarActionCount:
               Number(
-                liveRuntimeState.hostTelemetry.unsupportedAvatarActionCount,
+                monitorHealth.hostTelemetry.unsupportedAvatarActionCount,
               ) || 0,
-            repeatedReplyCount: liveRuntimeState.duplicateDrops,
+            repeatedReplyCount: monitorHealth.duplicateDrops,
             supervisor,
             alerts,
             acceptance30m,
@@ -4164,14 +3893,14 @@ function liveRuntimeMonitorPlugin(): Plugin {
         if (req.method === 'GET') {
           const requestUrl = new URL(req.url || '/', 'http://localhost');
           if (requestUrl.searchParams.get('observer') === 'control-panel') {
-            const observedAt = Date.now();
-            for (const item of operatorQueue.values()) {
-              if (item.testRunId && !item.panelObservedAt) {
-                item.panelObservedAt = observedAt;
-              }
-            }
+            void operatorQueueRuntime.observeControlPanel().catch((error) => {
+              console.error(
+                'Queue panel observation persistence failed.',
+                error,
+              );
+            });
           }
-          res.end(JSON.stringify({ items: operatorQueueSnapshot() }));
+          res.end(JSON.stringify({ items: operatorQueueRuntime.snapshot() }));
           return;
         }
         if (!['POST', 'PATCH'].includes(req.method || '')) {
@@ -4182,502 +3911,15 @@ function liveRuntimeMonitorPlugin(): Plugin {
         const chunks: Buffer[] = [];
         req.on('data', (chunk: Buffer) => chunks.push(chunk));
         req.on('end', async () => {
-          let auditBody: Record<string, unknown> = {};
-          let auditAction = req.method === 'POST' ? 'ingest' : 'unknown';
-          let auditBefore: OperatorQueueItem | null = null;
           try {
-            const body = JSON.parse(
-              Buffer.concat(chunks).toString('utf8'),
-            ) as Record<string, unknown>;
-            const action = String(
-              body.action || (req.method === 'POST' ? 'ingest' : ''),
-            ).trim();
-            auditBody = body;
-            auditAction = action;
-            const auditEventId = String(body.eventId || '').trim();
-            auditBefore = auditEventId
-              ? structuredClone(operatorQueue.get(auditEventId) ?? null)
-              : null;
-            const now = Date.now();
-            if (action === 'ingest' || action === 'manual-broadcast') {
-              const eventId = String(body.eventId || '').trim();
-              const text =
-                typeof body.text === 'string' ? body.text.trim() : '';
-              if (!eventId || !text || text.length > 1000)
-                throw new Error('invalid queue item');
-              const prompt =
-                action === 'ingest' && typeof body.prompt === 'string'
-                  ? body.prompt.trim()
-                  : '';
-              // `text` is the short operator-facing queue label. A system
-              // prompt carries bounded internal context for the model and is
-              // never accepted from ordinary viewer-message sources.
-              if (
-                prompt &&
-                (String(body.source || '') !== 'quiet-room-awareness' ||
-                  prompt.length > 12_000)
-              ) {
-                throw new Error('invalid queue prompt');
-              }
-              const manualReply =
-                action === 'manual-broadcast' && typeof body.reply === 'string'
-                  ? body.reply.trim()
-                  : '';
-              const directReply =
-                action === 'ingest' && typeof body.directReply === 'string'
-                  ? body.directReply.trim()
-                  : '';
-              const preparedSpeechPlan = sanitizePreparedSpeechPlan(
-                body.speechPlan,
-              );
-              if (directReply.length > 500)
-                throw new Error('invalid direct reply');
-              if (action === 'manual-broadcast' && !manualReply) {
-                throw new Error('manual broadcast text is required');
-              }
-              const existing = operatorQueue.get(eventId);
-              if (!existing) {
-                const viewerId =
-                  typeof body.viewerId === 'string' ? body.viewerId : undefined;
-                const normalizedText = text
-                  .normalize('NFKC')
-                  .replace(/\s+/g, ' ')
-                  .trim()
-                  .toLowerCase();
-                const repeatedByViewer = Boolean(
-                  viewerId &&
-                    operatorQueueSnapshot().some(
-                      (item) =>
-                        item.viewerId === viewerId &&
-                        now - item.createdAt <= 15_000 &&
-                        item.text
-                          .normalize('NFKC')
-                          .replace(/\s+/g, ' ')
-                          .trim()
-                          .toLowerCase() === normalizedText,
-                    ),
-                );
-                operatorQueue.set(eventId, {
-                  eventId,
-                  text,
-                  prompt: prompt || undefined,
-                  source: String(body.source || 'external-chat'),
-                  sourceLabel:
-                    typeof body.sourceLabel === 'string'
-                      ? body.sourceLabel
-                      : undefined,
-                  viewerId,
-                  viewerName:
-                    typeof body.viewerName === 'string'
-                      ? body.viewerName
-                      : undefined,
-                  sourcesSeen: Array.isArray(body.sourcesSeen)
-                    ? body.sourcesSeen.filter(
-                        (item): item is string => typeof item === 'string',
-                      )
-                    : [],
-                  createdAt: finiteTimestamp(body.createdAt) ?? now,
-                  updatedAt: now,
-                  // Delivery-critical acknowledgements may wait behind normal
-                  // chat, but never behind stale queued work. They do not
-                  // interrupt an active voice turn; they simply become next.
-                  order: directReply
-                    ? Math.min(
-                        0,
-                        ...operatorQueueSnapshot().map((item) => item.order),
-                      ) - 1
-                    : operatorQueueSnapshot().length,
-                  // Exact repeat from the same viewer is an emphasis candidate,
-                  // not a second answer. Keep it visible in grey for the
-                  // operator and leave semantic non-repeats to LLM judgment.
-                  status:
-                    manualReply || directReply
-                      ? 'ready'
-                      : repeatedByViewer
-                        ? 'skipped'
-                        : 'pending',
-                  skipReason: repeatedByViewer ? 'duplicate_text' : undefined,
-                  preparedReply: manualReply || directReply || undefined,
-                  preparedSpeechPlan,
-                  preparedAt: manualReply || directReply ? now : undefined,
-                  skills: [],
-                  testRunId:
-                    typeof body.testRunId === 'string'
-                      ? body.testRunId
-                      : undefined,
-                  stepId:
-                    typeof body.stepId === 'string' ? body.stepId : undefined,
-                  scenarioId:
-                    typeof body.scenarioId === 'string'
-                      ? body.scenarioId
-                      : undefined,
-                  retryCount: 0,
-                  beatCount:
-                    manualReply || directReply
-                      ? Math.max(
-                          1,
-                          preparedSpeechPlan?.beats.length ??
-                            (manualReply || directReply)
-                              .split(/(?<=[。！？!?])/u)
-                              .filter((part) => part.trim()).length,
-                        )
-                      : 0,
-                  completedBeatCount: 0,
-                  replyHash:
-                    manualReply || directReply
-                      ? createHash('sha256')
-                          .update(manualReply || directReply)
-                          .digest('hex')
-                          .slice(0, 16)
-                      : undefined,
-                  faultKind:
-                    body.testRunId &&
-                    [
-                      'typhoon-skill-timeout',
-                      'model-truncation',
-                      'tts-first-beat-failure',
-                      'prepare-lease-expiry',
-                    ].includes(String(body.faultKind))
-                      ? (body.faultKind as OperatorQueueItem['faultKind'])
-                      : undefined,
-                  presenceOnly: body.presenceOnly === true,
-                  engagementSignals: Array.isArray(body.engagementSignals)
-                    ? body.engagementSignals.filter(
-                        (
-                          signal,
-                        ): signal is NonNullable<
-                          OperatorQueueItem['engagementSignals']
-                        >[number] =>
-                          [
-                            'follow',
-                            'like',
-                            'gift',
-                            'superchat',
-                            'guard',
-                          ].includes(String(signal)),
-                      )
-                    : undefined,
-                  roomContext: sanitizeRoomContext(body.roomContext),
-                });
-              } else {
-                // Several open runtime pages can observe the same platform
-                // event. Keep queue ingestion idempotent and merge only the
-                // bounded room evidence; never reset an in-flight status.
-                const incomingRoomContext = sanitizeRoomContext(
-                  body.roomContext,
-                );
-                existing.roomContext = mergeRoomContext(
-                  existing.roomContext,
-                  incomingRoomContext,
-                );
-                existing.sourcesSeen = [
-                  ...new Set([
-                    ...existing.sourcesSeen,
-                    ...(Array.isArray(body.sourcesSeen)
-                      ? body.sourcesSeen.filter(
-                          (source): source is string =>
-                            typeof source === 'string',
-                        )
-                      : []),
-                  ]),
-                ];
-              }
-            } else {
-              const eventId = String(body.eventId || '').trim();
-              const item = operatorQueue.get(eventId);
-              if (!item) throw new Error('queue item not found');
-              if (wouldRegressCompletedDelivery(item, action)) {
-                throw new Error('completed delivery is immutable');
-              }
-              if (action === 'delete') {
-                item.status = 'deleted';
-              } else if (action === 'move') {
-                const target = Number(body.order);
-                const visible = operatorQueueSnapshot().filter(
-                  (entry) => entry.eventId !== eventId,
-                );
-                visible.splice(
-                  Math.max(
-                    0,
-                    Math.min(
-                      visible.length,
-                      Number.isFinite(target) ? target : visible.length,
-                    ),
-                  ),
-                  0,
-                  item,
-                );
-                visible.forEach((entry, index) => {
-                  entry.order = index;
-                });
-              } else if (action === 'edit-reply') {
-                const reply =
-                  typeof body.reply === 'string' ? body.reply.trim() : '';
-                if (!reply || reply.length > 3000)
-                  throw new Error('invalid prepared reply');
-                item.preparedReply = reply;
-                item.status = 'ready';
-              } else if (action === 'skip') {
-                item.status = 'skipped';
-                item.skipReason =
-                  typeof body.reason === 'string' && body.reason.trim()
-                    ? body.reason.trim()
-                    : 'llm_no_reply';
-                item.finishReason = item.skipReason;
-              } else if (action === 'fail') {
-                item.status = 'failed';
-                item.finishReason =
-                  typeof body.reason === 'string' && body.reason.trim()
-                    ? body.reason.trim()
-                    : 'runtime_failed';
-                item.leaseOwnerId = undefined;
-                item.leaseExpiresAt = undefined;
-              } else if (action === 'retry') {
-                item.retryCount = (item.retryCount || 0) + 1;
-                item.leaseOwnerId = undefined;
-                item.leaseExpiresAt = undefined;
-                if (
-                  item.status === 'speaking' &&
-                  (item.completedBeatCount || 0) > 0
-                ) {
-                  item.status = 'failed';
-                  item.finishReason = 'partial_playback_not_retried';
-                } else if ((item.retryCount || 0) > MAX_QUEUE_RETRIES) {
-                  item.status = 'failed';
-                  item.finishReason =
-                    typeof body.reason === 'string'
-                      ? body.reason
-                      : 'retry_limit_exceeded';
-                } else if (
-                  ['preparing', 'speaking', 'ready'].includes(item.status)
-                ) {
-                  item.status = item.preparedReply ? 'ready' : 'pending';
-                }
-              } else if (action === 'mark-observed') {
-                item.interactionObservedAt = now;
-                item.relationshipVisitDelta =
-                  Number(body.relationshipVisitDelta) || 0;
-                item.otherViewerRelationshipMutated = Boolean(
-                  body.otherViewerRelationshipMutated,
-                );
-              } else if (action === 'mark-engagement') {
-                item.engagementAppliedAt = now;
-              } else if (action === 'consume-fault') {
-                if (!item.testRunId) throw new Error('faults are test-only');
-                item.faultConsumed = true;
-              } else if (action === 'beat-progress') {
-                const replaceBeatPlan = body.replaceBeatPlan === true;
-                const reportedBeatCount = Math.max(
-                  1,
-                  Number(body.beatCount) || 0,
-                );
-                const reportedCompletedBeats = Math.max(
-                  0,
-                  Number(body.completedBeatCount) || 0,
-                );
-                item.beatCount = replaceBeatPlan
-                  ? reportedBeatCount
-                  : Math.max(item.beatCount || 0, reportedBeatCount);
-                item.completedBeatCount = replaceBeatPlan
-                  ? Math.min(reportedCompletedBeats, item.beatCount)
-                  : Math.max(
-                      item.completedBeatCount || 0,
-                      reportedCompletedBeats,
-                    );
-                item.audioByteLength =
-                  (item.audioByteLength || 0) +
-                  Math.max(0, Number(body.byteLength) || 0);
-              } else if (action === 'claim-prepare') {
-                releaseExpiredOperatorLeases(now);
-                if (item.status !== 'pending')
-                  throw new Error('queue item is not pending');
-                const ownerId = String(body.ownerId || '').trim();
-                if (!ownerId) throw new Error('queue lease owner is required');
-                if (item.assignedOwnerId && item.assignedOwnerId !== ownerId) {
-                  throw new Error(
-                    'queue item is assigned to another runtime owner',
-                  );
-                }
-                item.status = 'preparing';
-                item.leaseOwnerId = ownerId;
-                item.leaseExpiresAt = now + PREPARE_LEASE_MS;
-              } else if (action === 'renew-lease') {
-                const ownerId = String(body.ownerId || '').trim();
-                if (!ownerId || item.leaseOwnerId !== ownerId) {
-                  throw new Error('queue lease owner mismatch');
-                }
-                if (!['preparing', 'speaking'].includes(item.status)) {
-                  throw new Error('queue item has no renewable lease');
-                }
-                item.leaseExpiresAt =
-                  now +
-                  (item.status === 'speaking'
-                    ? SPEAK_LEASE_MS
-                    : PREPARE_LEASE_MS);
-              } else if (action === 'ready') {
-                item.preparedReply =
-                  typeof body.reply === 'string'
-                    ? body.reply.trim()
-                    : item.preparedReply;
-                item.preparedSpeechPlan = sanitizePreparedSpeechPlan(
-                  body.speechPlan,
-                );
-                item.skills = Array.isArray(body.skills)
-                  ? body.skills.filter(
-                      (skill): skill is string => typeof skill === 'string',
-                    )
-                  : item.skills;
-                // A late LLM callback may arrive after this item has already
-                // begun playback. Never regress a live or completed item back
-                // into the ready queue.
-                if (!['speaking', 'done'].includes(item.status)) {
-                  item.status = item.preparedReply ? 'ready' : 'pending';
-                }
-                if (item.preparedReply) item.preparedAt = now;
-                item.leaseOwnerId = undefined;
-                item.leaseExpiresAt = undefined;
-                if (item.preparedReply) {
-                  item.beatCount = Math.max(
-                    1,
-                    item.preparedSpeechPlan?.beats.length ??
-                      item.preparedReply
-                        .split(/(?<=[。！？!?])/u)
-                        .filter((part) => part.trim()).length,
-                  );
-                  item.completedBeatCount = 0;
-                  item.audioByteLength = 0;
-                  item.replyHash = createHash('sha256')
-                    .update(item.preparedReply)
-                    .digest('hex')
-                    .slice(0, 16);
-                }
-              } else if (action === 'claim-speak') {
-                releaseExpiredOperatorLeases(now);
-                if (item.status !== 'ready' || !item.preparedReply)
-                  throw new Error('queue item is not ready');
-                const ownerId = String(body.ownerId || '').trim();
-                if (!ownerId) throw new Error('queue lease owner is required');
-                if (item.assignedOwnerId && item.assignedOwnerId !== ownerId) {
-                  throw new Error(
-                    'queue item is assigned to another runtime owner',
-                  );
-                }
-                if (
-                  operatorQueueSnapshot().some(
-                    (entry) =>
-                      entry.eventId !== eventId && entry.status === 'speaking',
-                  )
-                ) {
-                  throw new Error('another queue item is already speaking');
-                }
-                item.status = 'speaking';
-                item.leaseOwnerId = ownerId;
-                item.leaseExpiresAt = now + SPEAK_LEASE_MS;
-              } else if (action === 'done') {
-                const ownerId = String(body.ownerId || '').trim();
-                if (item.leaseOwnerId && item.leaseOwnerId !== ownerId) {
-                  throw new Error('queue lease owner mismatch');
-                }
-                item.beatCount = Math.max(
-                  item.beatCount || 0,
-                  Number(body.beatCount) || 0,
-                );
-                item.completedBeatCount = Math.max(
-                  item.completedBeatCount || 0,
-                  Number(body.completedBeatCount) || 0,
-                );
-                item.audioByteLength = Math.max(
-                  item.audioByteLength || 0,
-                  Number(body.audioByteLength) || 0,
-                );
-                if (
-                  (item.beatCount || 0) <= 0 ||
-                  (item.completedBeatCount || 0) < (item.beatCount || 0) ||
-                  (item.audioByteLength || 0) <= 0
-                ) {
-                  throw new Error(
-                    'cannot finish without complete audio evidence',
-                  );
-                }
-                item.status = 'done';
-                item.doneAt = now;
-                item.finishReason =
-                  typeof body.reason === 'string' ? body.reason : 'played';
-                item.leaseOwnerId = undefined;
-                item.leaseExpiresAt = undefined;
-              } else {
-                throw new Error('invalid queue action');
-              }
-              item.updatedAt = now;
-              normalizeOperatorQueueOrder();
-            }
-            await persistOperatorQueue();
-            const eventId = String(body.eventId || '').trim();
-            const actorId =
-              typeof body.auditActor === 'string' && body.auditActor.trim()
-                ? body.auditActor.trim()
-                : ['manual-broadcast', 'delete', 'move', 'edit-reply'].includes(
-                      action,
-                    )
-                  ? 'control-room'
-                  : body.testRunId
-                    ? 'stress-test'
-                    : 'runtime';
-            await appendAuditEntry({
-              category: 'operator_queue',
-              action,
-              actor: {
-                type:
-                  actorId === 'control-room'
-                    ? 'operator'
-                    : actorId === 'stress-test'
-                      ? 'test'
-                      : 'system',
-                id: actorId,
-              },
-              correlationId: eventId || undefined,
-              eventId: eventId || undefined,
-              occurredAt: now,
-              status: 'succeeded',
-              request: body,
-              before: auditBefore,
-              after: eventId
-                ? structuredClone(operatorQueue.get(eventId) ?? null)
-                : null,
+            const result = await executeOperatorQueueHttpRequest({
+              method: req.method === 'POST' ? 'POST' : 'PATCH',
+              rawBody: Buffer.concat(chunks).toString('utf8'),
             });
-            res.end(
-              JSON.stringify({
-                item: operatorQueue.get(String(body.eventId || '')),
-                items: operatorQueueSnapshot(),
-              }),
-            );
+            res.end(JSON.stringify(result));
           } catch (error) {
             const reason =
               error instanceof Error ? error.message : 'invalid queue request';
-            void appendAuditEntry({
-              category: 'operator_queue',
-              action: auditAction,
-              actor: {
-                type: 'operator',
-                id:
-                  typeof auditBody.auditActor === 'string'
-                    ? auditBody.auditActor
-                    : 'unknown-client',
-              },
-              correlationId:
-                typeof auditBody.eventId === 'string'
-                  ? auditBody.eventId
-                  : undefined,
-              eventId:
-                typeof auditBody.eventId === 'string'
-                  ? auditBody.eventId
-                  : undefined,
-              occurredAt: Date.now(),
-              status: 'failed',
-              request: auditBody,
-              before: auditBefore,
-              error: reason,
-            }).catch(() => undefined);
             res.statusCode = 400;
             res.end(
               JSON.stringify({
@@ -4776,264 +4018,13 @@ function liveRuntimeMonitorPlugin(): Plugin {
         });
         req.on('end', async () => {
           try {
-            if (requestSize > 256 * 1024) {
-              throw new Error('live_runtime_event_too_large');
-            }
-            const event = JSON.parse(
-              Buffer.concat(chunks).toString('utf8'),
-            ) as Record<string, unknown>;
-            delete event.serverCanaryRunId;
-            delete event.serverCanaryReceivedAt;
-            delete event.serverCanaryAttested;
-            delete event.serverReceivedAt;
-            const serverReceivedAt = Date.now();
-            const canaryAttestation = await attestSoulCanaryRuntimeEvent(
-              req,
-              event,
-              serverReceivedAt,
-            );
-            const now = finiteTimestamp(event.at) ?? Date.now();
-            const eventId = String(event.eventId || event.id || 'runtime');
-            const stage = String(event.stage || event.kind || 'event');
-            if (stage === 'model_output') {
-              // Provider response objects may carry private reasoning even if
-              // the current browser client omits it. Enforce the boundary at
-              // the persistence owner as defense in depth, including against
-              // stale clients that are still open during an HMR rollout.
-              delete event.modelRawText;
-              delete event.rawText;
-              delete event.parsedText;
-            }
-            liveRuntimeState.lastEventAt = now;
-            if (stage === 'runtime-owner-heartbeat') {
-              const ownerId = String(event.ownerId || '').trim();
-              if (ownerId) {
-                runtimeOwnerHeartbeats.set(ownerId, {
-                  seenAt: now,
-                  availableForStress: event.availableForStress === true,
-                  ttsConfigured: event.ttsConfigured === true,
-                });
-              }
-              liveRuntimeState.hostTelemetry = {
-                hostPhase: event.hostPhase,
-                activeTurnId: event.activeTurnId,
-                targetViewerId: event.targetViewerId,
-                lastDecisionReason: event.lastDecisionReason,
-                proactiveRemaining: event.proactiveRemaining,
-                nextProactiveAt: event.nextProactiveAt,
-                currentBeatIndex: event.currentBeatIndex,
-                currentBeatInterruptible: event.currentBeatInterruptible,
-                recoveryCount: event.recoveryCount,
-                unsupportedAvatarActionCount:
-                  event.unsupportedAvatarActionCount,
-              };
-            }
-            if (typeof event.queueDepth === 'number') {
-              liveRuntimeState.reportedQueueDepth = Math.max(
-                0,
-                event.queueDepth,
-              );
-            }
-            if (typeof event.oldestQueueAgeMs === 'number') {
-              liveRuntimeState.reportedOldestQueueAgeMs = Math.max(
-                0,
-                event.oldestQueueAgeMs,
-              );
-            }
-            if (stage === 'queued') {
-              liveRuntimeState.queued.set(
-                eventId,
-                finiteTimestamp(event.queuedAt) ?? now,
-              );
-            } else if (
-              [
-                'selected',
-                'dropped',
-                'deduplicated',
-                'done',
-                'failed',
-              ].includes(stage)
-            ) {
-              liveRuntimeState.queued.delete(eventId);
-            }
-            if (
-              stage === 'deduplicated' &&
-              String(event.dropReason || '').startsWith('duplicate')
-            ) {
-              liveRuntimeState.duplicateDrops += 1;
-            }
-            if (stage === 'generated') liveRuntimeState.lastGeneratedAt = now;
-            if (stage === 'speaking') {
-              liveRuntimeState.lastSpeechAt = now;
-              liveRuntimeState.isSpeaking = true;
-            }
-            if (
-              ['done', 'tts_rate_limit', 'failed', 'dropped'].includes(stage)
-            ) {
-              liveRuntimeState.isSpeaking = false;
-            }
-            if (stage === 'sanitizer_failure') {
-              liveRuntimeState.sanitizerFailures += 1;
-            }
-            if (stage === 'tts_rate_limit') {
-              liveRuntimeState.ttsRateLimitTimes.push(now);
-            }
-            const reason =
-              typeof event.reason === 'string'
-                ? event.reason
-                : typeof event.error === 'string'
-                  ? event.error
-                  : undefined;
-            const soulFallbackReason =
-              typeof event.fallbackReason === 'string'
-                ? event.fallbackReason
-                : undefined;
-            const soulFallbackDetail =
-              typeof event.fallbackDetail === 'string'
-                ? event.fallbackDetail.slice(0, 120)
-                : undefined;
-            const intentionalSoulFallbacks = new Set([
-              'cognition-frozen',
-              'operator-neutral-fallback',
-              'operator-has-execution-control',
-              'local-safety-mute',
-            ]);
-            if (
-              stage === 'soul_shadow_decision' &&
-              event.fallback !== true &&
-              event.persistenceOk === true
-            ) {
-              delete liveRuntimeState.lastFaults.soul;
-            }
-            if (
-              stage === 'soul_snapshot_recovered' &&
-              liveRuntimeState.lastFaults.soul?.stage ===
-                'soul_snapshot_recovery_failed'
-            ) {
-              delete liveRuntimeState.lastFaults.soul;
-            }
-            if (
-              (stage.startsWith('soul_') &&
-                /failed|failure|timeout|error/.test(stage)) ||
-              (stage.startsWith('soul_') &&
-                event.persistenceOk === false) ||
-              (stage === 'soul_shadow_decision' &&
-                event.fallback === true &&
-                soulFallbackReason &&
-                !intentionalSoulFallbacks.has(soulFallbackReason))
-            ) {
-              liveRuntimeState.lastFaults.soul = {
-                at: now,
-                stage:
-                  stage === 'soul_shadow_decision'
-                    ? 'soul_fast_fallback'
-                    : stage,
-                reason:
-                  soulFallbackDetail ||
-                  soulFallbackReason ||
-                  (typeof event.persistenceError === 'string'
-                    ? event.persistenceError
-                    : undefined) ||
-                  reason ||
-                  (event.persistenceOk === false
-                    ? 'soul_persistence_failed'
-                    : undefined),
-              };
-            }
-            if (
-              stage === 'model-truncated' ||
-              (stage === 'failed' &&
-                /generation|model|chat/i.test(reason || ''))
-            ) {
-              const authenticationFailed =
-                reason === 'generation_auth_failed';
-              liveRuntimeState.lastFaults.model = {
-                at: now,
-                stage: authenticationFailed
-                  ? 'generation_auth_failed'
-                  : stage,
-                reason: authenticationFailed
-                  ? 'MiniMax 服务端凭据为空。请在设置 → LLM → OpenAI-Compatible → API 密钥中重新输入原 key；无需轮换。'
-                  : reason,
-              };
-            }
-            if (stage.includes('skill') && /fail|timeout|error/.test(stage)) {
-              liveRuntimeState.lastFaults.skill = { at: now, stage, reason };
-            }
-            if (
-              stage.startsWith('tts-') &&
-              /error|failed|timeout|rate/.test(stage)
-            ) {
-              liveRuntimeState.lastFaults.tts = { at: now, stage, reason };
-            }
-            if (
-              stage.includes('flashhead') &&
-              /error|failed|timeout/.test(stage)
-            ) {
-              liveRuntimeState.lastFaults.flashhead = {
-                at: now,
-                stage,
-                reason,
-              };
-            }
-            if (stage === 'live_platform_delivery_failed') {
-              liveRuntimeState.lastFaults.platform = { at: now, stage, reason };
-            }
-            await mkdir(join(LIVE_RUNTIME_LOG_PATH, '..'), {
-              recursive: true,
+            const result = await handleLiveRuntimeEventRequest({
+              rawBody: Buffer.concat(chunks).toString('utf8'),
+              byteLength: requestSize,
+              headers: req.headers,
             });
-            await appendFile(
-              LIVE_RUNTIME_LOG_PATH,
-              `${JSON.stringify({
-                ...event,
-                at: now,
-                serverReceivedAt,
-                ...canaryAttestation,
-              })}\n`,
-              'utf8',
-            );
-            await appendAuditEntry({
-              category: 'runtime',
-              action: stage,
-              actor: redactAuditValue(
-                event.actor ?? {
-                  type: stage.startsWith('operator_') ? 'operator' : 'system',
-                  id: stage.startsWith('operator_')
-                    ? 'control-room'
-                    : 'runtime',
-                },
-              ),
-              correlationId: eventId === 'runtime' ? undefined : eventId,
-              eventId: eventId === 'runtime' ? undefined : eventId,
-              occurredAt: now,
-              status: 'succeeded',
-              payload: event,
-            });
-            if (
-              [
-                'fact_validation_rewrite',
-                'sanitizer_failure',
-                'tts_rate_limit',
-              ].includes(stage)
-            ) {
-              void fetch(DIGITAL_HOST_EVENT_SINK_URL, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                  event: stage,
-                  channel: 'virtual-runtime',
-                  requestId: eventId === 'runtime' ? undefined : eventId,
-                  at: now,
-                  reasons: Array.isArray(event.reasons)
-                    ? event.reasons
-                    : undefined,
-                  error:
-                    typeof event.error === 'string' ? event.error : undefined,
-                }),
-              }).catch(() => undefined);
-            }
             res.statusCode = 201;
-            res.end(JSON.stringify({ ok: true }));
+            res.end(JSON.stringify(result));
           } catch {
             res.statusCode = 400;
             res.end(JSON.stringify({ error: 'invalid event' }));
@@ -5205,6 +4196,16 @@ async function fetchWeatherJson<T>(
 }
 
 async function fetchCityWeather(location: string) {
+  try {
+    return await fetchRadarCityWeather({
+      baseUrl: LIVE_RADAR_BASE_URL,
+      location,
+    });
+  } catch {
+    // The radar owns deterministic China city resolution and richer local
+    // observations. Keep Open-Meteo as a bounded fallback for other places or
+    // when the local radar is temporarily unavailable.
+  }
   const geocodingUrl = new URL(
     'https://geocoding-api.open-meteo.com/v1/search',
   );
@@ -5282,7 +4283,9 @@ async function fetchCityWeather(location: string) {
     throw new Error('city_weather_current_missing');
   }
   const canonicalName = [place.name, place.admin1]
-    .filter((value): value is string => typeof value === 'string' && Boolean(value))
+    .filter(
+      (value): value is string => typeof value === 'string' && Boolean(value),
+    )
     .filter((value, index, values) => values.indexOf(value) === index)
     .join('，');
   const condition = cityWeatherCodeLabel(forecast.current?.weather_code);
@@ -5615,38 +4618,48 @@ function replyLatencyPlugin(): Plugin {
 
 // https://vite.dev/config/
 export default defineConfig({
+  build: {
+    rollupOptions: {
+      output: {
+        manualChunks: resolveClientChunk,
+      },
+    },
+  },
   plugins: [
     react(),
-    runtimeOwnerLeasePlugin(),
-    radarCityRelayPlugin(),
-    liveProgramPlugin(),
-    liveSafetyGatewayPlugin(),
-    conversationHistoryPlugin(),
-    acceptanceLedgerPlugin(),
-    stressTestPlugin(),
-    runtimeSettingsPlugin(),
-    createSoulRuntimePlugin({
-      getRuntimeSettings: () =>
-        runtimeSettings ? JSON.parse(runtimeSettings) : null,
-      // The provider's observed tail occasionally exceeds the former 5.5s
-      // cutoff even with thinking disabled. This remains below the plugin's
-      // absolute 10s safety bound and does not add a retry/model call.
-      fastTimeoutMs: 8_000,
-      // Prompt target remains 420; this hard ceiling leaves room for a final
-      // brace instead of turning an otherwise valid M3 object into truncation.
-      fastMaxCompletionTokens: 600,
-      paths: {
-        ledgerPath: join(APP_ROOT, '.runtime', 'soul', 'ledger.jsonl'),
-        snapshotPath: join(APP_ROOT, '.runtime', 'soul', 'snapshot.json'),
-      },
-    }),
-    skillRoutingAgentPlugin(),
-    personaPlanningAgentPlugin(),
-    minimaxAudioBridgePlugin(),
-    liveRuntimeMonitorPlugin(),
-    typhoonContextPlugin(),
-    localTtsCapturePlugin(),
-    replyLatencyPlugin(),
+    shareRuntimeProxyWithPreview(),
+    ...[
+      runtimeOwnerLeasePlugin(),
+      radarCityRelayPlugin(),
+      liveProgramPlugin(),
+      liveSafetyGatewayPlugin(),
+      conversationHistoryPlugin(),
+      acceptanceLedgerPlugin(),
+      stressTestPlugin(),
+      runtimeSettingsPlugin(),
+      createSoulRuntimePlugin({
+        getRuntimeSettings: () =>
+          runtimeSettings ? JSON.parse(runtimeSettings) : null,
+        // The provider's observed tail occasionally exceeds the former 5.5s
+        // cutoff even with thinking disabled. This remains below the plugin's
+        // absolute 10s safety bound and does not add a retry/model call.
+        fastTimeoutMs: 8_000,
+        // Prompt target remains 420; this hard ceiling leaves room for a final
+        // brace instead of turning an otherwise valid M3 object into truncation.
+        fastMaxCompletionTokens: 600,
+        paths: {
+          ledgerPath: join(APP_ROOT, '.runtime', 'soul', 'ledger.jsonl'),
+          snapshotPath: join(APP_ROOT, '.runtime', 'soul', 'snapshot.json'),
+        },
+      }),
+      skillRoutingAgentPlugin(),
+      personaPlanningAgentPlugin(),
+      minimaxAudioBridgePlugin(),
+      liveRuntimeMonitorPlugin(),
+      typhoonContextPlugin(),
+      localTtsCapturePlugin(),
+      replyLatencyPlugin(),
+    ].map(exposeRuntimePluginInPreview),
   ],
   server: {
     proxy: {

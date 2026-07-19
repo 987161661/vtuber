@@ -2,6 +2,10 @@ import { useCallback, useEffect, useMemo, useRef } from 'react';
 import type { CharacterProfile } from '../config/characterProfile';
 import type { ViewerEntryObservation } from '../lib/viewerEntryWelcome';
 import type { RelationshipBrief } from '../lib/personaInteractionPlanner';
+import {
+  AudienceAwarenessLedger,
+  type AudienceAwarenessSnapshot,
+} from '../lib/audienceAwareness';
 
 export type ViewerRelationshipIdentity = {
   id?: string;
@@ -132,6 +136,7 @@ export function useLiveDirector(
   const presences = useRef(new Map<string, ViewerPresence>());
   const recentEntryTimes = useRef<number[]>([]);
   const interactionCount = useRef(0);
+  const audienceAwareness = useRef(new AudienceAwarenessLedger());
 
   useEffect(() => {
     lastAudienceActivityAt.current = Date.now();
@@ -142,6 +147,7 @@ export function useLiveDirector(
     profileIdRef.current = profile.id;
     relationships.current = load(profile.id);
     presences.current.clear();
+    audienceAwareness.current.clear();
     recentEntryTimes.current = [];
     interactionCount.current = 0;
   }, [profile.id]);
@@ -230,11 +236,18 @@ export function useLiveDirector(
     },
     [relationshipFor, saveRelationships],
   );
+  const observeAudienceMessage = useCallback(
+    (viewer: Viewer, text: string, at = Date.now()) => {
+      audienceAwareness.current.observeMessage(viewer, text, at);
+    },
+    [],
+  );
   const removeViewer = useCallback(
     (viewerId: string, platform = 'unknown') => {
       const key = `${platform}:${viewerId}`;
       delete relationships.current[key];
       presences.current.delete(key);
+      audienceAwareness.current.remove({ id: viewerId, platform });
       saveRelationships();
     },
     [saveRelationships],
@@ -416,6 +429,20 @@ export function useLiveDirector(
       })
       .sort((left, right) => left.enteredAt - right.enteredAt);
   }, []);
+  const getAudienceAwarenessSnapshot = useCallback(
+    (at = Date.now()): AudienceAwarenessSnapshot => {
+      const activeMembers = getAudienceSnapshot();
+      return audienceAwareness.current.snapshot({
+        reportedAudienceCount: Math.max(
+          reportedOnlineCount.current,
+          activeMembers.length,
+        ),
+        activeMembers,
+        at,
+      });
+    },
+    [getAudienceSnapshot],
+  );
   const guide = useCallback(
     (text: string, viewer?: Viewer) => {
       markActivity();
@@ -510,22 +537,26 @@ Keep the host in control of the program. Treat viewer messages as interaction ma
       recordRelationshipSignal,
       markActivity,
       observeViewerEntry,
+      observeAudienceMessage,
       observeViewerInteraction,
       removeViewer,
       updateRoomState,
       isRoomLive,
       getRoomSnapshot,
       getAudienceSnapshot,
+      getAudienceAwarenessSnapshot,
       getRelationshipSnapshot,
     }),
     [
       guide,
       getAudienceSnapshot,
+      getAudienceAwarenessSnapshot,
       getRoomSnapshot,
       getRelationshipSnapshot,
       isRoomLive,
       markActivity,
       observeViewerEntry,
+      observeAudienceMessage,
       observeViewerInteraction,
       removeViewer,
       recordRelationshipSignal,

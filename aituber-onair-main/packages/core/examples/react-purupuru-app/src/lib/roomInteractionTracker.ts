@@ -30,6 +30,10 @@ export type RoomInteractionSnapshot = RoomBatchContext & {
   /** Platform-reported or locally estimated audience; never assumed exact. */
   platformAudienceEstimate?: number;
   participantCountIsExact?: boolean;
+  audienceActivityMode?: 'empty' | 'active' | 'passive' | 'likely-resting';
+  activeAudienceCount?: number;
+  engageableAudienceCount?: number;
+  likelyRestingAudienceCount?: number;
 };
 
 const HOSTILE = /(?:滚|闭嘴|垃圾|废物|恶心|骗子|傻逼|蠢货|找打|去死)/u;

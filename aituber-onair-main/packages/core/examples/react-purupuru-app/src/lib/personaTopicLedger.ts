@@ -19,6 +19,11 @@ export interface PersonaTopicCandidate {
 }
 
 const SEMANTIC_FAMILIES: Array<[string, RegExp]> = [
+  [
+    'support_ack',
+    /点赞|点了赞|赞收|谢谢.*赞|感谢.*赞|亮一格|点亮|靠你们养|靠你们撑|多撑.*格/u,
+  ],
+  ['time_mood', /周[一二三四五六日天]|摸鱼|下班|还挂着|没处去|躲清静|躲清净/u],
   ['drinks', /茶|咖啡|饮料|水杯|茶杯|保温杯|喝水|泡了/u],
   ['food', /零食|吃饭|午饭|晚饭|夜宵|咸味|甜点/u],
   ['music', /音乐|歌曲|歌单|旋律|节奏|耳机/u],
@@ -88,12 +93,23 @@ export function isRecentSemanticTopicRepeat(
   });
 }
 
+/**
+ * Support acknowledgements are single-use interaction replies, never a source
+ * for later quiet-room monologues. Keeping this rule deterministic prevents a
+ * single like from driving an hour of paraphrased proactive speech.
+ */
+export function isSingleUseEngagementEcho(candidate: string): boolean {
+  return semanticFamilies(candidate).includes('support_ack');
+}
+
 function normalizedTokens(text: string) {
-  return text
-    .normalize('NFKC')
-    .toLowerCase()
-    .match(/[\p{Script=Han}]{2,6}|[a-z0-9]{3,16}/gu)
-    ?.slice(0, 4) ?? [];
+  return (
+    text
+      .normalize('NFKC')
+      .toLowerCase()
+      .match(/[\p{Script=Han}]{2,6}|[a-z0-9]{3,16}/gu)
+      ?.slice(0, 4) ?? []
+  );
 }
 
 export function inferTopicFamily(text: string, fallback = 'inner_life') {
@@ -116,18 +132,17 @@ export class PersonaTopicLedger {
   private readonly cooldownTurns: number;
   private readonly cooldownMs: number;
 
-  constructor(
-    maxEntries = 12,
-    cooldownTurns = 6,
-    cooldownMs = 30 * 60_000,
-  ) {
+  constructor(maxEntries = 12, cooldownTurns = 6, cooldownMs = 30 * 60_000) {
     this.maxEntries = maxEntries;
     this.cooldownTurns = cooldownTurns;
     this.cooldownMs = cooldownMs;
   }
 
   snapshot() {
-    return this.entries.map((entry) => ({ ...entry, entities: [...entry.entities] }));
+    return this.entries.map((entry) => ({
+      ...entry,
+      entities: [...entry.entities],
+    }));
   }
 
   isCooling(candidate: PersonaTopicCandidate, at = Date.now()) {

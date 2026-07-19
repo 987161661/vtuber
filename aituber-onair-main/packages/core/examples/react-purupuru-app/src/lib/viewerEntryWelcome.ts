@@ -27,7 +27,6 @@ function promptField(value: string, maxLength = 48): string {
 
 export function shouldWelcomeViewerEntry(
   observation: ViewerEntryObservation,
-  _maxAudience = SMALL_ROOM_WELCOME_MAX_AUDIENCE,
 ): boolean {
   return observation.isNewPresence && observation.estimatedAudience > 0;
 }

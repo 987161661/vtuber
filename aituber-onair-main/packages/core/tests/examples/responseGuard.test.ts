@@ -66,7 +66,8 @@ describe('guardViewerResponse', () => {
   });
 
   it('unwraps a fenced speech plan instead of speaking its JSON envelope', () => {
-    const spoken = '\u5317\u4eac\u73b0\u5728\u662f\u4e8c\u7ea7\u897f\u5357\u98ce\u3002';
+    const spoken =
+      '\u5317\u4eac\u73b0\u5728\u662f\u4e8c\u7ea7\u897f\u5357\u98ce\u3002';
     const result = guardViewerResponse(
       `\`\`\`json\n${JSON.stringify({ version: 2, beats: [{ text: spoken }] })}\n\`\`\``,
     );
@@ -82,10 +83,10 @@ describe('guardViewerResponse', () => {
     const result = guardViewerResponse(
       '{"text":"\\u4f1a\\u4e0b\\u96e8","emotion":"neutral"',
       {
-      isWeather: true,
-      viewerText: '\u5317\u4eac\u5929\u6c14\u600e\u4e48\u6837',
-      requiredAnswer,
-      claims: [{ text: requiredAnswer }],
+        isWeather: true,
+        viewerText: '\u5317\u4eac\u5929\u6c14\u600e\u4e48\u6837',
+        requiredAnswer,
+        claims: [{ text: requiredAnswer }],
       },
     );
 
@@ -117,7 +118,8 @@ describe('guardViewerResponse', () => {
       '\u60e0\u5dde\u4eca\u665a\u6ca1\u6709\u96e8\u707e\uff0c\u5c40\u90e8\u53ea\u4f1a\u6709\u9635\u96e8\u3002',
       {
         isWeather: true,
-        viewerText: '\u6211\u5728\u60e0\u5dde\uff0c\u6709\u6ca1\u6709\u96e8\u707e',
+        viewerText:
+          '\u6211\u5728\u60e0\u5dde\uff0c\u6709\u6ca1\u6709\u96e8\u707e',
         requiredAnswer:
           '\u5f53\u524d\u6280\u80fd\u6ca1\u6709\u53d6\u5f97\u60e0\u5dde\u5e02\u53ef\u6838\u5b9e\u7684\u96e8\u707e\u3001\u6d2a\u6c34\u3001\u5185\u6d9d\u6216\u5b98\u65b9\u9884\u8b66\u8d44\u6599\uff0c\u6240\u4ee5\u4e0d\u80fd\u5224\u65ad\u73b0\u5728\u6709\u6ca1\u6709\u96e8\u707e\u3002',
         claims: [],
@@ -125,7 +127,9 @@ describe('guardViewerResponse', () => {
     );
 
     expect(result.text).toContain('\u4e0d\u80fd\u5224\u65ad');
-    expect(result.text).not.toContain('\u60e0\u5dde\u4eca\u665a\u6ca1\u6709\u96e8\u707e');
+    expect(result.text).not.toContain(
+      '\u60e0\u5dde\u4eca\u665a\u6ca1\u6709\u96e8\u707e',
+    );
     expect(result.reasons).toContain('no_fact_claims');
   });
 
@@ -209,6 +213,30 @@ describe('guardViewerResponse', () => {
     expect(result.rewritten).toBe(false);
     expect(result.reasons).toEqual([]);
     expect(result.text).toContain('南京现在30.8度');
+  });
+
+  it('does not reinterpret a viewer rain report as window condensation', () => {
+    const requiredAnswer =
+      '四平市，吉林省城市代表点当前雾，气温 20℃，当前降水 0 毫米。未来两小时无降水。城市代表点资料不代表全市每个位置。';
+    const result = guardViewerResponse(
+      '四平城市代表点当前没有降水——你看到的可能是雾气沾在窗户上，显得像在下雨。',
+      {
+        isWeather: true,
+        viewerText: '我真服了，怎么还下雨啊？',
+        requiredAnswer,
+        claims: [
+          {
+            type: 'representative_point_observation',
+            text: '四平市城市代表点当前雾，当前降水 0 毫米',
+          },
+          { type: 'minutely_forecast', text: '未来两小时无降水' },
+        ],
+      },
+    );
+
+    expect(result.reasons).toContain('unsupported_viewer_observation_rewrite');
+    expect(result.text).toContain('不代表全市每个位置');
+    expect(result.text).not.toContain('窗户');
   });
 
   it('replaces unsupported naming lore when the viewer asked for a storm lifecycle', () => {

@@ -2,12 +2,16 @@ import { describe, expect, it } from 'vitest';
 import {
   isCurrentBroadcastFault,
   isProductionEvent,
-  routeFor,
-} from '../../examples/react-purupuru-app/src/components/BroadcastTopologyPanel';
+  routeBroadcastEvent,
+} from '../../examples/react-purupuru-app/src/lib/broadcastTopology';
 
 describe('Soul-aware broadcast topology', () => {
   it('closes a fault detail after the runtime fault is cleared or replaced', () => {
-    const reference = { nodeId: 'persona', at: 100, stage: 'soul_fast_fallback' };
+    const reference = {
+      nodeId: 'persona',
+      at: 100,
+      stage: 'soul_fast_fallback',
+    };
 
     expect(
       isCurrentBroadcastFault(reference, {
@@ -42,12 +46,15 @@ describe('Soul-aware broadcast topology', () => {
     ['soul_outcome_committed', 'playback'],
     ['soul_delivered_projection_committed', 'playback'],
   ] as const)('maps %s to the %s causal node', (stage, node) => {
-    expect(routeFor({ eventId: 'event-1', stage }).node).toBe(node);
+    expect(routeBroadcastEvent({ eventId: 'event-1', stage }).node).toBe(node);
   });
 
   it('continues to show legacy persona planning during shadow migration', () => {
     expect(
-      routeFor({ eventId: 'event-1', stage: 'persona_plan_completed' }),
+      routeBroadcastEvent({
+        eventId: 'event-1',
+        stage: 'persona_plan_completed',
+      }),
     ).toMatchObject({ node: 'persona', activeEdges: ['persona-model'] });
   });
 });

@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   buildLandfallStatus,
+  buildOutlookRequiredAnswer,
   buildRequiredAnswer,
   extractNamedTyphoonQuery,
   extractSpecificPlace,
@@ -10,6 +11,25 @@ import {
   selectStormsForQuestion,
   stormLocationAnswer,
 } from './query_typhoon_radar.mjs';
+
+test('recognizes genesis-outlook questions and preserves regional probability semantics', () => {
+  assert.equal(intentFor('下一个台风胚胎可能在哪里，成台概率多大？'), 'outlook');
+  const answer = buildOutlookRequiredAnswer({
+    generatedAt: '2026-07-19T15:12:51.424Z',
+    nearTermDisturbances: [],
+    extendedRangeAreas: [{
+      week: 2,
+      probabilityPercent: 20,
+      validPeriod: '07/22/2026 - 07/28/2026',
+      center: { latitude: 13.6, longitude: 140.3 },
+    }],
+  });
+  assert.match(answer, /JTWC未来24小时当前未列出/);
+  assert.match(answer, /第2周区域生成概率20%/);
+  assert.match(answer, /13\.6°N、140\.3°E/);
+  assert.match(answer, /不是单个胚胎的定点成台概率/);
+  assert.match(answer, /7月19日 23:12/);
+});
 
 test('answers a historical named storm from its archived final classification', () => {
   const history = {

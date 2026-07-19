@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   extractWeatherLocation,
   getWeatherLocationClarification,
+  routedWeatherLocationClarification,
   isDedicatedTyphoonRoomStatusQuestion,
   routeSoulSkillDeterministically,
   routeTyphoonSkillWithAgent,
@@ -48,7 +49,10 @@ describe('routeSoulSkillDeterministically', () => {
   });
 
   it.each([
-    ['\u559c\u6b22\u7684\u8bdd\u53ef\u4ee5\u5173\u6ce8\u4e00\u4e0b', '\u5173\u6ce8'],
+    [
+      '\u559c\u6b22\u7684\u8bdd\u53ef\u4ee5\u5173\u6ce8\u4e00\u4e0b',
+      '\u5173\u6ce8',
+    ],
     ['\u4f60\u8fd9\u4e2a\u5de5\u5177\u4eba\uff0c\u95ed\u5634', '\u8fb9\u754c'],
   ])(
     'keeps %s in companion mode for the single Soul model to appraise (%s)',
@@ -268,6 +272,67 @@ describe('routeTyphoonSkillWithAgent', () => {
       skillQuery: '北京',
     });
     expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('inherits a recently declared city only from the same live-room viewer', () => {
+    const now = Date.now();
+    const decision = routeSoulSkillDeterministically({
+      text: '\u5c34\u5c2c\u76842r\u8702\u533b \u7684\u5f39\u5e55\uff1a\u6211\u771f\u670d\u4e86\uff0c\u600e\u4e48\u8fd8\u4e0b\u96e8\u554a\uff1f',
+      viewerId: 'viewer-siping',
+      sourceLabel: 'bilibili',
+      turns: [
+        {
+          eventId: 'prior-location',
+          at: now - 60_000,
+          input:
+            '\u5c34\u5c2c\u76842r\u8702\u533b \u7684\u5f39\u5e55\uff1a\u6211\u5728\u5409\u6797\u56db\u5e73\u5e02',
+          viewerId: 'viewer-siping',
+          sourceLabel: 'bilibili',
+          sourcesSeen: ['bilibili-internal'],
+        },
+        {
+          eventId: 'other-viewer-location',
+          at: now - 30_000,
+          input:
+            '\u5176\u4ed6\u89c2\u4f17 \u7684\u5f39\u5e55\uff1a\u6211\u5728\u5317\u4eac\u5e02',
+          viewerId: 'viewer-beijing',
+          sourceLabel: 'bilibili',
+        },
+      ],
+    });
+
+    expect(decision).toMatchObject({
+      reason: 'city_weather_context_route',
+      mode: 'weather',
+      intent: 'city_weather_query',
+      skillIds: ['city-weather'],
+      skillQuery: '\u5409\u6797\u56db\u5e73\u5e02',
+    });
+  });
+
+  it('does not treat conversational residue as an explicit weather location', () => {
+    expect(
+      extractWeatherLocation(
+        '\u6211\u771f\u670d\u4e86\uff0c\u600e\u4e48\u8fd8\u4e0b\u96e8\u554a\uff1f',
+      ),
+    ).toBeNull();
+  });
+
+  it('does not let the clarification shortcut override a contextual weather route', () => {
+    expect(
+      routedWeatherLocationClarification(
+        '\u600e\u4e48\u8fd8\u4e0b\u96e8\u554a\uff1f',
+        { intent: 'city_weather_query' },
+      ),
+    ).toBeNull();
+    expect(
+      routedWeatherLocationClarification(
+        '\u600e\u4e48\u8fd8\u4e0b\u96e8\u554a\uff1f',
+        {
+          intent: 'clarify_location',
+        },
+      ),
+    ).toContain('\u57ce\u5e02');
   });
 
   it('extracts the city from the durable live-room viewer envelope', async () => {

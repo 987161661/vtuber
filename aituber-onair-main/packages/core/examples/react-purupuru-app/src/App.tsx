@@ -1,7 +1,13 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import {
+  lazy,
+  Suspense,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from 'react';
 import { ChatPanel } from './components/ChatPanel';
-import { ControlRoom } from './components/ControlRoom';
-import { SettingsPanel } from './components/SettingsPanel';
 import type { StressRunState } from './components/StressTestPanel';
 import {
   LINGLAN_PROFILE,
@@ -17,6 +23,7 @@ import { useLiveDirector } from './hooks/useLiveDirector';
 import { useLiveHostCoordinator } from './hooks/useLiveHostCoordinator';
 import { useLivePlatformEvents } from './hooks/useLivePlatformEvents';
 import { useRuntimeOwnerLease } from './hooks/useRuntimeOwnerLease';
+import { useSoulCanaryController } from './hooks/useSoulCanaryController';
 import { useScreenVisionController } from './hooks/useScreenVisionController';
 import { useSettings } from './hooks/useSettings';
 import { useSocialStreamBus } from './hooks/useSocialStreamBus';
@@ -29,6 +36,18 @@ import {
   normalizeCityReportEngagementPayload,
 } from './lib/cityReportEngagementPolicy';
 import {
+  cityReportFactSnapshot,
+  parseCityReportPayloadV2,
+  prepareIsolatedCityReport,
+} from './lib/cityReportIsolation';
+import {
+  createTurnEnvelopeV2,
+  matchesTurnAttempt,
+  transitionStoredTurn,
+  transitionTurn,
+  type TurnEnvelopeV2,
+} from './lib/turnEnvelope';
+import {
   hasSoulPrimaryEvidence,
   type AcceptanceFingerprint,
   type AcceptanceLedger,
@@ -39,7 +58,12 @@ import {
   isQuietRoomInteraction,
   minimumQuietIntervalMs,
 } from './lib/emptyRoomAwareness';
-import { parseFlashHeadBundle } from './lib/flashheadBundle';
+import {
+  createSpeakingAvatarHttpRenderer,
+  createSpeakingMediaPipeline,
+  getAudioPlaybackTimeoutMs,
+  type SpeakingRenderTrace,
+} from './lib/speakingMediaPipeline';
 import { resolveEffectiveLiveRoomStatus } from './lib/liveRoomRuntimeState';
 import { routeSimulatorEventForQueue } from './lib/simulatorRoom';
 import {
@@ -62,9 +86,9 @@ import {
   relayRadarCityComment,
 } from './lib/radarCityBridge';
 import {
-  getWeatherLocationClarification,
   routeSoulSkillDeterministically,
   routeTyphoonSkillWithAgent,
+  routedWeatherLocationClarification,
 } from './lib/skillRoutingAgent';
 import {
   formatPersonaInteractionPlan,
@@ -78,7 +102,10 @@ import {
   type PersonaRuntimeTransition,
   type ProactiveIntentPlanV1,
 } from './lib/personaRuntimeState';
-import { isRecentSemanticTopicRepeat } from './lib/personaTopicLedger';
+import {
+  isRecentSemanticTopicRepeat,
+  isSingleUseEngagementEcho,
+} from './lib/personaTopicLedger';
 import {
   buildViewerEntryWelcomePrompt,
   shouldWelcomeViewerEntry,
@@ -141,12 +168,33 @@ import {
 import type { LiveLifecycleTransition } from './lib/liveResponseScheduler';
 import type { RoomInteractionSnapshot } from './lib/roomInteractionTracker';
 import {
-  isStaleReadyReply,
+  operatorInteractionAccountingQueue,
+  operatorQueueClient,
   type OperatorQueueItem,
   type PreparedSpeechPlan,
   updateOperatorQueue,
 } from './lib/operatorQueue';
+import { accountViewerInteraction } from './lib/viewerInteractionAccounting';
+import { planOperatorTurnWork } from './lib/operatorTurnWorker';
+import { settleOperatorDraft } from './lib/operatorDraftSettlement';
+import {
+  classifyOperatorGenerationFailure,
+  recoverOperatorPreparation,
+  type CapturedGenerationFailure,
+} from './lib/operatorPreparationRecovery';
+import { GenerationFailureCoordinator } from './lib/generationFailureCoordinator';
+import { settleOperatorSpeechFailure } from './lib/operatorSpeechFailureSettlement';
+import {
+  projectSpeechTerminalOutcome,
+  projectUndeliveredSpeech,
+} from './lib/speechTerminalProjection';
+import { settleScopeTransitionTerminals } from './lib/scopeTransitionSettlement';
 import { STRESS_TEST_PLAN } from './lib/stressTestPlan';
+import {
+  parseStressDiagnostics,
+  projectStressRunState,
+  type StressApiRecord,
+} from './lib/stressRunProjection';
 import {
   AvatarBehaviorBus,
   createAvatarBehaviorEvent,
@@ -186,11 +234,24 @@ import {
 } from './lib/soulCanonRepository';
 import { evaluateSoulReflectionPolicy } from './lib/soulReflectionPolicy';
 import {
-  hasCompleteDeliveryEvidence,
   isLiveHostCoordinatorRequired,
   resolveAuthoritativeSpeechHints,
-  resolveIncompleteDelivery,
+  resolveSpeechOutcome,
 } from './lib/liveHostDelivery';
+import {
+  createReplyLatencyHttpReporter,
+  createReplyLatencyTracker,
+  type ReplyModelTrace,
+} from './lib/replyLatencyTracker';
+
+const ControlRoom = lazy(async () => {
+  const module = await import('./components/ControlRoom');
+  return { default: module.ControlRoom };
+});
+const SettingsPanel = lazy(async () => {
+  const module = await import('./components/SettingsPanel');
+  return { default: module.SettingsPanel };
+});
 
 type AvatarPackageSource = 'default' | 'user';
 const EMPTY_STRESS_RUN: StressRunState = {
@@ -201,78 +262,8 @@ const EMPTY_STRESS_RUN: StressRunState = {
   queue: { waiting: 0, drafting: 0, ready: 0, speaking: 0 },
   failures: [],
 };
-type StressApiRecord = Record<string, unknown>;
 
-type SoulCanaryActiveSummary = {
-  runId: string;
-  scope: SoulScopeV1;
-  startedAt: number;
-  runtimeOwnerClaimedAt?: number;
-};
-
-type SoulCanaryOperatorCredential = SoulCanaryActiveSummary & {
-  version: 1;
-  operatorToken: string;
-};
-
-type SoulCanaryRuntimeCredential = SoulCanaryActiveSummary & {
-  eventToken: string;
-  ownerId: string;
-};
-
-const SOUL_CANARY_OPERATOR_SESSION_KEY = 'aituber:soul-canary-operator:v1';
 const SOUL_CANARY_MIN_DURATION_MS = 2 * 60 * 60_000;
-
-function sameSoulScope(left: SoulScopeV1, right: SoulScopeV1): boolean {
-  return (
-    left.personaId === right.personaId &&
-    left.platform === right.platform &&
-    left.roomId === right.roomId &&
-    left.sessionId === right.sessionId
-  );
-}
-
-function readSoulCanaryOperatorCredential(): SoulCanaryOperatorCredential | null {
-  try {
-    const parsed = JSON.parse(
-      sessionStorage.getItem(SOUL_CANARY_OPERATOR_SESSION_KEY) || 'null',
-    ) as Partial<SoulCanaryOperatorCredential> | null;
-    if (
-      parsed?.version !== 1 ||
-      typeof parsed.runId !== 'string' ||
-      typeof parsed.operatorToken !== 'string' ||
-      !/^[a-f0-9]{64}$/u.test(parsed.operatorToken) ||
-      typeof parsed.startedAt !== 'number' ||
-      !parsed.scope ||
-      typeof parsed.scope.personaId !== 'string' ||
-      typeof parsed.scope.platform !== 'string' ||
-      typeof parsed.scope.roomId !== 'string' ||
-      typeof parsed.scope.sessionId !== 'string'
-    ) {
-      return null;
-    }
-    return parsed as SoulCanaryOperatorCredential;
-  } catch {
-    return null;
-  }
-}
-
-function persistSoulCanaryOperatorCredential(
-  credential: SoulCanaryOperatorCredential | null,
-): void {
-  try {
-    if (credential) {
-      sessionStorage.setItem(
-        SOUL_CANARY_OPERATOR_SESSION_KEY,
-        JSON.stringify(credential),
-      );
-    } else {
-      sessionStorage.removeItem(SOUL_CANARY_OPERATOR_SESSION_KEY);
-    }
-  } catch {
-    // A private browsing/storage failure must not weaken server validation.
-  }
-}
 
 function scopedViewerId(
   viewerId?: string,
@@ -407,41 +398,6 @@ function soulCanonMemoryRefs(
     }));
 }
 
-function parseStressDiagnostics(value: unknown): StressRunState['diagnostics'] {
-  if (!value || typeof value !== 'object') return undefined;
-  const checks = (value as StressApiRecord).checks;
-  if (!Array.isArray(checks)) return undefined;
-  return checks.flatMap((raw, index) => {
-    if (!raw || typeof raw !== 'object') return [];
-    const check = raw as StressApiRecord;
-    const level = check.level;
-    if (level !== 'pass' && level !== 'warning' && level !== 'error') return [];
-    return [
-      {
-        id: typeof check.id === 'string' ? check.id : `diagnostic-${index}`,
-        level,
-        code:
-          typeof check.code === 'string' ? check.code : 'unknown_diagnostic',
-        summary:
-          typeof check.summary === 'string'
-            ? check.summary
-            : 'No diagnostic summary.',
-        detail: typeof check.detail === 'string' ? check.detail : undefined,
-      },
-    ];
-  });
-}
-
-type RenderedSpeakingMedia = {
-  videoUrl: string;
-  audioBuffer: ArrayBuffer;
-  durationSeconds: number;
-};
-type SpeechRenderTrace = {
-  requestId: string;
-  source: 'chat' | 'live' | 'vision';
-  text: string;
-};
 type ConversationOrigin = {
   channel: string;
   label: string;
@@ -451,6 +407,7 @@ type ConversationOrigin = {
 };
 type ActiveLifecycle = ConversationOrigin & {
   eventId: string;
+  attemptId?: string;
   replyText?: string;
   deliveredConnectorTargets?: Set<string>;
   ttsRequestAt?: number;
@@ -473,47 +430,6 @@ type PendingDeliveredInteraction = {
   sourceLabel?: string;
   sourcesSeen?: string[];
 };
-type PendingGenerationFailure = {
-  reason:
-    | 'generation_auth_failed'
-    | 'generation_truncated'
-    | 'generation_failed';
-  error: string;
-  retryable: boolean;
-};
-type ReplyLatencyTrace = {
-  requestId: string;
-  source: 'chat' | 'live' | 'vision';
-  inputAt: number;
-  models: {
-    llm: { provider: string; model: string };
-    tts: { engine: string; model: string; speaker: string };
-    lipSync: {
-      engine: string;
-      model: string;
-      mode: 'streaming' | 'full-audio';
-    };
-  };
-  input?: string;
-  reply?: string;
-  eventId?: string;
-  origin?: {
-    channel: string;
-    requestId?: string;
-    viewerId?: string;
-    viewerName?: string;
-    commentAt?: number;
-    receivedAt?: number;
-    sourcesSeen?: string[];
-  };
-  llmCompletedAt?: number;
-  ttsRequestedAt?: number;
-  ttsFirstByteAt?: number;
-  flashHeadFirstFrameAt?: number;
-  firstPlaybackAt?: number;
-  speechEndSignaledAt?: number;
-};
-
 const INTERACTION_STAGES = new Set<LiveLifecycleTransition['stage']>([
   'received',
   'deduplicated',
@@ -577,18 +493,6 @@ function toInteractionTransition(
   };
 }
 
-// FlashHead returns generated media behind the TTS stream. Keep enough ready
-// media to bridge one normal render instead of starting after a single slice
-// and then repeatedly running dry.
-const FLASHHEAD_START_BUFFER_SECONDS = 2.5;
-// This remains a latency cap for an unusually slow stream, but must not force
-// playback before the normal continuity buffer has had a chance to fill.
-const FLASHHEAD_PLAYBACK_START_WAIT_MS = 2_800;
-
-// Speech always outranks an optional avatar render. If the local renderer is
-// offline or cold, fall back to the idle avatar quickly and play the verified
-// TTS audio instead of turning a short render delay into a silent reply.
-const SPEAKING_RENDER_TIMEOUT_MS = 6_000;
 // This is a *no-progress* watchdog, not a whole-reply deadline.  A real
 // MiniMax reply may contain several separately synthesized sentences, so a
 // fixed timer armed only at screenplay start used to kill valid playback after
@@ -599,30 +503,6 @@ const OPERATOR_SPEECH_WATCHDOG_MS = 45_000;
 const OPERATOR_TTS_START_TIMEOUT_MS = 15_000;
 const OPERATOR_GENERATION_RECOVERY_MS = 35_000;
 const NO_REPLY_TOKEN = '[[NO_REPLY]]';
-async function getAudioPlaybackTimeoutMs(arrayBuffer: ArrayBuffer) {
-  const url = URL.createObjectURL(new Blob([arrayBuffer.slice(0)]));
-  try {
-    const duration = await new Promise<number>((resolve) => {
-      const audio = new Audio();
-      const timeout = window.setTimeout(() => resolve(Number.NaN), 3_000);
-      const finish = (value: number) => {
-        window.clearTimeout(timeout);
-        audio.removeAttribute('src');
-        resolve(value);
-      };
-      audio.preload = 'metadata';
-      audio.onloadedmetadata = () => finish(audio.duration);
-      audio.onerror = () => finish(Number.NaN);
-      audio.src = url;
-    });
-    return Number.isFinite(duration)
-      ? Math.ceil((duration + 2) * 1_000)
-      : 30_000;
-  } finally {
-    URL.revokeObjectURL(url);
-  }
-}
-
 export default function App() {
   const query = new URLSearchParams(window.location.search);
   // The coordinator owns every public speech turn. This is intentionally not
@@ -749,6 +629,7 @@ export default function App() {
   } = useInteractionFeed();
   const [operatorQueue, setOperatorQueue] = useState<OperatorQueueItem[]>([]);
   const operatorQueueRef = useRef<OperatorQueueItem[]>([]);
+  const turnEnvelopeByEventIdRef = useRef(new Map<string, TurnEnvelopeV2>());
   operatorQueueRef.current = operatorQueue;
   const [stressRun, setStressRun] = useState<StressRunState>(EMPTY_STRESS_RUN);
   const recentLiveTurnsRef = useRef<RecentLiveTurn[]>([]);
@@ -756,9 +637,11 @@ export default function App() {
   const radarCityCommandRouterRef = useRef(createRadarCityCommandRouter());
   const preparingOperatorTaskRef = useRef<string | null>(null);
   const generationFailureByEventIdRef = useRef(
-    new Map<string, PendingGenerationFailure>(),
+    new Map<string, CapturedGenerationFailure>(),
   );
-  const generationFailureQueueMutationRef = useRef(new Set<string>());
+  const generationFailureCoordinatorRef = useRef(
+    new GenerationFailureCoordinator(),
+  );
   const speakingOperatorTaskRef = useRef<string | null>(null);
   const runtimeOwnerIdRef = useRef(`runtime-${crypto.randomUUID()}`);
   const operatorPlaybackObservedRef = useRef(false);
@@ -852,19 +735,9 @@ export default function App() {
     [soulScope],
   );
   const soulScopeKey = `${soulScope.personaId}\u0000${soulScope.platform}\u0000${soulScope.roomId}\u0000${soulScope.sessionId}`;
-  const [soulCanaryOperatorCredential, setSoulCanaryOperatorCredential] =
-    useState<SoulCanaryOperatorCredential | null>(() =>
-      readSoulCanaryOperatorCredential(),
-    );
-  const [activeSoulCanary, setActiveSoulCanary] =
-    useState<SoulCanaryActiveSummary | null>(null);
-  const [soulCanaryBusy, setSoulCanaryBusy] = useState<
-    'starting' | 'finishing' | 'aborting' | undefined
-  >();
-  const [soulCanaryError, setSoulCanaryError] = useState('');
-  const [soulCanaryClock, setSoulCanaryClock] = useState(Date.now());
-  const soulCanaryRuntimeCredentialRef =
-    useRef<SoulCanaryRuntimeCredential | null>(null);
+  const soulCanaryRuntimeHeadersRef = useRef<() => Record<string, string>>(
+    () => ({}),
+  );
   const {
     dispatch: dispatchLiveHostEvent,
     snapshot: liveHostSnapshot,
@@ -983,7 +856,7 @@ export default function App() {
     soulControlState.cognitionFreezeOrigin,
     soulControlState.cognitionFrozen,
   ]);
-  const replyModelTrace = useMemo<ReplyLatencyTrace['models']>(
+  const replyModelTrace = useMemo<ReplyModelTrace>(
     () => ({
       llm: {
         provider: settingsHook.settings.llm.provider,
@@ -1082,6 +955,12 @@ export default function App() {
   const unsupportedAvatarActionCountRef = useRef(0);
   const [unsupportedAvatarActionCount, setUnsupportedAvatarActionCount] =
     useState(0);
+  const [reliabilityMetrics, setReliabilityMetrics] = useState({
+    bindingErrors: 0,
+    staleCallbacks: 0,
+    proactiveRepeatSuppressions: 0,
+    coordinatorRecoveries: 0,
+  });
   const avatarBehaviorBusRef = useRef<AvatarBehaviorBus | null>(null);
   const lastAvatarBehaviorBeatRef = useRef('');
   if (!avatarBehaviorBusRef.current) {
@@ -1168,6 +1047,7 @@ export default function App() {
   const emptyRoomAwarenessPlannerRef = useRef<EmptyRoomAwarenessPlanner | null>(
     null,
   );
+  const lastAudienceAwarenessEventRef = useRef('');
   if (!emptyRoomAwarenessPlannerRef.current) {
     emptyRoomAwarenessPlannerRef.current = new EmptyRoomAwarenessPlanner(
       Math.random,
@@ -1175,8 +1055,27 @@ export default function App() {
     );
   }
   const activeLifecycleRef = useRef<ActiveLifecycle | null>(null);
-  const speechRenderTraceRef = useRef<SpeechRenderTrace | null>(null);
-  const replyLatencyRef = useRef<ReplyLatencyTrace | null>(null);
+  const readSpeechDeliveryEvidence = useCallback(
+    () => ({
+      beatCount: operatorBeatCountRef.current,
+      completedBeatCount: operatorCompletedBeatCountRef.current,
+      audioByteLength: operatorAudioByteLengthRef.current,
+      playbackObserved:
+        operatorPlaybackObservedRef.current ||
+        Boolean(activeLifecycleRef.current?.ttsStartAt),
+    }),
+    [],
+  );
+  const speechRenderTraceRef = useRef<SpeakingRenderTrace | null>(null);
+  const replyLatencyTracker = useMemo(
+    () =>
+      createReplyLatencyTracker({
+        now: Date.now,
+        createId: () => crypto.randomUUID(),
+        report: createReplyLatencyHttpReporter(fetch),
+      }),
+    [],
+  );
   const [avatarReaction, setAvatarReaction] = useState<PuruPuruReaction | null>(
     null,
   );
@@ -1198,36 +1097,40 @@ export default function App() {
       };
       const headers: Record<string, string> = {
         'Content-Type': 'application/json',
+        ...soulCanaryRuntimeHeadersRef.current(),
       };
-      const canaryCredential = soulCanaryRuntimeCredentialRef.current;
-      if (
-        isLiveRuntimeOwner &&
-        soulRuntimeMode === 'canary' &&
-        canaryCredential?.ownerId === runtimeOwnerId &&
-        sameSoulScope(canaryCredential.scope, soulScope)
-      ) {
-        headers['X-Soul-Canary-Run'] = canaryCredential.runId;
-        headers['X-Soul-Canary-Token'] = canaryCredential.eventToken;
-        headers['X-Runtime-Owner-Id'] = runtimeOwnerId;
-      }
       void fetch('/api/live-runtime-events', {
         method: 'POST',
         headers,
         body: JSON.stringify(runtimeEvent),
       }).catch(() => undefined);
     },
-    [
-      isLiveRuntimeOwner,
-      recordInteraction,
-      runtimeOwnerId,
-      soulRuntimeMode,
-      soulScope,
-    ],
+    [recordInteraction, soulRuntimeMode, soulScope],
   );
+  const soulCanary = useSoulCanaryController({
+    runtimeMode: soulRuntimeMode,
+    scope: soulScope,
+    isRuntimeOwner: isLiveRuntimeOwner,
+    runtimeOwnerId,
+    emitRuntimeEvent,
+    refreshPrimaryGate: refreshSoulPrimaryGate,
+  });
+  soulCanaryRuntimeHeadersRef.current = soulCanary.runtimeEventHeaders;
+  const {
+    active: activeSoulCanary,
+    operatorCredential: soulCanaryOperatorCredential,
+    busy: soulCanaryBusy,
+    error: soulCanaryError,
+    clock: soulCanaryClock,
+    start: startSoulCanary,
+    finish: finishSoulCanary,
+    abort: abortSoulCanary,
+  } = soulCanary;
   const emitSoulRecoveryEventRef = useRef(emitRuntimeEvent);
   emitSoulRecoveryEventRef.current = emitRuntimeEvent;
   useEffect(() => {
     if (
+      !isLiveRuntimeOwner ||
       runtimeProfile.id !== LINGLAN_SOUL_CONSTITUTION.personaId ||
       soulRuntimeMode === 'legacy'
     ) {
@@ -1285,279 +1188,13 @@ export default function App() {
     return () => {
       cancelled = true;
     };
-  }, [runtimeProfile.id, soulRuntimeMode, soulScope, soulScopeKey]);
-  useEffect(() => {
-    let cancelled = false;
-    const refresh = async () => {
-      const response = await fetch('/api/acceptance-ledger?activeCanary=1', {
-        cache: 'no-store',
-      });
-      if (!response.ok) return;
-      const payload = (await response.json()) as {
-        activeCanaries?: SoulCanaryActiveSummary[];
-      };
-      if (cancelled) return;
-      const active = Array.isArray(payload.activeCanaries)
-        ? (payload.activeCanaries[0] ?? null)
-        : null;
-      setActiveSoulCanary(active);
-      setSoulCanaryOperatorCredential((current) => {
-        if (!current || active?.runId === current.runId) return current;
-        persistSoulCanaryOperatorCredential(null);
-        return null;
-      });
-    };
-    void refresh().catch(() => undefined);
-    const timer = window.setInterval(
-      () => void refresh().catch(() => undefined),
-      5_000,
-    );
-    return () => {
-      cancelled = true;
-      window.clearInterval(timer);
-    };
-  }, []);
-  useEffect(() => {
-    if (!activeSoulCanary) return;
-    setSoulCanaryClock(Date.now());
-    const timer = window.setInterval(
-      () => setSoulCanaryClock(Date.now()),
-      30_000,
-    );
-    return () => window.clearInterval(timer);
-  }, [activeSoulCanary]);
-  useEffect(() => {
-    if (!isLiveRuntimeOwner || soulRuntimeMode !== 'canary') {
-      soulCanaryRuntimeCredentialRef.current = null;
-      return;
-    }
-    let cancelled = false;
-    const claimActiveCanary = async () => {
-      const activeResponse = await fetch(
-        '/api/acceptance-ledger?activeCanary=1',
-        { cache: 'no-store' },
-      );
-      if (!activeResponse.ok) return;
-      const activePayload = (await activeResponse.json()) as {
-        activeCanaries?: SoulCanaryActiveSummary[];
-      };
-      const active = activePayload.activeCanaries?.find((candidate) =>
-        sameSoulScope(candidate.scope, soulScope),
-      );
-      if (!active) {
-        soulCanaryRuntimeCredentialRef.current = null;
-        return;
-      }
-      const current = soulCanaryRuntimeCredentialRef.current;
-      if (
-        current?.runId === active.runId &&
-        current.ownerId === runtimeOwnerId
-      ) {
-        return;
-      }
-      const response = await fetch('/api/acceptance-ledger', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'X-Runtime-Owner-Id': runtimeOwnerId,
-        },
-        body: JSON.stringify({
-          action: 'claim-soul-canary-runtime',
-          scope: soulScope,
-        }),
-      });
-      if (!response.ok) return;
-      const claimed = (await response.json()) as {
-        runId?: unknown;
-        eventToken?: unknown;
-        scope?: SoulScopeV1;
-        startedAt?: unknown;
-      };
-      if (
-        cancelled ||
-        typeof claimed.runId !== 'string' ||
-        typeof claimed.eventToken !== 'string' ||
-        !/^[a-f0-9]{64}$/u.test(claimed.eventToken) ||
-        typeof claimed.startedAt !== 'number' ||
-        !claimed.scope
-      ) {
-        return;
-      }
-      soulCanaryRuntimeCredentialRef.current = {
-        runId: claimed.runId,
-        eventToken: claimed.eventToken,
-        scope: claimed.scope,
-        startedAt: claimed.startedAt,
-        ownerId: runtimeOwnerId,
-      };
-      emitRuntimeEvent({
-        stage: 'soul_canary_runtime_claimed',
-        at: Date.now(),
-        runId: claimed.runId,
-      });
-    };
-    void claimActiveCanary().catch(() => undefined);
-    const timer = window.setInterval(
-      () => void claimActiveCanary().catch(() => undefined),
-      5_000,
-    );
-    return () => {
-      cancelled = true;
-      window.clearInterval(timer);
-    };
   }, [
-    emitRuntimeEvent,
     isLiveRuntimeOwner,
-    runtimeOwnerId,
+    runtimeProfile.id,
     soulRuntimeMode,
     soulScope,
+    soulScopeKey,
   ]);
-  const startSoulCanary = useCallback(async () => {
-    if (soulRuntimeMode !== 'canary') {
-      setSoulCanaryError('请先将 Soul Runtime 切换为 Canary。');
-      return;
-    }
-    setSoulCanaryBusy('starting');
-    setSoulCanaryError('');
-    try {
-      const response = await fetch('/api/acceptance-ledger', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'X-Runtime-Settings-Role': 'producer',
-        },
-        body: JSON.stringify({
-          action: 'start-soul-canary',
-          scope: soulScope,
-        }),
-      });
-      const payload = (await response.json().catch(() => ({}))) as {
-        runId?: unknown;
-        operatorToken?: unknown;
-        scope?: SoulScopeV1;
-        startedAt?: unknown;
-        error?: unknown;
-      };
-      if (
-        !response.ok ||
-        typeof payload.runId !== 'string' ||
-        typeof payload.operatorToken !== 'string' ||
-        !/^[a-f0-9]{64}$/u.test(payload.operatorToken) ||
-        typeof payload.startedAt !== 'number' ||
-        !payload.scope
-      ) {
-        throw new Error(
-          typeof payload.error === 'string'
-            ? payload.error
-            : 'soul_canary_start_failed',
-        );
-      }
-      const credential: SoulCanaryOperatorCredential = {
-        version: 1,
-        runId: payload.runId,
-        operatorToken: payload.operatorToken,
-        scope: payload.scope,
-        startedAt: payload.startedAt,
-      };
-      persistSoulCanaryOperatorCredential(credential);
-      setSoulCanaryOperatorCredential(credential);
-      setActiveSoulCanary(credential);
-      setSoulCanaryClock(Date.now());
-      emitRuntimeEvent({
-        stage: 'soul_canary_started',
-        at: Date.now(),
-        runId: credential.runId,
-      });
-    } catch (error) {
-      setSoulCanaryError(
-        error instanceof Error ? error.message : 'soul_canary_start_failed',
-      );
-    } finally {
-      setSoulCanaryBusy(undefined);
-    }
-  }, [emitRuntimeEvent, soulRuntimeMode, soulScope]);
-  const finishSoulCanary = useCallback(async () => {
-    const credential = soulCanaryOperatorCredential;
-    if (!credential) return;
-    setSoulCanaryBusy('finishing');
-    setSoulCanaryError('');
-    try {
-      const response = await fetch('/api/acceptance-ledger', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'X-Runtime-Settings-Role': 'producer',
-          'X-Soul-Canary-Operator-Token': credential.operatorToken,
-        },
-        body: JSON.stringify({
-          action: 'finish-soul-canary',
-          runId: credential.runId,
-        }),
-      });
-      const payload = (await response.json().catch(() => ({}))) as {
-        error?: unknown;
-      };
-      if (!response.ok) {
-        throw new Error(
-          typeof payload.error === 'string'
-            ? payload.error
-            : 'soul_canary_finish_failed',
-        );
-      }
-      persistSoulCanaryOperatorCredential(null);
-      setSoulCanaryOperatorCredential(null);
-      setActiveSoulCanary(null);
-      soulCanaryRuntimeCredentialRef.current = null;
-      await refreshSoulPrimaryGate();
-    } catch (error) {
-      setSoulCanaryError(
-        error instanceof Error ? error.message : 'soul_canary_finish_failed',
-      );
-    } finally {
-      setSoulCanaryBusy(undefined);
-    }
-  }, [refreshSoulPrimaryGate, soulCanaryOperatorCredential]);
-  const abortSoulCanary = useCallback(async () => {
-    const credential = soulCanaryOperatorCredential;
-    if (!credential) return;
-    setSoulCanaryBusy('aborting');
-    setSoulCanaryError('');
-    try {
-      const response = await fetch('/api/acceptance-ledger', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'X-Runtime-Settings-Role': 'producer',
-          'X-Soul-Canary-Operator-Token': credential.operatorToken,
-        },
-        body: JSON.stringify({
-          action: 'abort-soul-canary',
-          runId: credential.runId,
-          reasonCode: 'operator-aborted-from-soul-inspector',
-        }),
-      });
-      const payload = (await response.json().catch(() => ({}))) as {
-        error?: unknown;
-      };
-      if (!response.ok) {
-        throw new Error(
-          typeof payload.error === 'string'
-            ? payload.error
-            : 'soul_canary_abort_failed',
-        );
-      }
-      persistSoulCanaryOperatorCredential(null);
-      setSoulCanaryOperatorCredential(null);
-      setActiveSoulCanary(null);
-      soulCanaryRuntimeCredentialRef.current = null;
-    } catch (error) {
-      setSoulCanaryError(
-        error instanceof Error ? error.message : 'soul_canary_abort_failed',
-      );
-    } finally {
-      setSoulCanaryBusy(undefined);
-    }
-  }, [soulCanaryOperatorCredential]);
   const recordSoulReflectionEvidence = useCallback(
     (entry: SoulReflectionLedgerSummaryV1) => {
       soulReflectionEvidenceRef.current = [
@@ -1667,46 +1304,6 @@ export default function App() {
     [emitRuntimeEvent],
   );
 
-  const finalizeReplyLatency = useCallback(() => {
-    const replyTrace = replyLatencyRef.current;
-    if (!replyTrace) return;
-    const endedAt = Date.now();
-    void fetch('/api/reply-latency', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        ...replyTrace,
-        endedAt,
-        inputToLlmMs: replyTrace.llmCompletedAt
-          ? replyTrace.llmCompletedAt - replyTrace.inputAt
-          : null,
-        llmToTtsRequestMs:
-          replyTrace.llmCompletedAt && replyTrace.ttsRequestedAt
-            ? replyTrace.ttsRequestedAt - replyTrace.llmCompletedAt
-            : null,
-        ttsRequestToFirstByteMs:
-          replyTrace.ttsRequestedAt && replyTrace.ttsFirstByteAt
-            ? replyTrace.ttsFirstByteAt - replyTrace.ttsRequestedAt
-            : null,
-        firstByteToPlaybackMs:
-          replyTrace.ttsFirstByteAt && replyTrace.firstPlaybackAt
-            ? replyTrace.firstPlaybackAt - replyTrace.ttsFirstByteAt
-            : null,
-        inputToTtsFirstByteMs: replyTrace.ttsFirstByteAt
-          ? replyTrace.ttsFirstByteAt - replyTrace.inputAt
-          : null,
-        inputToFlashHeadFirstFrameMs: replyTrace.flashHeadFirstFrameAt
-          ? replyTrace.flashHeadFirstFrameAt - replyTrace.inputAt
-          : null,
-        inputToFirstPlaybackMs: replyTrace.firstPlaybackAt
-          ? replyTrace.firstPlaybackAt - replyTrace.inputAt
-          : null,
-        inputToEndMs: endedAt - replyTrace.inputAt,
-      }),
-    }).catch(() => undefined);
-    replyLatencyRef.current = null;
-  }, []);
-
   const emitAvatarReaction = useCallback((draft: PuruPuruReactionDraft) => {
     avatarReactionIdRef.current += 1;
     setAvatarReaction(withReactionId(draft, avatarReactionIdRef.current));
@@ -1716,164 +1313,6 @@ export default function App() {
     speechReactionRef.current = null;
     setAvatarReaction(null);
   }, []);
-
-  const renderSpeakingVideo = useCallback(
-    async (
-      arrayBuffer: ArrayBuffer,
-      options: { reset?: boolean; end?: boolean; sequence?: number } = {},
-    ): Promise<RenderedSpeakingMedia | null> => {
-      if (!useSpeakingAvatar) return null;
-      const controller = new AbortController();
-      const timeout = window.setTimeout(
-        () => controller.abort(),
-        SPEAKING_RENDER_TIMEOUT_MS,
-      );
-      const requestedAt = Date.now();
-      try {
-        const parameters = new URLSearchParams();
-        if (options.reset) parameters.set('reset', 'true');
-        if (options.end) parameters.set('end', 'true');
-        const trace = speechRenderTraceRef.current;
-        const headers: Record<string, string> = {
-          'Content-Type': 'application/octet-stream',
-          'X-Avatar-Caller': 'react-purupuru-app',
-          'X-Avatar-Sequence': String(options.sequence ?? 0),
-        };
-        if (trace) {
-          headers['X-Avatar-Request-Id'] = trace.requestId;
-          headers['X-Avatar-Source'] = trace.source;
-          if (options.reset) {
-            headers['X-Avatar-Text'] = encodeURIComponent(
-              trace.text.slice(0, 1_000),
-            );
-          }
-        }
-        emitRuntimeEvent({
-          eventId: activeLifecycleRef.current?.eventId,
-          stage: `${speakingAvatarEngine}_render_request`,
-          at: requestedAt,
-          sequence: options.sequence ?? 0,
-          byteLength: arrayBuffer.byteLength,
-          reset: options.reset === true,
-          end: options.end === true,
-        });
-        const response = await fetch(
-          `/api/${speakingAvatarEngine}/render?${parameters.toString()}`,
-          {
-            method: 'POST',
-            headers,
-            body: arrayBuffer.slice(0),
-            signal: controller.signal,
-          },
-        );
-        const headersAt = Date.now();
-        emitRuntimeEvent({
-          eventId: activeLifecycleRef.current?.eventId,
-          stage: `${speakingAvatarEngine}_render_headers`,
-          at: headersAt,
-          sequence: options.sequence ?? 0,
-          requestToHeadersMs: headersAt - requestedAt,
-          status: response.status,
-        });
-        if (response.status === 204) return null;
-        if (!response.ok) {
-          throw new Error(
-            `${speakingAvatarEngine} returned ${response.status}`,
-          );
-        }
-        const payload = new Uint8Array(await response.arrayBuffer());
-        emitRuntimeEvent({
-          eventId: activeLifecycleRef.current?.eventId,
-          stage: `${speakingAvatarEngine}_render_completed`,
-          at: Date.now(),
-          sequence: options.sequence ?? 0,
-          requestToMediaMs: Date.now() - requestedAt,
-          payloadByteLength: payload.byteLength,
-        });
-        const { audioBuffer, videoBuffer } = parseFlashHeadBundle(payload);
-        const frameCount = Number(response.headers.get('X-FlashHead-Frames'));
-        const replyLatency = replyLatencyRef.current;
-        if (
-          replyLatency &&
-          !replyLatency.flashHeadFirstFrameAt &&
-          Number.isFinite(frameCount) &&
-          frameCount > 0
-        ) {
-          replyLatency.flashHeadFirstFrameAt = Date.now();
-        }
-        return {
-          audioBuffer,
-          videoUrl: URL.createObjectURL(
-            new Blob([videoBuffer], { type: 'video/webm' }),
-          ),
-          durationSeconds:
-            Number.isFinite(frameCount) && frameCount > 0 ? frameCount / 25 : 0,
-        };
-      } catch (error) {
-        console.warn(
-          `${speakingAvatarEngine} unavailable; using the idle avatar.`,
-          error,
-        );
-        emitRuntimeEvent({
-          eventId: activeLifecycleRef.current?.eventId,
-          stage: `${speakingAvatarEngine}_render_failed`,
-          at: Date.now(),
-          reason: error instanceof Error ? error.message : String(error),
-        });
-        return null;
-      } finally {
-        window.clearTimeout(timeout);
-      }
-    },
-    [emitRuntimeEvent, speakingAvatarEngine, useSpeakingAvatar],
-  );
-
-  const playAudioChunk = useCallback(
-    async (
-      arrayBuffer: ArrayBuffer,
-      generatedVideoUrl: string | null,
-      emitReaction: boolean,
-    ) => {
-      const playbackTimeoutMs = await getAudioPlaybackTimeoutMs(arrayBuffer);
-      if (generatedVideoUrl) {
-        setSpeakingAvatarVideoUrl(generatedVideoUrl);
-        await new Promise<void>((resolve) => {
-          requestAnimationFrame(() => requestAnimationFrame(() => resolve()));
-        });
-      }
-
-      try {
-        await Promise.race([
-          play(arrayBuffer, {
-            onStart: () => {
-              if (!replyLatencyRef.current?.firstPlaybackAt) {
-                if (replyLatencyRef.current) {
-                  replyLatencyRef.current.firstPlaybackAt = Date.now();
-                }
-              }
-              if (!emitReaction) return;
-              if (speechReactionRef.current) {
-                emitAvatarReaction(speechReactionRef.current);
-              } else {
-                setAvatarReaction(null);
-              }
-            },
-          }),
-          new Promise<void>((resolve) =>
-            window.setTimeout(resolve, playbackTimeoutMs),
-          ),
-        ]);
-      } finally {
-        stop();
-        if (generatedVideoUrl) {
-          setSpeakingAvatarVideoUrl(null);
-          // Keep the Blob alive through the visual cross-fade back to LivePortrait.
-          window.setTimeout(() => URL.revokeObjectURL(generatedVideoUrl), 220);
-        }
-      }
-    },
-    [emitAvatarReaction, play, stop],
-  );
 
   const markSpeechAudioReady = useCallback(
     (byteLength: number) => {
@@ -1916,246 +1355,91 @@ export default function App() {
     [dispatchLiveHostEvent, emitRuntimeEvent],
   );
 
-  const handleAudioPlay = useCallback(
-    async (arrayBuffer: ArrayBuffer) => {
-      speechBeatBytesRef.current += arrayBuffer.byteLength;
-      if (arrayBuffer.byteLength > 0)
-        markSpeechAudioReady(arrayBuffer.byteLength);
-      if (!replyLatencyRef.current?.ttsFirstByteAt) {
-        if (replyLatencyRef.current) {
-          replyLatencyRef.current.ttsFirstByteAt = Date.now();
-        }
-      }
-      if (captureTts) {
-        await fetch('/api/tts-capture', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/octet-stream' },
-          body: arrayBuffer.slice(0),
-        });
-      }
-      const rendered = await renderSpeakingVideo(arrayBuffer, {
-        reset: true,
-        end: true,
-      });
-      await playAudioChunk(
-        rendered?.audioBuffer ?? arrayBuffer,
-        rendered?.videoUrl ?? null,
-        true,
-      );
-      finalizeReplyLatency();
-    },
+  const speakingMediaRenderer = useMemo(
+    () =>
+      createSpeakingAvatarHttpRenderer({
+        enabled: useSpeakingAvatar,
+        engine: speakingAvatarEngine,
+        getTrace: () => speechRenderTraceRef.current,
+        getEventId: () => activeLifecycleRef.current?.eventId,
+        emit: emitRuntimeEvent,
+        onFirstFrame: () =>
+          replyLatencyTracker.record({ type: 'flashhead-first-frame' }),
+      }),
     [
-      captureTts,
-      finalizeReplyLatency,
-      markSpeechAudioReady,
-      playAudioChunk,
-      renderSpeakingVideo,
+      emitRuntimeEvent,
+      replyLatencyTracker,
+      speakingAvatarEngine,
+      useSpeakingAvatar,
     ],
   );
 
-  const handleAudioStream = useCallback(
-    async (audioStream: AsyncGenerator<ArrayBuffer>) => {
-      beginQueue();
-      const iterator = audioStream[Symbol.asyncIterator]();
-      let current = await iterator.next();
-      if (current.done) {
-        await finishQueue();
-        return;
-      }
-      speechBeatBytesRef.current += current.value.byteLength;
-      if (current.value.byteLength > 0)
-        markSpeechAudioReady(current.value.byteLength);
-      if (!replyLatencyRef.current?.ttsFirstByteAt) {
-        if (replyLatencyRef.current) {
-          replyLatencyRef.current.ttsFirstByteAt = Date.now();
-        }
-      }
-
-      let sequence = 0;
-      let renderPromise = renderSpeakingVideo(current.value, {
-        reset: true,
-        sequence,
-      });
-      const capturedChunks = captureTts ? [current.value.slice(0)] : [];
-      const sourceChunks = [current.value.slice(0)];
-      let firstChunk = true;
-      let playbackStarted = speakingAvatarEngine !== 'flashhead';
-      let stagedDuration = 0;
-      const stagedMedia: RenderedSpeakingMedia[] = [];
-      const generatedVideoUrls: string[] = [];
-      let startDeadlineTimer: number | null = null;
-      let rendererProducedMedia = false;
-
-      // Do not race a FlashHead render against a shorter UI deadline. The
-      // renderer holds streaming MP3 state across requests, so treating a
-      // merely slow response as absent discards its generated audio/video and
-      // produces audible gaps. `renderSpeakingVideo` still has the hard
-      // no-progress timeout above, so an unavailable renderer cannot hang the
-      // speech pipeline forever.
-      const awaitStreamRender = async (
-        pendingRender: Promise<RenderedSpeakingMedia | null>,
-      ): Promise<RenderedSpeakingMedia | null> => pendingRender;
-
-      const enqueuePlayable = async (
-        audioBuffer: ArrayBuffer,
-        videoUrl?: string,
-      ) => {
-        const emitThisChunk = firstChunk;
-        if (videoUrl) generatedVideoUrls.push(videoUrl);
-        await enqueue(audioBuffer, {
-          onVisualStart: videoUrl
-            ? () => setSpeakingAvatarVideoUrl(videoUrl)
-            : undefined,
-          onStart: () => {
-            if (!replyLatencyRef.current?.firstPlaybackAt) {
-              if (replyLatencyRef.current) {
-                replyLatencyRef.current.firstPlaybackAt = Date.now();
-              }
-            }
-            if (!emitThisChunk) return;
+  const speakingMediaPipeline = useMemo(
+    () =>
+      createSpeakingMediaPipeline({
+        engine: speakingAvatarEngine,
+        renderer: speakingMediaRenderer,
+        playback: {
+          play,
+          stop,
+          beginQueue,
+          enqueue,
+          finishQueue,
+          timeoutMs: getAudioPlaybackTimeoutMs,
+        },
+        lifecycle: {
+          onSourceChunk: (byteLength) => {
+            speechBeatBytesRef.current += byteLength;
+          },
+          onFirstAudio: (byteLength) => {
+            markSpeechAudioReady(byteLength);
+            replyLatencyTracker.record({ type: 'tts-first-byte' });
+          },
+          onPlaybackStarted: () => {
+            replyLatencyTracker.record({ type: 'first-playback' });
             if (speechReactionRef.current) {
               emitAvatarReaction(speechReactionRef.current);
             } else {
               setAvatarReaction(null);
             }
           },
-        });
-        firstChunk = false;
-      };
-
-      const enqueueRendered = async (rendered: RenderedSpeakingMedia) => {
-        await enqueuePlayable(rendered.audioBuffer, rendered.videoUrl);
-      };
-
-      const enqueueRendererFallback = async (audioBuffer: ArrayBuffer) => {
-        if (!playbackStarted) {
-          playbackStarted = true;
-          if (startDeadlineTimer !== null) {
-            window.clearTimeout(startDeadlineTimer);
-            startDeadlineTimer = null;
-          }
-        }
-        emitRuntimeEvent({
-          eventId: activeLifecycleRef.current?.eventId,
-          stage: 'flashhead_audio_fallback',
-          at: Date.now(),
-          byteLength: audioBuffer.byteLength,
-          reason: 'renderer_returned_no_playable_media',
-        });
-        await enqueuePlayable(audioBuffer);
-      };
-
-      const startStagedPlayback = async () => {
-        if (playbackStarted || !stagedMedia.length) return;
-        playbackStarted = true;
-        if (startDeadlineTimer !== null) {
-          window.clearTimeout(startDeadlineTimer);
-          startDeadlineTimer = null;
-        }
-        for (const staged of stagedMedia.splice(0)) {
-          await enqueueRendered(staged);
-        }
-      };
-
-      const stageOrEnqueue = async (
-        rendered: RenderedSpeakingMedia,
-        forceStart = false,
-      ) => {
-        if (playbackStarted) {
-          await enqueueRendered(rendered);
-          return;
-        }
-        stagedMedia.push(rendered);
-        stagedDuration += rendered.durationSeconds;
-        if (startDeadlineTimer === null) {
-          startDeadlineTimer = window.setTimeout(() => {
-            void startStagedPlayback();
-          }, FLASHHEAD_PLAYBACK_START_WAIT_MS);
-        }
-        if (!forceStart && stagedDuration < FLASHHEAD_START_BUFFER_SECONDS)
-          return;
-        await startStagedPlayback();
-      };
-
-      while (!current.done) {
-        const sourceAudio = current.value;
-        const nextPromise = iterator.next();
-        const rendered = await awaitStreamRender(renderPromise);
-        if (rendered) {
-          rendererProducedMedia = true;
-          await stageOrEnqueue(rendered);
-        } else if (sourceAudio.byteLength > 0) {
-          if (speakingAvatarEngine === 'flashhead') {
-            // Streaming MP3 fragments are not independently decodable.
-            // FlashHead has accepted the fragment into its current session;
-            // the explicit end request below gets the first chance to flush it.
-            emitRuntimeEvent({
-              eventId: activeLifecycleRef.current?.eventId,
-              stage: 'flashhead_fragment_deferred',
-              at: Date.now(),
-              byteLength: sourceAudio.byteLength,
-              reason: 'renderer_session_will_flush_tail',
-            });
-          } else {
-            await enqueueRendererFallback(sourceAudio);
-          }
-        }
-        const next = await nextPromise;
-        if (!next.done) speechBeatBytesRef.current += next.value.byteLength;
-        if (!next.done) sourceChunks.push(next.value.slice(0));
-        if (!next.done && captureTts) {
-          capturedChunks.push(next.value.slice(0));
-        }
-        const nextRenderPromise = next.done
-          ? null
-          : renderSpeakingVideo(next.value, { sequence: ++sequence });
-        current = next;
-        if (nextRenderPromise) renderPromise = nextRenderPromise;
-      }
-
-      if (speakingAvatarEngine === 'flashhead') {
-        const finalRendered = await awaitStreamRender(
-          renderSpeakingVideo(new ArrayBuffer(0), {
-            end: true,
-            sequence: ++sequence,
+          onFinished: () => {
+            replyLatencyTracker.finish();
+          },
+        },
+        visual: {
+          show: setSpeakingAvatarVideoUrl,
+          waitUntilVisible: () =>
+            new Promise<void>((resolve) => {
+              requestAnimationFrame(() =>
+                requestAnimationFrame(() => resolve()),
+              );
+            }),
+          release: (url) => {
+            // Keep the Blob alive through the cross-fade back to LivePortrait.
+            window.setTimeout(() => URL.revokeObjectURL(url), 220);
+          },
+        },
+        capture: captureTts
+          ? async (chunks) => {
+              await fetch('/api/tts-capture', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/octet-stream' },
+                body: new Blob(chunks),
+              });
+            }
+          : undefined,
+        emit: (event) =>
+          emitRuntimeEvent({
+            eventId: activeLifecycleRef.current?.eventId,
+            at: Date.now(),
+            ...event,
           }),
-        );
-        if (finalRendered) {
-          rendererProducedMedia = true;
-          await stageOrEnqueue(finalRendered, true);
-        }
-        if (!rendererProducedMedia && sourceChunks.length) {
-          const byteLength = sourceChunks.reduce(
-            (total, chunk) => total + chunk.byteLength,
-            0,
-          );
-          const completeAudio = new Uint8Array(byteLength);
-          let offset = 0;
-          for (const chunk of sourceChunks) {
-            completeAudio.set(new Uint8Array(chunk), offset);
-            offset += chunk.byteLength;
-          }
-          await enqueueRendererFallback(completeAudio.buffer);
-        }
-      }
-      if (!playbackStarted && stagedMedia.length) {
-        await startStagedPlayback();
-      }
-      if (startDeadlineTimer !== null) window.clearTimeout(startDeadlineTimer);
-      if (captureTts && capturedChunks.length) {
-        await fetch('/api/tts-capture', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/octet-stream' },
-          body: new Blob(capturedChunks),
-        });
-      }
-      await finishQueue();
-      setSpeakingAvatarVideoUrl(null);
-      window.setTimeout(() => {
-        for (const url of generatedVideoUrls) URL.revokeObjectURL(url);
-      }, 220);
-      finalizeReplyLatency();
-    },
+        scheduler: {
+          set: (callback, delayMs) => window.setTimeout(callback, delayMs),
+          clear: (timer) => window.clearTimeout(timer),
+        },
+      }),
     [
       beginQueue,
       captureTts,
@@ -2163,12 +1447,40 @@ export default function App() {
       emitRuntimeEvent,
       enqueue,
       finishQueue,
-      finalizeReplyLatency,
       markSpeechAudioReady,
-      renderSpeakingVideo,
+      play,
+      replyLatencyTracker,
       speakingAvatarEngine,
+      speakingMediaRenderer,
+      stop,
     ],
   );
+
+  const handleAudioPlay = useCallback(
+    async (arrayBuffer: ArrayBuffer) => {
+      await speakingMediaPipeline.playFull(arrayBuffer);
+    },
+    [speakingMediaPipeline],
+  );
+
+  const handleAudioStream = useCallback(
+    async (audioStream: AsyncGenerator<ArrayBuffer>) => {
+      await speakingMediaPipeline.playStream(audioStream);
+    },
+    [speakingMediaPipeline],
+  );
+
+  const retireOperatorSpeechFailureState = useCallback((eventId: string) => {
+    pendingPersonaRuntimeCommitsRef.current.delete(eventId);
+    pendingDeliveredInteractionsRef.current.delete(eventId);
+    if (activeLifecycleRef.current?.eventId === eventId) {
+      activeLifecycleRef.current = null;
+    }
+    if (speakingOperatorTaskRef.current === eventId) {
+      speakingOperatorTaskRef.current = null;
+    }
+    operatorPlaybackObservedRef.current = false;
+  }, []);
 
   const armOperatorSpeechWatchdog = useCallback(
     (
@@ -2177,74 +1489,94 @@ export default function App() {
       reason = 'tts_progress_timeout',
     ) => {
       if (speakingOperatorTaskRef.current !== eventId) return;
+      const armedAttempt = activeLifecycleRef.current;
+      if (armedAttempt?.eventId !== eventId || !armedAttempt.attemptId) return;
+      const attemptId = armedAttempt.attemptId;
       if (operatorSpeechWatchdogRef.current !== null) {
         window.clearTimeout(operatorSpeechWatchdogRef.current);
       }
       operatorSpeechWatchdogRef.current = window.setTimeout(() => {
-        if (speakingOperatorTaskRef.current !== eventId) return;
+        if (
+          speakingOperatorTaskRef.current !== eventId ||
+          activeLifecycleRef.current?.eventId !== eventId ||
+          activeLifecycleRef.current.attemptId !== attemptId
+        ) {
+          return;
+        }
         // This fires only when neither a TTS beat nor playback completion has
         // made progress for the watchdog window.  Do not confuse a long,
         // multi-beat response with a stalled renderer.
-        const active = activeLifecycleRef.current;
-        const outcome = resolveIncompleteDelivery({
-          beatCount: operatorBeatCountRef.current,
-          completedBeatCount: operatorCompletedBeatCountRef.current,
-          audioByteLength: operatorAudioByteLengthRef.current,
-          playbackObserved:
-            operatorPlaybackObservedRef.current || Boolean(active?.ttsStartAt),
-        });
-        stop();
-        speakingOperatorTaskRef.current = null;
-        operatorPlaybackObservedRef.current = false;
         operatorSpeechWatchdogRef.current = null;
-        if (active?.eventId === eventId) {
+        const queueItem = operatorQueueRef.current.find(
+          (item) => item.eventId === eventId && item.attemptId === attemptId,
+        );
+        if (!queueItem) {
           emitRuntimeEvent({
             eventId,
-            stage: 'failed',
+            attemptId,
+            stage: 'stale_callback',
             at: Date.now(),
-            source: active.channel,
-            sourceLabel: active.label,
-            viewerId: active.viewerId,
-            viewerName: active.viewerName,
-            sourcesSeen: active.sourcesSeen,
-            reason,
-            soulOutcomeStatus: outcome.status,
-            deliveredFraction: outcome.deliveredFraction,
+            reason: 'speech_watchdog_attempt_missing',
           });
+          return;
         }
-        dispatchLiveHostEvent({
-          type: 'runtime-fault',
-          at: Date.now(),
-          eventId,
-          reasonCode: reason,
-        });
-        commitConversationHistoryOutcome(eventId, outcome.status, {
-          viewerId: active?.viewerId,
-          deliveredFraction: outcome.deliveredFraction,
-          reasonCode: reason,
-          ttsStartAt: active?.ttsStartAt,
-          ttsEndAt: Date.now(),
-        });
-        void (async () => {
-          await soulOutcomeFinalizerRef.current(eventId, outcome.status, {
-            deliveredFraction: outcome.deliveredFraction,
-            reasonCode: reason,
-          });
-          pendingPersonaRuntimeCommitsRef.current.delete(eventId);
-          pendingDeliveredInteractionsRef.current.delete(eventId);
-          if (activeLifecycleRef.current?.eventId === eventId) {
-            activeLifecycleRef.current = null;
+        void settleOperatorSpeechFailure(
+          {
+            item: queueItem,
+            ownerId: runtimeOwnerIdRef.current,
+            turns: turnEnvelopeByEventIdRef.current,
+            evidence: readSpeechDeliveryEvidence(),
+            failure: { kind: 'watchdog', reason },
+          },
+          {
+            mutateQueue: updateOperatorQueue,
+            finalizeSoulOutcome: (failedEventId, status, options) =>
+              soulOutcomeFinalizerRef.current(failedEventId, status, options),
+            commitConversationHistoryOutcome,
+            emitRuntimeEvent,
+            dispatchLiveHostEvent,
+            retireLocalState: (failedEventId) => {
+              retireOperatorSpeechFailureState(failedEventId);
+              stop();
+            },
+          },
+        ).catch((error) => {
+          const errorReason =
+            error instanceof Error ? error.message : String(error);
+          if (
+            /stale queue .* attempt|queue lease owner mismatch/i.test(
+              errorReason,
+            )
+          ) {
+            setReliabilityMetrics((current) => ({
+              ...current,
+              staleCallbacks: current.staleCallbacks + 1,
+            }));
+            emitRuntimeEvent({
+              eventId,
+              attemptId,
+              stage: 'stale_callback',
+              at: Date.now(),
+              reason: errorReason,
+            });
+            return;
           }
-          await updateOperatorQueue(eventId, 'fail', { reason }).catch(
-            () => undefined,
-          );
-        })();
+          emitRuntimeEvent({
+            eventId,
+            attemptId,
+            stage: 'speech_failure_settlement_failed',
+            at: Date.now(),
+            reason: errorReason,
+          });
+        });
       }, timeoutMs);
     },
     [
       commitConversationHistoryOutcome,
       dispatchLiveHostEvent,
       emitRuntimeEvent,
+      readSpeechDeliveryEvidence,
+      retireOperatorSpeechFailureState,
       stop,
     ],
   );
@@ -2320,7 +1652,7 @@ export default function App() {
   const handleSpeechStart = useCallback(
     (screenplay: ScreenplayLike) => {
       const text = screenplay.text?.trim() || '';
-      const replyTrace = replyLatencyRef.current;
+      const replyTrace = replyLatencyTracker.context();
       speechRenderTraceRef.current = {
         requestId: replyTrace?.requestId ?? crypto.randomUUID(),
         source:
@@ -2330,6 +1662,16 @@ export default function App() {
       };
       const active = activeLifecycleRef.current;
       if (active?.eventId) {
+        const envelope = turnEnvelopeByEventIdRef.current.get(active.eventId);
+        if (
+          envelope &&
+          (!active.attemptId || active.attemptId === envelope.attemptId)
+        ) {
+          turnEnvelopeByEventIdRef.current.set(
+            active.eventId,
+            transitionTurn(envelope, 'speaking'),
+          );
+        }
         if (speakingOperatorTaskRef.current === active.eventId) {
           operatorPlaybackObservedRef.current = false;
         }
@@ -2435,6 +1777,7 @@ export default function App() {
     [
       debugAffineAvatarMotion,
       emitRuntimeEvent,
+      replyLatencyTracker,
       settingsHook.settings.liveConnectors,
       useSpeakingAvatar,
     ],
@@ -2505,22 +1848,19 @@ export default function App() {
   soulOutcomeFinalizerRef.current = finalizeSoulOutcome;
 
   const handleSpeechEnd = useCallback(() => {
-    if (replyLatencyRef.current) {
-      replyLatencyRef.current.speechEndSignaledAt = Date.now();
-    }
     const active = activeLifecycleRef.current;
     const isOperatorPlayback =
       Boolean(active?.eventId) &&
       speakingOperatorTaskRef.current === active?.eventId;
-    const hasCompleteOperatorAudio = hasCompleteDeliveryEvidence({
-      beatCount: operatorBeatCountRef.current,
-      completedBeatCount: operatorCompletedBeatCountRef.current,
-      audioByteLength: operatorAudioByteLengthRef.current,
+    const outcome = resolveSpeechOutcome({
+      signal: { type: 'completed', operatorPlayback: isOperatorPlayback },
+      evidence: readSpeechDeliveryEvidence(),
     });
     // Streaming TTS can briefly report an idle state between beats.  That is
     // not the end of the queued response: keep its lease and lifecycle alive
     // until every planned beat has completed.
-    if (isOperatorPlayback && !hasCompleteOperatorAudio) return;
+    if (outcome.kind === 'deferred') return;
+    replyLatencyTracker.record({ type: 'speech-end-signaled' });
     if (active?.eventId) {
       const ttsEndAt = Date.now();
       const isSoulDelivery = soulSessionByEventIdRef.current.has(
@@ -2532,19 +1872,27 @@ export default function App() {
         eventId: active.eventId,
         stage: 'completed',
       });
-      finalizeSoulOutcome(active.eventId, 'spoken', {
-        deliveredFraction: 1,
-        reasonCode: 'tts-playback-completed',
-      });
-      commitConversationHistoryOutcome(active.eventId, 'spoken', {
-        viewerId: active.viewerId,
-        deliveredFraction: 1,
-        reasonCode: 'tts-playback-completed',
-        ttsStartAt: active.ttsStartAt,
-        ttsEndAt,
-      });
-      if (isOperatorPlayback) {
+      void projectSpeechTerminalOutcome(
+        {
+          context: {
+            eventId: active.eventId,
+            attemptId: active.attemptId,
+            viewerId: active.viewerId,
+            ttsStartAt: active.ttsStartAt,
+          },
+          turns: turnEnvelopeByEventIdRef.current,
+          outcome,
+          at: ttsEndAt,
+        },
+        {
+          finalizeSoulOutcome,
+          commitConversationHistoryOutcome,
+          emitRuntimeEvent,
+        },
+      );
+      if (isOperatorPlayback && active.attemptId) {
         void updateOperatorQueue(active.eventId, 'done', {
+          attemptId: active.attemptId,
           ownerId: runtimeOwnerIdRef.current,
           beatCount: operatorBeatCountRef.current,
           completedBeatCount: operatorCompletedBeatCountRef.current,
@@ -2676,6 +2024,8 @@ export default function App() {
     emitRuntimeEvent,
     finalizeSoulOutcome,
     commitConversationHistoryOutcome,
+    readSpeechDeliveryEvidence,
+    replyLatencyTracker,
     resetAvatarReaction,
     soulControlState.memoryIsolated,
     streamerMemory,
@@ -2683,6 +2033,7 @@ export default function App() {
 
   const handleSpeechInterrupted = useCallback(() => {
     const active = activeLifecycleRef.current;
+    const interruptedAt = Date.now();
     const defersScopeCleanup = Boolean(
       active?.eventId && scopeTransitionEventIdsRef.current.has(active.eventId),
     );
@@ -2693,57 +2044,46 @@ export default function App() {
       }
       dispatchLiveHostEvent({
         type: 'speech',
-        at: Date.now(),
+        at: interruptedAt,
         eventId: active.eventId,
         stage: 'interrupted',
       });
-      const incompleteDelivery = resolveIncompleteDelivery({
-        beatCount: operatorBeatCountRef.current,
-        completedBeatCount: operatorCompletedBeatCountRef.current,
-        audioByteLength: operatorAudioByteLengthRef.current,
-        playbackObserved:
-          operatorPlaybackObservedRef.current || Boolean(active.ttsStartAt),
+      const outcome = resolveSpeechOutcome({
+        signal: { type: 'interrupted', scopeTransition: defersScopeCleanup },
+        evidence: readSpeechDeliveryEvidence(),
       });
-      const deliveredFraction = incompleteDelivery.deliveredFraction;
-      finalizeSoulOutcome(
-        active.eventId,
-        defersScopeCleanup
-          ? incompleteDelivery.status
-          : deliveredFraction > 0
-            ? 'partial'
-            : 'interrupted',
+      void projectSpeechTerminalOutcome(
         {
-          deliveredFraction,
-          reasonCode: defersScopeCleanup
-            ? 'scope-switch-interrupted-delivery'
-            : 'interrupted-at-beat-boundary',
+          context: {
+            eventId: active.eventId,
+            attemptId: active.attemptId,
+            viewerId: active.viewerId,
+            ttsStartAt: active.ttsStartAt,
+          },
+          turns: turnEnvelopeByEventIdRef.current,
+          outcome,
+          at: interruptedAt,
         },
-      );
-      commitConversationHistoryOutcome(
-        active.eventId,
-        incompleteDelivery.status,
         {
-          viewerId: active.viewerId,
-          deliveredFraction,
-          reasonCode: defersScopeCleanup
-            ? 'scope-switch-interrupted-delivery'
-            : 'interrupted-at-beat-boundary',
-          ttsStartAt: active.ttsStartAt,
-          ttsEndAt: Date.now(),
+          finalizeSoulOutcome,
+          commitConversationHistoryOutcome,
+          emitRuntimeEvent,
         },
       );
       emitRuntimeEvent({
         eventId: active.eventId,
         stage: 'dropped',
-        at: Date.now(),
+        at: interruptedAt,
         source: active.channel,
         sourceLabel: active.label,
         viewerId: active.viewerId,
         viewerName: active.viewerName,
-        reason: 'interrupted_at_beat_boundary',
+        reason: outcome.reasonCode,
       });
       void updateOperatorQueue(active.eventId, 'skip', {
-        reason: 'interrupted_at_beat_boundary',
+        attemptId: active.attemptId,
+        ownerId: runtimeOwnerIdRef.current,
+        reason: outcome.reasonCode,
       }).catch(() => undefined);
     }
     if (!defersScopeCleanup) {
@@ -2764,6 +2104,7 @@ export default function App() {
     emitRuntimeEvent,
     finalizeSoulOutcome,
     commitConversationHistoryOutcome,
+    readSpeechDeliveryEvidence,
     resetAvatarReaction,
   ]);
 
@@ -2772,6 +2113,7 @@ export default function App() {
     isProcessing,
     partialResponse,
     processChat,
+    generateIsolatedReply,
     processVisionChat,
     speakPrepared,
     isCoreReady,
@@ -2791,9 +2133,7 @@ export default function App() {
       if (stage === 'start') {
         const requestedAt = Date.now();
         if (active) active.ttsRequestAt = requestedAt;
-        if (replyLatencyRef.current) {
-          replyLatencyRef.current.ttsRequestedAt = requestedAt;
-        }
+        replyLatencyTracker.record({ type: 'tts-requested', at: requestedAt });
         const beatIndex = Number(data.beatIndex ?? data.index ?? 0);
         const avatarBeatKey = `${active?.eventId || 'direct'}:${beatIndex}`;
         if (
@@ -2809,8 +2149,10 @@ export default function App() {
         operatorBeatCountRef.current = bridgePlayback
           ? Number(data.count || 1)
           : Math.max(operatorBeatCountRef.current, Number(data.count || 0));
-        if (active?.eventId) {
+        if (active?.eventId && active.attemptId) {
           void updateOperatorQueue(active.eventId, 'beat-progress', {
+            attemptId: active.attemptId,
+            ownerId: runtimeOwnerIdRef.current,
             beatCount: Number(data.count || 0),
             completedBeatCount: Number(data.index || 0),
             replaceBeatPlan: bridgePlayback,
@@ -2859,49 +2201,33 @@ export default function App() {
           Number(data.index || 0) + 1,
         );
         operatorAudioByteLengthRef.current += speechBeatBytesRef.current;
-        void updateOperatorQueue(active.eventId, 'beat-progress', {
-          beatCount: Number(data.count || 0),
-          completedBeatCount: Number(data.index || 0) + 1,
-          byteLength: speechBeatBytesRef.current,
-          replaceBeatPlan: bridgePlayback,
-        }).catch(() => undefined);
+        if (active.attemptId) {
+          void updateOperatorQueue(active.eventId, 'beat-progress', {
+            attemptId: active.attemptId,
+            ownerId: runtimeOwnerIdRef.current,
+            beatCount: Number(data.count || 0),
+            completedBeatCount: Number(data.index || 0) + 1,
+            byteLength: speechBeatBytesRef.current,
+            replaceBeatPlan: bridgePlayback,
+          }).catch(() => undefined);
+        }
       }
       if (active?.eventId && stage === 'error') {
-        dispatchLiveHostEvent({
-          type: 'runtime-fault',
-          at: Date.now(),
+        // This callback is a diagnostic precursor. speakPrepared rejects next,
+        // and its owner performs the sole durable/local terminal settlement.
+        emitRuntimeEvent({
           eventId: active.eventId,
-          reasonCode: 'tts_beat_failed',
+          attemptId: active.attemptId,
+          stage: 'tts_beat_error_observed',
+          at: Date.now(),
+          beatIndex: Number(data.beatIndex ?? data.index ?? 0),
+          error:
+            typeof data.error === 'string'
+              ? data.error
+              : data.error == null
+                ? undefined
+                : String(data.error),
         });
-        pendingPersonaRuntimeCommitsRef.current.delete(active.eventId);
-        pendingDeliveredInteractionsRef.current.delete(active.eventId);
-        const deliveredFraction =
-          operatorBeatCountRef.current > 0
-            ? Math.min(
-                1,
-                operatorCompletedBeatCountRef.current /
-                  operatorBeatCountRef.current,
-              )
-            : 0;
-        finalizeSoulOutcome(
-          active.eventId,
-          deliveredFraction > 0 ? 'partial' : 'failed',
-          {
-            deliveredFraction,
-            reasonCode: 'tts-beat-failed',
-          },
-        );
-        commitConversationHistoryOutcome(
-          active.eventId,
-          deliveredFraction > 0 ? 'partial' : 'failed',
-          {
-            viewerId: active.viewerId,
-            deliveredFraction,
-            reasonCode: 'tts-beat-failed',
-            ttsStartAt: active.ttsStartAt,
-            ttsEndAt: Date.now(),
-          },
-        );
       }
     },
     personaPlannerEnabled,
@@ -2910,6 +2236,26 @@ export default function App() {
     speechPlanV2Enabled,
     getApiKeyForProvider: settingsHook.getApiKeyForProvider,
     onAssistantResponse: (input, reply, metadata) => {
+      if (metadata?.eventId && metadata.attemptId) {
+        const envelope = turnEnvelopeByEventIdRef.current.get(metadata.eventId);
+        if (
+          envelope &&
+          !matchesTurnAttempt(envelope, metadata.eventId, metadata.attemptId)
+        ) {
+          setReliabilityMetrics((current) => ({
+            ...current,
+            staleCallbacks: current.staleCallbacks + 1,
+          }));
+          emitRuntimeEvent({
+            eventId: metadata.eventId,
+            attemptId: metadata.attemptId,
+            stage: 'stale_callback',
+            at: Date.now(),
+            reason: 'assistant_response_attempt_mismatch',
+          });
+          return;
+        }
+      }
       // Generated text is not an autobiographical event yet. Reserve it here
       // and commit only after the correlated speech lifecycle proves delivery.
       if (metadata?.eventId) {
@@ -2924,12 +2270,14 @@ export default function App() {
           sourcesSeen: metadata.sourcesSeen,
         });
       }
-      if (replyLatencyRef.current) {
-        replyLatencyRef.current.llmCompletedAt = Date.now();
-        replyLatencyRef.current.input = input;
-        replyLatencyRef.current.reply = reply;
-        replyLatencyRef.current.eventId = metadata?.eventId;
-      }
+      replyLatencyTracker.record({
+        type: 'llm-completed',
+        input,
+        reply,
+        eventId: metadata?.eventId,
+        attemptId: metadata?.attemptId,
+        requireEventMatch: Boolean(metadata?.eventId),
+      });
       const active = activeLifecycleRef.current;
       if (active?.eventId && active.eventId === metadata?.eventId) {
         emitRuntimeEvent({
@@ -2991,109 +2339,74 @@ export default function App() {
       }
     },
     onChatError: (error, metadata) => {
+      if (metadata?.eventId && metadata.attemptId) {
+        const envelope = turnEnvelopeByEventIdRef.current.get(metadata.eventId);
+        if (
+          envelope &&
+          !matchesTurnAttempt(envelope, metadata.eventId, metadata.attemptId)
+        ) {
+          setReliabilityMetrics((current) => ({
+            ...current,
+            staleCallbacks: current.staleCallbacks + 1,
+          }));
+          emitRuntimeEvent({
+            eventId: metadata.eventId,
+            attemptId: metadata.attemptId,
+            stage: 'stale_callback',
+            at: Date.now(),
+            reason: 'chat_error_attempt_mismatch',
+          });
+          return;
+        }
+      }
       // Continuation failures from the chat processor can lose the original
       // metadata after speech has already started.  Keep the lifecycle event
       // as the correlation source so the stress runner reports the upstream
       // generation failure instead of a later, misleading TTS timeout.
       const active = activeLifecycleRef.current;
       const eventId = metadata?.eventId ?? active?.eventId;
-      if (eventId) {
-        pendingDeliveredInteractionsRef.current.delete(eventId);
-      }
-      const errorMessage =
-        error instanceof Error ? error.message.slice(0, 240) : 'chat_failed';
-      const reason: PendingGenerationFailure['reason'] =
-        /\b401\b|unauthori[sz]ed|api.?key|credential|authorization/i.test(
-          errorMessage,
-        )
-          ? 'generation_auth_failed'
-          : /truncated|continuation/i.test(errorMessage)
-            ? 'generation_truncated'
-            : 'generation_failed';
+      const capturedFailure = classifyOperatorGenerationFailure(error);
       const queueOwnsFailure =
         Boolean(eventId) && preparingOperatorTaskRef.current === eventId;
-      if (eventId) {
-        if (queueOwnsFailure) {
-          generationFailureByEventIdRef.current.set(eventId, {
-            reason,
-            error: errorMessage,
-            retryable:
-              reason !== 'generation_auth_failed' &&
-              reason !== 'generation_truncated',
-          });
-          // The streaming core may report an error without resolving the
-          // outer preparation promise (for example after a transport-level
-          // network failure). Do not leave the durable queue item leased in
-          // `preparing` until the two-minute server lease expires. Mutate it
-          // once per attempt here; the preparation effect will observe that
-          // it is no longer `preparing` and therefore cannot double-retry it.
-          if (!generationFailureQueueMutationRef.current.has(eventId)) {
-            generationFailureQueueMutationRef.current.add(eventId);
-            processingLiveEventIdsRef.current.delete(eventId);
-            preparingOperatorTaskRef.current = null;
-            void updateOperatorQueue(
-              eventId,
-              reason === 'generation_failed' ? 'retry' : 'fail',
-              { reason },
-            ).catch(() => undefined);
-          }
-        }
-        const incompleteDelivery = resolveIncompleteDelivery({
-          beatCount: operatorBeatCountRef.current,
-          completedBeatCount: operatorCompletedBeatCountRef.current,
-          audioByteLength: operatorAudioByteLengthRef.current,
-          playbackObserved:
-            operatorPlaybackObservedRef.current || Boolean(active?.ttsStartAt),
-        });
-        commitConversationHistoryOutcome(eventId, incompleteDelivery.status, {
-          viewerId: active?.viewerId,
-          deliveredFraction: incompleteDelivery.deliveredFraction,
-          reasonCode: reason,
-          ttsStartAt: active?.ttsStartAt,
-          ttsEndAt: Date.now(),
-        });
-        // The queue preparation effect is the sole retry authority for its
-        // active event. Letting this callback also mutate the queue races the
-        // still-running generation attempt and previously caused four rapid
-        // duplicate retries with a misleading no-draft reason.
-        if (!queueOwnsFailure) {
-          void updateOperatorQueue(
+      void generationFailureCoordinatorRef.current
+        .handle(
+          {
             eventId,
-            reason === 'generation_failed' ? 'retry' : 'fail',
-            { reason },
-          ).catch(() => undefined);
-        }
-        dispatchLiveHostEvent({
-          type: 'generation',
-          at: Date.now(),
-          eventId,
-          stage: 'failed',
-          turn: {
-            eventId,
-            kind: active?.channel.includes('quiet-room')
-              ? 'proactive'
-              : 'viewer',
-            priority: active?.channel.includes('quiet-room') ? 'low' : 'normal',
-            createdAt: Date.now(),
-            targetViewerId: active?.viewerId,
+            attemptId: metadata?.attemptId ?? active?.attemptId,
+            preparationOwned: queueOwnsFailure,
+            failure: capturedFailure,
+            evidence: readSpeechDeliveryEvidence(),
+            lifecycle: active ?? undefined,
+            turns: turnEnvelopeByEventIdRef.current,
           },
+          {
+            capturePreparationFailure: (failedEventId, failure) => {
+              generationFailureByEventIdRef.current.set(failedEventId, failure);
+            },
+            retirePendingState: (failedEventId) => {
+              pendingDeliveredInteractionsRef.current.delete(failedEventId);
+              pendingPersonaRuntimeCommitsRef.current.delete(failedEventId);
+            },
+            finalizeSoulOutcome,
+            commitConversationHistoryOutcome,
+            dispatchLiveHostEvent,
+            emitRuntimeEvent,
+          },
+        )
+        .catch((settlementError) => {
+          emitRuntimeEvent({
+            eventId,
+            attemptId: metadata?.attemptId ?? active?.attemptId,
+            stage: 'generation_failure_settlement_failed',
+            at: Date.now(),
+            reason:
+              settlementError instanceof Error
+                ? settlementError.message
+                : String(settlementError),
+          });
         });
-      }
-      emitRuntimeEvent({
-        eventId,
-        stage: queueOwnsFailure ? 'generation_error' : 'failed',
-        at: Date.now(),
-        source: active?.channel,
-        sourceLabel: active?.label,
-        viewerId: active?.viewerId,
-        viewerName: active?.viewerName,
-        sourcesSeen: active?.sourcesSeen,
-        testRunId: active?.testRunId,
-        stepId: active?.stepId,
-        scenarioId: active?.scenarioId,
-        reason,
-        error: errorMessage,
-      });
+      // Clear synchronously: AITuberOnAirCore emits speech-end immediately
+      // after this callback, before asynchronous Soul projection completes.
       if (active?.eventId && active.eventId === eventId) {
         activeLifecycleRef.current = null;
       }
@@ -3135,13 +2448,7 @@ export default function App() {
       scopeTransitionEventIdsRef.current.add(active.eventId);
     }
 
-    const incompleteDelivery = resolveIncompleteDelivery({
-      beatCount: operatorBeatCountRef.current,
-      completedBeatCount: operatorCompletedBeatCountRef.current,
-      audioByteLength: operatorAudioByteLengthRef.current,
-      playbackObserved:
-        operatorPlaybackObservedRef.current || Boolean(active?.ttsStartAt),
-    });
+    const scopeTransitionEvidence = readSpeechDeliveryEvidence();
     const oldSoulEventIds = [...soulSessionByEventIdRef.current.keys()];
     const oldQueueItems = operatorQueueRef.current.filter(
       (item) =>
@@ -3162,55 +2469,33 @@ export default function App() {
     const transition = scopeTransitionChainRef.current
       .catch(() => undefined)
       .then(async () => {
-        await Promise.all(
-          oldSoulEventIds.map((eventId) => {
-            const isActive = eventId === active?.eventId;
-            return finalizeSoulOutcome(
-              eventId,
-              isActive ? incompleteDelivery.status : 'failed',
-              {
-                deliveredFraction: isActive
-                  ? incompleteDelivery.deliveredFraction
-                  : 0,
-                reasonCode: isActive
-                  ? 'scope-switch-interrupted-delivery'
-                  : 'scope-switch-before-delivery',
-              },
-            );
-          }),
+        const settlement = await settleScopeTransitionTerminals(
+          {
+            active: active?.eventId
+              ? {
+                  eventId: active.eventId,
+                  attemptId: active.attemptId,
+                  viewerId: active.viewerId,
+                  ttsStartAt: active.ttsStartAt,
+                }
+              : undefined,
+            evidence: scopeTransitionEvidence,
+            capturedEventIds,
+            oldSoulEventIds,
+            oldQueueItems,
+            ownerId: runtimeOwnerIdRef.current,
+            turns: turnEnvelopeByEventIdRef.current,
+            at: targetActivatedAt,
+          },
+          {
+            mutateQueue: updateOperatorQueue,
+            finalizeSoulOutcome,
+            commitConversationHistoryOutcome,
+            emitRuntimeEvent,
+          },
         );
 
-        await Promise.allSettled(
-          oldQueueItems.map((item) =>
-            updateOperatorQueue(
-              item.eventId,
-              item.status === 'speaking' ? 'fail' : 'skip',
-              { reason: 'scope_changed_before_delivery' },
-            ),
-          ),
-        );
-
-        for (const eventId of capturedEventIds) {
-          const queueItem = oldQueueItems.find(
-            (item) => item.eventId === eventId,
-          );
-          const isActive = eventId === active?.eventId;
-          const deliveryStatus = isActive
-            ? incompleteDelivery.status
-            : queueItem && queueItem.status !== 'speaking'
-              ? 'skipped'
-              : 'failed';
-          commitConversationHistoryOutcome(eventId, deliveryStatus, {
-            viewerId: isActive ? active?.viewerId : queueItem?.viewerId,
-            deliveredFraction: isActive
-              ? incompleteDelivery.deliveredFraction
-              : 0,
-            reasonCode: isActive
-              ? 'scope-switch-interrupted-delivery'
-              : 'scope-switch-before-delivery',
-            ttsStartAt: isActive ? active?.ttsStartAt : undefined,
-            ttsEndAt: Date.now(),
-          });
+        for (const eventId of settlement.settledEventIds) {
           pendingDeliveredInteractionsRef.current.delete(eventId);
           pendingPersonaRuntimeCommitsRef.current.delete(eventId);
           processingLiveEventIdsRef.current.delete(eventId);
@@ -3245,7 +2530,7 @@ export default function App() {
         speechBeatBytesRef.current = 0;
         activeLifecycleRef.current = null;
         speechRenderTraceRef.current = null;
-        replyLatencyRef.current = null;
+        replyLatencyTracker.reset();
         speechReactionRef.current = null;
         proactiveSpeechRef.current = false;
         proactiveEventIdRef.current = null;
@@ -3259,6 +2544,7 @@ export default function App() {
           Math.random,
           nextPersonaRuntimeState,
         );
+        lastAudienceAwarenessEventRef.current = '';
         resetAvatarReaction();
         setAvatarMotion('idle_cold');
 
@@ -3289,6 +2575,8 @@ export default function App() {
     finalizeSoulOutcome,
     interruptSpeech,
     recoverChatRuntime,
+    readSpeechDeliveryEvidence,
+    replyLatencyTracker,
     resetAvatarReaction,
     soulScopeKey,
     soulSession,
@@ -3321,21 +2609,31 @@ export default function App() {
         stop();
         recoverChatRuntime();
         if (action.eventId) {
+          const at = Date.now();
           const pending = pendingDeliveredInteractionsRef.current.get(
             action.eventId,
           );
-          commitConversationHistoryOutcome(action.eventId, 'failed', {
-            viewerId: pending?.viewerId,
-            deliveredFraction: 0,
-            reasonCode: action.reasonCode,
-            ttsEndAt: Date.now(),
-          });
           pendingPersonaRuntimeCommitsRef.current.delete(action.eventId);
           pendingDeliveredInteractionsRef.current.delete(action.eventId);
-          finalizeSoulOutcome(action.eventId, 'failed', {
-            deliveredFraction: 0,
-            reasonCode: action.reasonCode,
-          });
+          const envelope = turnEnvelopeByEventIdRef.current.get(action.eventId);
+          void projectUndeliveredSpeech(
+            {
+              context: {
+                eventId: action.eventId,
+                attemptId: envelope?.attemptId,
+                viewerId: pending?.viewerId,
+              },
+              turns: turnEnvelopeByEventIdRef.current,
+              status: 'failed',
+              reasonCode: action.reasonCode,
+              at,
+            },
+            {
+              finalizeSoulOutcome,
+              commitConversationHistoryOutcome,
+              emitRuntimeEvent,
+            },
+          );
         }
         continue;
       }
@@ -3445,21 +2743,20 @@ export default function App() {
     }
     if (!operatorPlaybackObservedRef.current) return;
 
-    const hasCompleteOperatorAudio = hasCompleteDeliveryEvidence({
-      beatCount: operatorBeatCountRef.current,
-      completedBeatCount: operatorCompletedBeatCountRef.current,
-      audioByteLength: operatorAudioByteLengthRef.current,
+    const outcome = resolveSpeechOutcome({
+      signal: { type: 'completed', operatorPlayback: true },
+      evidence: readSpeechDeliveryEvidence(),
     });
     // `isSpeaking` can fall false between streaming TTS beats.  In that gap,
     // a queue item must remain leased instead of being falsely announced as
     // done before its final beat exists.
-    if (!hasCompleteOperatorAudio) return;
+    if (outcome.kind === 'deferred') return;
 
     // Use the same idempotent completion path as the core SPEECH_END event.
     // The first caller clears activeLifecycleRef; a late duplicate becomes a
     // no-op and cannot commit the Soul reservation twice.
     handleSpeechEnd();
-  }, [handleSpeechEnd, isSpeaking]);
+  }, [handleSpeechEnd, isSpeaking, readSpeechDeliveryEvidence]);
   const liveDirector = useLiveDirector(runtimeProfile, {
     soulManaged: soulPublicBehaviorEnabled,
   });
@@ -4083,13 +3380,14 @@ export default function App() {
   const processWithHostExtensions = useCallback(
     async (
       text: string,
-      options?: {
+      options: {
         displayText?: string;
         memoryContext?: string;
         viewerId?: string;
         viewerName?: string;
         source?: 'chat' | 'live' | 'vision';
-        eventId?: string;
+        eventId: string;
+        attemptId: string;
         commentAt?: number;
         receivedAt?: number;
         queuedAt?: number;
@@ -4101,8 +3399,7 @@ export default function App() {
         catchup?: boolean;
         showInput?: boolean;
         persistInteraction?: boolean;
-        silent?: boolean;
-        onPrepared?: (
+        onPrepared: (
           reply: string,
           skills: string[],
           speechPlan?: PreparedSpeechPlan,
@@ -4116,7 +3413,7 @@ export default function App() {
         engagementSignals?: OperatorQueueItem['engagementSignals'];
       },
     ) => {
-      const eventId = options?.eventId ?? crypto.randomUUID();
+      const eventId = options.eventId;
       if (processingLiveEventIdsRef.current.has(eventId)) {
         emitRuntimeEvent({
           eventId,
@@ -4186,8 +3483,6 @@ export default function App() {
             participantCountIsExact: false,
           }
         : undefined;
-      const weatherLocationClarification =
-        getWeatherLocationClarification(displayText);
       const routingInput = {
         text: displayText,
         viewerId: options?.viewerId,
@@ -4211,6 +3506,10 @@ export default function App() {
       const routing = soulOwnsTurn
         ? soulRouting!
         : await routeTyphoonSkillWithAgent(routingInput);
+      const weatherLocationClarification = routedWeatherLocationClarification(
+        displayText,
+        routing,
+      );
       emitRuntimeEvent({
         eventId,
         stage: 'program_decision',
@@ -4379,7 +3678,7 @@ export default function App() {
             stage: 'completed',
             turn,
           });
-          options?.onPrepared?.(NO_REPLY_TOKEN, []);
+          options.onPrepared(NO_REPLY_TOKEN, []);
           return true;
         }
         personaContext = formatPersonaInteractionPlan(
@@ -4511,7 +3810,7 @@ export default function App() {
           stage: 'completed',
           turn,
         });
-        options?.onPrepared?.(NO_REPLY_TOKEN, []);
+        options.onPrepared(NO_REPLY_TOKEN, []);
         return true;
       }
       if (personaRuntimeTransition) {
@@ -4553,11 +3852,7 @@ export default function App() {
         sourcesSeen: options?.sourcesSeen,
         createdAt: options?.commentAt,
       });
-      if (
-        weatherLocationClarification &&
-        options?.onPrepared &&
-        !soulOwnsTurn
-      ) {
+      if (weatherLocationClarification && !soulOwnsTurn) {
         emitRuntimeEvent({
           eventId,
           stage: 'weather_clarification_fast_path',
@@ -4910,7 +4205,7 @@ export default function App() {
               reasonCode,
               expiresAt: evaluation.decision.expiresAt,
             });
-            options?.onPrepared?.(NO_REPLY_TOKEN, []);
+            options.onPrepared(NO_REPLY_TOKEN, []);
             return true;
           }
 
@@ -4961,12 +4256,13 @@ export default function App() {
             });
           }
           soulSessionByEventIdRef.current.set(eventId, soulSession);
-          if (replyLatencyRef.current) {
-            replyLatencyRef.current.llmCompletedAt = Date.now();
-            replyLatencyRef.current.input = displayText;
-            replyLatencyRef.current.reply = spokenText;
-            replyLatencyRef.current.eventId = eventId;
-          }
+          replyLatencyTracker.record({
+            type: 'llm-completed',
+            input: displayText,
+            reply: spokenText,
+            eventId,
+            requireEventMatch: true,
+          });
           const historyScope = conversationHistoryScopeFor(
             options?.viewerId,
             options?.sourcesSeen?.[0],
@@ -5018,81 +4314,10 @@ export default function App() {
             responseGuardRewritten: guardedResponse.rewritten,
             responseGuardReasons: guardedResponse.reasons,
           });
-          if (options?.onPrepared) {
-            options.onPrepared(spokenText, enrichment.skills, speechPlan);
-            return true;
-          }
-          if (!claimSpeechPermission(eventId)) {
-            commitConversationHistoryOutcome(eventId, 'skipped', {
-              viewerId: options?.viewerId,
-              deliveredFraction: 0,
-              reasonCode: 'coordinator-denied-direct-speech',
-            });
-            pendingDeliveredInteractionsRef.current.delete(eventId);
-            finalizeSoulOutcome(eventId, 'skipped', {
-              deliveredFraction: 0,
-              reasonCode: 'coordinator-denied-direct-speech',
-            });
-            return true;
-          }
-          await speakPrepared(spokenText, speechPlan);
+          options.onPrepared(spokenText, enrichment.skills, speechPlan);
           return true;
         }
       }
-      // Operator-queue preparation must return a writable text draft. The
-      // screenshot/vision route speaks directly and has no draft callback, so
-      // reserve it for one-off direct broadcasts only.
-      if (enrichment.vision && !options?.silent) {
-        const liveRadarImage = await enrichment.vision.capture();
-        if (liveRadarImage) {
-          processingLiveEventIdsRef.current.delete(eventId);
-          dispatchLiveHostEvent({
-            type: 'generation',
-            at: Date.now(),
-            eventId,
-            stage: 'completed',
-            turn,
-          });
-          if (!claimSpeechPermission(eventId)) {
-            emitRuntimeEvent({
-              eventId,
-              stage: 'dropped',
-              at: Date.now(),
-              reason: 'coordinator_denied_direct_vision_speech',
-            });
-            return false;
-          }
-          if (activeLifecycleRef.current?.eventId !== eventId) {
-            activeLifecycleRef.current = {
-              eventId,
-              channel: options?.source ?? 'vision',
-              label: options?.sourceLabel ?? 'vision',
-              viewerId: options?.viewerId,
-              viewerName: options?.viewerName,
-              sourcesSeen: options?.sourcesSeen,
-            };
-          }
-          await processVisionChat(
-            liveRadarImage,
-            enrichment.vision.buildPrompt(
-              options?.displayText ?? text,
-              enrichment.context,
-            ),
-          );
-          if (activeLifecycleRef.current?.eventId === eventId) {
-            emitRuntimeEvent({
-              eventId,
-              stage: 'failed',
-              at: Date.now(),
-              reason: 'vision_completed_without_public_speech',
-            });
-            activeLifecycleRef.current = null;
-          }
-          return true;
-        }
-      }
-      const directPlaybackRequested =
-        options?.silent !== true && !options?.onPrepared;
       return processChat(text, {
         ...options,
         eventId,
@@ -5128,13 +4353,15 @@ export default function App() {
           runShadowSoulEvaluation?.();
           const repeatsRecentTopic =
             isProactive &&
-            isRecentSemanticTopicRepeat(
-              reply,
-              recentLiveTurnsRef.current
-                .filter((recent) => Date.now() - recent.at <= 5 * 60_000)
-                .flatMap((recent) => [recent.input, recent.reply ?? ''])
-                .filter(Boolean),
-            );
+            (isSingleUseEngagementEcho(reply) ||
+              isRecentSemanticTopicRepeat(
+                reply,
+                recentLiveTurnsRef.current
+                  .filter((recent) => Date.now() - recent.at <= 30 * 60_000)
+                  .slice(-6)
+                  .flatMap((recent) => [recent.input, recent.reply ?? ''])
+                  .filter(Boolean),
+              ));
           processingLiveEventIdsRef.current.delete(eventId);
           dispatchLiveHostEvent({
             type: 'generation',
@@ -5143,76 +4370,24 @@ export default function App() {
             stage: 'completed',
             turn,
           });
-          if (options?.onPrepared) {
-            if (repeatsRecentTopic) {
-              emitRuntimeEvent({
-                eventId,
-                stage: 'proactive_semantic_repeat_suppressed',
-                at: Date.now(),
-                source: options.source,
-                sourceLabel: options.sourceLabel,
-                reason: 'recent-topic-semantic-overlap',
-              });
-              options.onPrepared(NO_REPLY_TOKEN, enrichment.skills, speechPlan);
-              return;
-            }
-            options.onPrepared(reply, enrichment.skills, speechPlan);
-            return;
-          }
-          if (!directPlaybackRequested) return;
-          if (
-            runtimeScopeReadyKey !== soulScopeKey ||
-            !claimSpeechPermission(eventId)
-          ) {
+          if (repeatsRecentTopic) {
+            setReliabilityMetrics((current) => ({
+              ...current,
+              proactiveRepeatSuppressions:
+                current.proactiveRepeatSuppressions + 1,
+            }));
             emitRuntimeEvent({
               eventId,
-              stage: 'dropped',
+              stage: 'proactive_semantic_repeat_suppressed',
               at: Date.now(),
-              reason: 'coordinator_denied_direct_chat_speech',
+              source: options.source,
+              sourceLabel: options.sourceLabel,
+              reason: 'recent-topic-semantic-overlap',
             });
-            commitConversationHistoryOutcome(eventId, 'skipped', {
-              viewerId: options?.viewerId,
-              deliveredFraction: 0,
-              reasonCode: 'coordinator-denied-direct-chat-speech',
-            });
+            options.onPrepared(NO_REPLY_TOKEN, enrichment.skills, speechPlan);
             return;
           }
-          const active = activeLifecycleRef.current;
-          if (active?.eventId === eventId) {
-            active.replyText = reply;
-          } else {
-            activeLifecycleRef.current = {
-              eventId,
-              replyText: reply,
-              channel: options?.source ?? 'chat',
-              label: options?.sourceLabel ?? 'chat',
-              viewerId: options?.viewerId,
-              viewerName: options?.viewerName,
-              sourcesSeen: options?.sourcesSeen,
-            };
-          }
-          void speakPrepared(reply, speechPlan).catch((error) => {
-            emitRuntimeEvent({
-              eventId,
-              stage: 'failed',
-              at: Date.now(),
-              reason: 'direct_chat_tts_failed',
-              error: error instanceof Error ? error.message : String(error),
-            });
-            commitConversationHistoryOutcome(eventId, 'failed', {
-              viewerId: options?.viewerId,
-              deliveredFraction: 0,
-              reasonCode: 'direct-chat-tts-failed',
-              ttsEndAt: Date.now(),
-            });
-            void finalizeSoulOutcome(eventId, 'failed', {
-              deliveredFraction: 0,
-              reasonCode: 'direct-chat-tts-failed',
-            });
-            if (activeLifecycleRef.current?.eventId === eventId) {
-              activeLifecycleRef.current = null;
-            }
-          });
+          options.onPrepared(reply, enrichment.skills, speechPlan);
         },
       });
     },
@@ -5231,7 +4406,9 @@ export default function App() {
       personaPlannerEnabled,
       processChat,
       processVisionChat,
+      readSpeechDeliveryEvidence,
       recordSoulReflectionEvidence,
+      replyLatencyTracker,
       runSoulReflection,
       runtimeProfile.id,
       runtimeScopeReadyKey,
@@ -5251,15 +4428,10 @@ export default function App() {
 
   const refreshOperatorQueue = useCallback(async () => {
     try {
-      const response = await fetch(
-        `/api/operator-queue${isObsOverlay ? '' : '?observer=control-panel'}`,
-        { cache: 'no-store' },
+      const items = await operatorQueueClient.list(
+        isObsOverlay ? undefined : 'control-panel',
       );
-      if (!response.ok) return;
-      const payload = (await response.json()) as {
-        items?: OperatorQueueItem[];
-      };
-      if (Array.isArray(payload.items)) setOperatorQueue(payload.items);
+      setOperatorQueue(items);
     } catch {
       // The control room remains usable while the local Vite host reloads.
     }
@@ -5270,113 +4442,7 @@ export default function App() {
       const response = await fetch('/api/stress-test', { cache: 'no-store' });
       if (!response.ok) return;
       const raw = (await response.json()) as StressApiRecord;
-      const testItems = operatorQueue.filter(
-        (item) =>
-          item.testRunId === raw.runId ||
-          (raw.lifecycle === 'idle' && item.testRunId),
-      );
-      const status: StressRunState['status'] =
-        raw.cleanupState === 'running'
-          ? 'cleaning'
-          : raw.lifecycle === 'completed' && raw.hardPass !== true
-            ? 'failed'
-            : raw.lifecycle === 'running' ||
-                raw.lifecycle === 'paused' ||
-                raw.lifecycle === 'completed' ||
-                raw.lifecycle === 'aborted' ||
-                raw.lifecycle === 'failed'
-              ? raw.lifecycle
-              : raw.lifecycle === 'aborting'
-                ? 'paused'
-                : testItems.length > 0
-                  ? 'failed'
-                  : 'idle';
-      setStressRun({
-        status,
-        runId:
-          typeof raw.runId === 'string' ? raw.runId : testItems[0]?.testRunId,
-        completedSteps: Number(raw.terminalCount || 0),
-        totalSteps: Number(raw.messageCount || STRESS_TEST_PLAN.messageCount),
-        startedAt:
-          typeof raw.startedAt === 'number' ? raw.startedAt : undefined,
-        updatedAt:
-          typeof raw.updatedAt === 'number' ? raw.updatedAt : undefined,
-        etaMs:
-          typeof raw.estimatedRemainingMs === 'number'
-            ? raw.estimatedRemainingMs
-            : undefined,
-        reportPath:
-          typeof raw.reportDirectory === 'string'
-            ? raw.reportDirectory
-            : undefined,
-        phase: typeof raw.phaseLabel === 'string' ? raw.phaseLabel : undefined,
-        viewers: Array.isArray(raw.viewers)
-          ? raw.viewers.map((value) => {
-              const viewer = value as StressApiRecord;
-              return {
-                id: String(viewer.viewerId || ''),
-                name: String(viewer.viewerName || ''),
-                role: String(viewer.viewerId || ''),
-                status: viewer.currentStepId
-                  ? `当前 ${viewer.currentStepId}`
-                  : '等待',
-                completedSteps: Number(viewer.terminal || 0),
-                totalSteps: Number(viewer.quota || 0),
-                currentStep:
-                  typeof viewer.currentStepId === 'string'
-                    ? viewer.currentStepId
-                    : undefined,
-              };
-            })
-          : [],
-        queue: {
-          waiting: testItems.filter((item) => item.status === 'pending').length,
-          drafting: testItems.filter((item) => item.status === 'preparing')
-            .length,
-          ready: testItems.filter((item) => item.status === 'ready').length,
-          speaking: testItems.filter((item) => item.status === 'speaking')
-            .length,
-        },
-        currentPlayback:
-          raw.currentBroadcast && typeof raw.currentBroadcast === 'object'
-            ? {
-                viewerName: String(
-                  (raw.currentBroadcast as StressApiRecord).viewerName || '',
-                ),
-                stepId: String(
-                  (raw.currentBroadcast as StressApiRecord).stepId || '',
-                ),
-                text: testItems.find(
-                  (item) =>
-                    item.eventId ===
-                    (raw.currentBroadcast as StressApiRecord).eventId,
-                )?.preparedReply,
-              }
-            : undefined,
-        failures: Array.isArray(raw.failures)
-          ? raw.failures.map((value, index: number) => {
-              const failure = value as StressApiRecord;
-              return {
-                id: `${failure.code || 'failure'}-${failure.at || index}`,
-                code:
-                  typeof failure.code === 'string' ? failure.code : undefined,
-                stepId:
-                  typeof failure.stepId === 'string'
-                    ? failure.stepId
-                    : undefined,
-                message: String(
-                  failure.message || failure.code || 'unknown failure',
-                ),
-                at: Number(failure.at || Date.now()),
-                diagnostic:
-                  failure.diagnostic && typeof failure.diagnostic === 'object'
-                    ? (failure.diagnostic as StressRunState['failures'][number]['diagnostic'])
-                    : undefined,
-              };
-            })
-          : [],
-        diagnostics: parseStressDiagnostics(raw.diagnostics),
-      });
+      setStressRun(projectStressRunState(raw, operatorQueue));
     } catch {
       // Vite may be reloading while the live overlay keeps running.
     }
@@ -5529,19 +4595,7 @@ export default function App() {
         directReply: normalizedCityReport.directReply,
         viewerName: normalizedCityReport.viewerName,
       };
-      const response = await fetch('/api/operator-queue', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ action: 'ingest', ...queueInput, createdAt }),
-      });
-      if (!response.ok) {
-        const detail = (await response.text()).trim();
-        throw new Error(
-          `operator queue ingest failed (${response.status})${
-            detail ? `: ${detail.slice(0, 300)}` : ''
-          }`,
-        );
-      }
+      await operatorQueueClient.ingest({ ...queueInput, createdAt });
       emitRuntimeEvent({
         ...queueInput,
         stage: 'received',
@@ -5729,26 +4783,45 @@ export default function App() {
       proactiveEventIdRef.current = null;
       void Promise.all(
         [...eventIds].map(async (eventId) => {
-          await updateOperatorQueue(eventId, 'skip', { reason });
+          const queuedItem = operatorQueue.find(
+            (item) => item.eventId === eventId,
+          );
+          const envelope = turnEnvelopeByEventIdRef.current.get(eventId);
+          const attemptId = queuedItem?.attemptId ?? envelope?.attemptId;
+          await updateOperatorQueue(eventId, 'skip', {
+            attemptId,
+            ownerId: runtimeOwnerIdRef.current,
+            reason,
+          });
+          const at = Date.now();
           const pending = pendingDeliveredInteractionsRef.current.get(eventId);
           emitRuntimeEvent({
             eventId,
             stage: 'dropped',
-            at: Date.now(),
+            at,
             source: 'quiet-room-awareness',
             reason,
           });
           pendingPersonaRuntimeCommitsRef.current.delete(eventId);
-          commitConversationHistoryOutcome(eventId, 'skipped', {
-            viewerId: pending?.viewerId,
-            deliveredFraction: 0,
-            reasonCode: reason,
-          });
           pendingDeliveredInteractionsRef.current.delete(eventId);
-          finalizeSoulOutcome(eventId, 'skipped', {
-            deliveredFraction: 0,
-            reasonCode: reason,
-          });
+          await projectUndeliveredSpeech(
+            {
+              context: {
+                eventId,
+                attemptId,
+                viewerId: pending?.viewerId,
+              },
+              turns: turnEnvelopeByEventIdRef.current,
+              status: 'skipped',
+              reasonCode: reason,
+              at,
+            },
+            {
+              finalizeSoulOutcome,
+              commitConversationHistoryOutcome,
+              emitRuntimeEvent,
+            },
+          );
         }),
       )
         .then(() => refreshOperatorQueue())
@@ -5843,23 +4916,7 @@ export default function App() {
       if (!preparedReply) return;
       void unlock().catch(() => undefined);
       markLiveActivity('operator-manual');
-      const now = Date.now();
-      await fetch('/api/operator-queue', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          action: 'manual-broadcast',
-          eventId: crypto.randomUUID(),
-          text: preparedReply,
-          reply: preparedReply,
-          source: 'operator-manual',
-          sourceLabel: '总控手动播报',
-          viewerName: '主播总控',
-          sourcesSeen: ['operator-manual'],
-          createdAt: now,
-          auditActor: 'control-room',
-        }),
-      });
+      await operatorQueueClient.manualBroadcast(preparedReply);
       await refreshOperatorQueue();
     },
     [markLiveActivity, refreshOperatorQueue, unlock],
@@ -5877,29 +4934,65 @@ export default function App() {
     return () => window.clearInterval(timer);
   }, [refreshStressRun]);
 
+  const planOperatorWork = useCallback(
+    () =>
+      planOperatorTurnWork(operatorQueue, {
+        ownsRuntime: isLiveRuntimeOwner,
+        coreReady: isCoreReady,
+        scopeReady: runtimeScopeReadyKey === soulScopeKey,
+        coordinatorHold:
+          hostCoordinatorV2Enabled &&
+          liveHostSnapshot.phase === 'operator_hold',
+        processing: isProcessing,
+        speaking: isSpeaking,
+        preparingTaskActive: Boolean(preparingOperatorTaskRef.current),
+        speakingTaskActive: Boolean(speakingOperatorTaskRef.current),
+        ownerId: runtimeOwnerIdRef.current,
+        scopeActivatedAt: runtimeScopeActivatedAtRef.current,
+      }),
+    [
+      hostCoordinatorV2Enabled,
+      isCoreReady,
+      isLiveRuntimeOwner,
+      isProcessing,
+      isSpeaking,
+      liveHostSnapshot.phase,
+      operatorQueue,
+      runtimeScopeReadyKey,
+      soulScopeKey,
+    ],
+  );
+
   useEffect(() => {
-    if (
-      !isLiveRuntimeOwner ||
-      !isCoreReady ||
-      runtimeScopeReadyKey !== soulScopeKey ||
-      (hostCoordinatorV2Enabled &&
-        liveHostSnapshot.phase === 'operator_hold') ||
-      isProcessing ||
-      preparingOperatorTaskRef.current
-    )
-      return;
-    const next = operatorQueue.find(
-      (item) =>
-        item.status === 'pending' &&
-        (item.createdAt >= runtimeScopeActivatedAtRef.current ||
-          item.finishReason === 'lease_expired_requeued') &&
-        (!item.assignedOwnerId ||
-          item.assignedOwnerId === runtimeOwnerIdRef.current),
-    );
+    const next = planOperatorWork().prepare;
     if (!next) return;
+    const attemptClaim = {
+      attemptId: next.attemptId,
+      ownerId: runtimeOwnerIdRef.current,
+    };
     const claimedScopeEpoch = runtimeScopeEpochRef.current;
-    generationFailureQueueMutationRef.current.delete(next.eventId);
     preparingOperatorTaskRef.current = next.eventId;
+    const preparationRecoveryPorts = {
+      listQueue: () => operatorQueueClient.list(),
+      mutateQueue: updateOperatorQueue,
+      recoverRuntime: recoverChatRuntime,
+      wait: (ms: number) =>
+        new Promise<void>((resolve) => {
+          window.setTimeout(resolve, ms);
+        }),
+      emitRuntimeEvent,
+      dispatchLiveHostEvent,
+      incrementStaleCallbacks: () =>
+        setReliabilityMetrics((current) => ({
+          ...current,
+          staleCallbacks: current.staleCallbacks + 1,
+        })),
+      incrementCoordinatorRecoveries: () =>
+        setReliabilityMetrics((current) => ({
+          ...current,
+          coordinatorRecoveries: current.coordinatorRecoveries + 1,
+        })),
+    };
     void (async () => {
       try {
         if (next.status === 'pending') {
@@ -5926,64 +5019,31 @@ export default function App() {
         }
         const leaseTimer = window.setInterval(() => {
           void updateOperatorQueue(next.eventId, 'renew-lease', {
-            ownerId: runtimeOwnerIdRef.current,
+            ...attemptClaim,
           }).catch(() => undefined);
         }, 10_000);
         let prepared = false;
         let chatAccepted = true;
+        let draftSettlementTask: Promise<unknown> | null = null;
         try {
-          if (
-            !next.interactionObservedAt &&
-            next.viewerId &&
-            !next.presenceOnly
-          ) {
-            const relationshipPlatform = next.sourcesSeen?.[0] || 'unknown';
-            const relationshipKey = `${relationshipPlatform}:${next.viewerId}`;
-            const beforeRelationships = liveDirector.getRelationshipSnapshot();
-            if (!soulPublicBehaviorEnabled) {
-              liveDirector.observeViewerInteraction({
-                id: next.viewerId,
-                name: next.viewerName,
-                platform: relationshipPlatform,
-              });
-            }
-            const afterRelationships = liveDirector.getRelationshipSnapshot();
-            const beforeVisits =
-              beforeRelationships[relationshipKey]?.visits ?? 0;
-            const afterVisits =
-              afterRelationships[relationshipKey]?.visits ?? 0;
-            const otherViewerRelationshipMutated = Object.keys({
-              ...beforeRelationships,
-              ...afterRelationships,
-            }).some(
-              (viewerId) =>
-                viewerId !== relationshipKey &&
-                JSON.stringify(beforeRelationships[viewerId] ?? null) !==
-                  JSON.stringify(afterRelationships[viewerId] ?? null),
-            );
-            await updateOperatorQueue(next.eventId, 'mark-observed', {
-              relationshipVisitDelta: afterVisits - beforeVisits,
-              otherViewerRelationshipMutated,
+          const interactionAccounting = await accountViewerInteraction({
+            item: next,
+            ownerId: runtimeOwnerIdRef.current,
+            soulPublicBehaviorEnabled,
+            director: liveDirector,
+            queue: operatorInteractionAccountingQueue,
+          });
+          if (interactionAccounting.metricsStatus === 'failed') {
+            emitRuntimeEvent({
+              eventId: next.eventId,
+              attemptId: next.attemptId,
+              testRunId: next.testRunId,
+              stepId: next.stepId,
+              scenarioId: next.scenarioId,
+              stage: 'interaction-accounting-metrics-failed',
+              at: Date.now(),
+              reason: 'queue_metrics_write_failed',
             });
-          }
-          if (
-            !next.engagementAppliedAt &&
-            next.viewerId &&
-            next.engagementSignals?.length
-          ) {
-            if (!soulPublicBehaviorEnabled) {
-              for (const signal of next.engagementSignals) {
-                liveDirector.recordRelationshipSignal(
-                  {
-                    id: next.viewerId,
-                    name: next.viewerName,
-                    platform: next.sourcesSeen?.[0],
-                  },
-                  signal,
-                );
-              }
-            }
-            await updateOperatorQueue(next.eventId, 'mark-engagement');
           }
           if (
             next.testRunId &&
@@ -6000,7 +5060,10 @@ export default function App() {
               reason: 'injected_test_failure',
             });
             await updateOperatorQueue(next.eventId, 'consume-fault');
-            await updateOperatorQueue(next.eventId, 'retry');
+            await updateOperatorQueue(next.eventId, 'retry', {
+              ...attemptClaim,
+              reason: 'injected_model_truncation',
+            });
             return;
           }
           await refreshOperatorQueue();
@@ -6010,19 +5073,13 @@ export default function App() {
           ) {
             prepared = true;
             await updateOperatorQueue(next.eventId, 'fail', {
+              ...attemptClaim,
               reason: 'scope_changed_during_generation',
             }).catch(() => undefined);
             return;
           }
           const generationPrompt = next.prompt || next.text;
-          // Queue-originated turns (live comments, radar bridge messages and
-          // proactive turns) used to bypass the trace initialised by
-          // handleSend. They could finish and emit `done`, but had no latency
-          // record to persist, leaving the topology stuck on an older result.
-          // Start one trace for the claimed queue turn before generation so a
-          // safe skill fallback is measured exactly like a normal reply.
-          replyLatencyRef.current = {
-            requestId: crypto.randomUUID(),
+          replyLatencyTracker.start({
             source:
               next.source.includes('live') ||
               next.source === 'parent-message' ||
@@ -6033,18 +5090,217 @@ export default function App() {
             models: replyModelTrace,
             input: next.text,
             eventId: next.eventId,
+            attemptId: next.attemptId,
             origin: {
               channel: next.source,
               viewerId: next.viewerId,
               viewerName: next.viewerName,
               sourcesSeen: next.sourcesSeen,
             },
-          };
+          });
+          const cityReport = parseCityReportPayloadV2({
+            eventId: next.eventId,
+            text: generationPrompt,
+            viewerId: next.viewerId,
+            viewerName: next.viewerName,
+          });
+          if (cityReport) {
+            const envelope = createTurnEnvelopeV2({
+              eventId: next.eventId,
+              attemptId: next.attemptId,
+              source: next.source,
+              sourceLabel: next.sourceLabel,
+              viewerId: next.viewerId,
+              viewerName: cityReport.viewerName,
+              text: next.text,
+              intent: cityReport.socialIntent
+                ? 'city-report+social'
+                : 'city-report',
+              factSnapshot: cityReportFactSnapshot(cityReport),
+              scope: {
+                personaId: runtimeProfile.id,
+                platform: next.sourcesSeen?.[0] || next.source,
+                roomId: soulScopeKey,
+                sessionId: String(runtimeScopeEpochRef.current),
+              },
+              createdAt: next.createdAt,
+            });
+            turnEnvelopeByEventIdRef.current.set(next.eventId, envelope);
+            transitionStoredTurn(
+              turnEnvelopeByEventIdRef.current,
+              next.eventId,
+              next.attemptId,
+              'preparing',
+            );
+            const cityPreparation = await prepareIsolatedCityReport({
+              payload: cityReport,
+              recentTurns: recentLiveTurnsRef.current,
+              generate: generateIsolatedReply,
+            });
+            const preparedReply = cityPreparation.reply;
+            const citySpeechPlan = cityPreparation.speechPlan;
+            for (const attempt of cityPreparation.attempts) {
+              if (attempt.status === 'rejected') {
+                setReliabilityMetrics((current) => ({
+                  ...current,
+                  bindingErrors: current.bindingErrors + 1,
+                }));
+                emitRuntimeEvent({
+                  eventId: next.eventId,
+                  attemptId: next.attemptId,
+                  isolatedAttempt: attempt.index,
+                  stage: 'city_binding_rejected',
+                  at: Date.now(),
+                  reasons: attempt.reasons,
+                });
+              } else if (attempt.status === 'failed') {
+                emitRuntimeEvent({
+                  eventId: next.eventId,
+                  attemptId: next.attemptId,
+                  isolatedAttempt: attempt.index,
+                  stage: 'city_isolated_generation_failed',
+                  at: Date.now(),
+                  error: attempt.error,
+                });
+              }
+            }
+            if (cityPreparation.usedDeterministicFallback) {
+              emitRuntimeEvent({
+                eventId: next.eventId,
+                attemptId: next.attemptId,
+                stage: 'city_deterministic_fallback',
+                at: Date.now(),
+                reasons: cityPreparation.attempts.flatMap((attempt) =>
+                  attempt.status === 'rejected'
+                    ? attempt.reasons
+                    : attempt.status === 'failed'
+                      ? [attempt.error]
+                      : [],
+                ),
+              });
+            }
+            prepared = true;
+            pendingDeliveredInteractionsRef.current.set(next.eventId, {
+              input: cityReport.viewerQuestion || next.text,
+              reply: preparedReply,
+              eventId: next.eventId,
+              viewerId: next.viewerId,
+              viewerName: cityReport.viewerName,
+              source: 'live',
+              sourceLabel: next.sourceLabel,
+              sourcesSeen: next.sourcesSeen,
+            });
+            replyLatencyTracker.record({
+              type: 'llm-completed',
+              eventId: next.eventId,
+              requireEventMatch: true,
+              reply: preparedReply,
+            });
+            const historyScope = conversationHistoryScopeFor(
+              next.viewerId,
+              next.sourcesSeen?.[0],
+            );
+            conversationHistoryScopeByEventIdRef.current.set(
+              next.eventId,
+              historyScope,
+            );
+            void fetch('/api/conversation-history', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                input: cityReport.viewerQuestion || next.text,
+                reply: preparedReply,
+                viewerId: next.viewerId,
+                viewerName: cityReport.viewerName,
+                source: 'live',
+                sourceLabel: next.sourceLabel,
+                eventId: next.eventId,
+                scope: historyScope,
+                deliveryStatus: 'generated',
+                queuedAt: next.createdAt,
+                processingAt: Date.now(),
+                llmEndAt: Date.now(),
+                sourcesSeen: next.sourcesSeen,
+              }),
+            }).catch((error) => {
+              console.warn('City delivery reservation failed.', error);
+            });
+            transitionStoredTurn(
+              turnEnvelopeByEventIdRef.current,
+              next.eventId,
+              next.attemptId,
+              'ready',
+            );
+            emitRuntimeEvent({
+              eventId: next.eventId,
+              attemptId: next.attemptId,
+              stage: 'city_isolated_ready',
+              at: Date.now(),
+              city: cityReport.city,
+              viewerId: next.viewerId,
+              viewerName: cityReport.viewerName,
+              fallback: cityPreparation.attempts.some(
+                (attempt) => attempt.status !== 'accepted',
+              ),
+              deterministicFallback: cityPreparation.usedDeterministicFallback,
+            });
+            await updateOperatorQueue(next.eventId, 'ready', {
+              attemptId: next.attemptId,
+              reply: preparedReply,
+              speechPlan: citySpeechPlan,
+              skills: ['city-report-isolated-v2'],
+            });
+            processingLiveEventIdsRef.current.delete(next.eventId);
+            dispatchLiveHostEvent({
+              type: 'generation',
+              at: Date.now(),
+              eventId: next.eventId,
+              stage: 'completed',
+              turn: {
+                eventId: next.eventId,
+                kind: 'viewer',
+                priority: 'normal',
+                createdAt: next.createdAt,
+                targetViewerId: next.viewerId,
+              },
+            });
+            return;
+          }
+          turnEnvelopeByEventIdRef.current.set(
+            next.eventId,
+            transitionTurn(
+              createTurnEnvelopeV2({
+                eventId: next.eventId,
+                attemptId: next.attemptId,
+                source: next.source,
+                sourceLabel: next.sourceLabel,
+                viewerId: next.viewerId,
+                viewerName: next.viewerName,
+                text: next.text,
+                intent: 'conversation',
+                scope: {
+                  personaId: runtimeProfile.id,
+                  platform: next.sourcesSeen?.[0] || next.source,
+                  roomId: soulScopeKey,
+                  sessionId: String(runtimeScopeEpochRef.current),
+                },
+                createdAt: next.createdAt,
+              }),
+              'preparing',
+            ),
+          );
+          // Queue-originated turns (live comments, radar bridge messages and
+          // proactive turns) used to bypass the trace initialised by
+          // handleSend. They could finish and emit `done`, but had no latency
+          // record to persist, leaving the topology stuck on an older result.
+          // Start one trace for the claimed queue turn before generation so a
+          // safe skill fallback is measured exactly like a normal reply.
           chatAccepted =
             (await processWithHostExtensions(generationPrompt, {
               displayText: next.text,
               source: 'chat',
               eventId: next.eventId,
+              attemptId: next.attemptId,
               sourceLabel: next.sourceLabel || next.source,
               viewerId: next.viewerId,
               viewerName: next.viewerName,
@@ -6061,129 +5317,90 @@ export default function App() {
                 id: scopedViewerId(next.viewerId, next.sourcesSeen?.[0]),
                 name: next.viewerName,
               }),
-              silent: true,
               onPrepared: (reply, skills, speechPlan) => {
                 prepared = true;
-                if (
-                  claimedScopeEpoch !== runtimeScopeEpochRef.current ||
-                  activeSoulScopeContextRef.current.scopeKey !== soulScopeKey
-                ) {
-                  void updateOperatorQueue(next.eventId, 'fail', {
-                    reason: 'scope_changed_before_draft_commit',
-                  }).catch(() => undefined);
-                  return;
-                }
-                if (reply === NO_REPLY_TOKEN) {
-                  emitRuntimeEvent({
-                    eventId: next.eventId,
-                    stage: 'dropped',
-                    at: Date.now(),
-                    text: next.text,
-                    source: next.source,
-                    sourceLabel: next.sourceLabel,
-                    viewerId: next.viewerId,
-                    viewerName: next.viewerName,
-                    sourcesSeen: next.sourcesSeen,
-                    reason: 'llm_no_reply',
-                  });
-                  void updateOperatorQueue(next.eventId, 'skip', {
-                    reason: 'llm_no_reply',
-                  })
-                    .then(() => refreshOperatorQueue())
-                    .catch(() => undefined);
-                  return;
-                }
-                emitRuntimeEvent({
-                  eventId: next.eventId,
-                  stage: 'generated',
-                  at: Date.now(),
-                  text: next.text,
-                  source: next.source,
-                  sourceLabel: next.sourceLabel,
-                  viewerId: next.viewerId,
-                  viewerName: next.viewerName,
-                  sourcesSeen: next.sourcesSeen,
-                  preparedReply: reply,
-                  speechPlan,
-                  skills,
-                });
-                void updateOperatorQueue(next.eventId, 'ready', {
-                  reply,
-                  speechPlan,
-                  skills,
-                })
-                  .then(() => refreshOperatorQueue())
-                  .catch(() => undefined);
+                if (draftSettlementTask) return;
+                draftSettlementTask = settleOperatorDraft(
+                  {
+                    item: next,
+                    ownerId: runtimeOwnerIdRef.current,
+                    reply,
+                    skills,
+                    speechPlan,
+                    noReplyToken: NO_REPLY_TOKEN,
+                    scopeIsCurrent:
+                      claimedScopeEpoch === runtimeScopeEpochRef.current &&
+                      activeSoulScopeContextRef.current.scopeKey ===
+                        soulScopeKey,
+                    turns: turnEnvelopeByEventIdRef.current,
+                  },
+                  {
+                    mutateQueue: updateOperatorQueue,
+                    refreshQueue: refreshOperatorQueue,
+                    emitRuntimeEvent,
+                    dispatchLiveHostEvent,
+                    incrementCoordinatorRecoveries: () =>
+                      setReliabilityMetrics((current) => ({
+                        ...current,
+                        coordinatorRecoveries:
+                          current.coordinatorRecoveries + 1,
+                      })),
+                  },
+                );
               },
             })) !== false;
+          if (draftSettlementTask) await draftSettlementTask;
         } finally {
           window.clearInterval(leaseTimer);
         }
         if (!prepared) {
-          // The current attempt has returned, so its generation de-duplication
-          // guard must not outlive the attempt and reject the controlled retry.
-          processingLiveEventIdsRef.current.delete(next.eventId);
           const capturedFailure = generationFailureByEventIdRef.current.get(
             next.eventId,
           );
-          generationFailureByEventIdRef.current.delete(next.eventId);
-          const response = await fetch('/api/operator-queue', {
-            cache: 'no-store',
-          });
-          const payload = (await response.json()) as {
-            items?: OperatorQueueItem[];
-          };
-          const current = payload.items?.find(
-            (item) => item.eventId === next.eventId,
+          const recovery = await recoverOperatorPreparation(
+            {
+              item: next,
+              ownerId: runtimeOwnerIdRef.current,
+              turns: turnEnvelopeByEventIdRef.current,
+              failure: {
+                kind: 'no-draft',
+                chatAccepted,
+                captured: capturedFailure,
+              },
+            },
+            preparationRecoveryPorts,
           );
-          if (
-            current?.status === 'preparing' &&
-            current.leaseOwnerId === runtimeOwnerIdRef.current
-          ) {
-            const reason =
-              capturedFailure?.reason ??
-              (chatAccepted
-                ? 'generation_completed_without_draft'
-                : 'generation_core_rejected');
-            emitRuntimeEvent({
-              eventId: next.eventId,
-              stage: 'failed',
-              at: Date.now(),
-              reason,
-              error: capturedFailure?.error,
-            });
-            if (capturedFailure && !capturedFailure.retryable) {
-              await updateOperatorQueue(next.eventId, 'fail', { reason });
-              return;
-            }
-            // `processChat` can resolve without an ASSISTANT_RESPONSE when a
-            // previous provider stream left the core's private lock engaged.
-            // Reset before retrying so the next queue turn gets a fresh core
-            // instead of silently receiving another immediate rejection.
-            recoverChatRuntime();
-            // `recoverChatRuntime` clears the core synchronously but React
-            // publishes `isCoreReady=false` on the next render.  Requeueing
-            // in the same microtask let the old effect immediately claim the
-            // item again against a null core, exhausting retries during a
-            // burst without making a provider request.
-            await new Promise<void>((resolve) => {
-              window.setTimeout(resolve, 750);
-            });
-            await updateOperatorQueue(next.eventId, 'retry', {
-              reason,
-            });
+          if (recovery.status !== 'ignored' && recovery.status !== 'stale') {
+            // The durable recovery has settled this exact attempt. Its local
+            // de-duplication and failure records may now be retired safely.
+            processingLiveEventIdsRef.current.delete(next.eventId);
+            generationFailureByEventIdRef.current.delete(next.eventId);
           }
         }
-      } catch {
-        // A deleted operator item is intentionally allowed to disappear.
+      } catch (error) {
+        const recovery = await recoverOperatorPreparation(
+          {
+            item: next,
+            ownerId: runtimeOwnerIdRef.current,
+            turns: turnEnvelopeByEventIdRef.current,
+            failure: { kind: 'exception', error },
+          },
+          preparationRecoveryPorts,
+        );
+        if (recovery.status === 'failed') {
+          processingLiveEventIdsRef.current.delete(next.eventId);
+          generationFailureByEventIdRef.current.delete(next.eventId);
+        }
       } finally {
         preparingOperatorTaskRef.current = null;
         void refreshOperatorQueue();
       }
     })();
   }, [
+    conversationHistoryScopeFor,
     dispatchLiveHostEvent,
     emitRuntimeEvent,
+    generateIsolatedReply,
     isCoreReady,
     isLiveRuntimeOwner,
     isProcessing,
@@ -6191,10 +5408,13 @@ export default function App() {
     liveHostSnapshot.phase,
     liveDirector,
     operatorQueue,
+    planOperatorWork,
     processWithHostExtensions,
     recoverChatRuntime,
+    replyLatencyTracker,
     replyModelTrace,
     refreshOperatorQueue,
+    runtimeProfile.id,
     runtimeScopeReadyKey,
     soulScopeKey,
     soulPublicBehaviorEnabled,
@@ -6202,61 +5422,65 @@ export default function App() {
   ]);
 
   useEffect(() => {
-    if (
-      !isLiveRuntimeOwner ||
-      runtimeScopeReadyKey !== soulScopeKey ||
-      (hostCoordinatorV2Enabled &&
-        liveHostSnapshot.phase === 'operator_hold') ||
-      isSpeaking ||
-      isProcessing ||
-      speakingOperatorTaskRef.current
-    )
-      return;
-    const stale = operatorQueue.find(
-      (item) =>
-        isStaleReadyReply(item) &&
-        (item.createdAt >= runtimeScopeActivatedAtRef.current ||
-          item.finishReason === 'lease_expired_requeued') &&
-        (!item.assignedOwnerId ||
-          item.assignedOwnerId === runtimeOwnerIdRef.current),
-    );
+    const { staleReady: stale, speak: next } = planOperatorWork();
     if (stale) {
       void updateOperatorQueue(stale.eventId, 'skip', {
         reason: 'stale_before_speech',
       })
-        .then(() => {
-          commitConversationHistoryOutcome(stale.eventId, 'skipped', {
-            viewerId: stale.viewerId,
-            deliveredFraction: 0,
-            reasonCode: 'stale-before-speech',
-          });
+        .then(async () => {
+          const at = Date.now();
           pendingDeliveredInteractionsRef.current.delete(stale.eventId);
-          finalizeSoulOutcome(stale.eventId, 'skipped', {
-            deliveredFraction: 0,
-            reasonCode: 'stale-before-speech',
-          });
+          await projectUndeliveredSpeech(
+            {
+              context: {
+                eventId: stale.eventId,
+                attemptId: stale.attemptId,
+                viewerId: stale.viewerId,
+              },
+              turns: turnEnvelopeByEventIdRef.current,
+              status: 'skipped',
+              reasonCode: 'stale-before-speech',
+              at,
+            },
+            {
+              finalizeSoulOutcome,
+              commitConversationHistoryOutcome,
+              emitRuntimeEvent,
+            },
+          );
           emitRuntimeEvent({
             eventId: stale.eventId,
             stage: 'dropped',
-            at: Date.now(),
+            at,
             source: stale.source,
             reason: 'stale_before_speech',
+          });
+          dispatchLiveHostEvent({
+            type: 'generation',
+            at,
+            eventId: stale.eventId,
+            stage: 'failed',
+            turn: {
+              eventId: stale.eventId,
+              kind: stale.source.includes('quiet-room')
+                ? 'proactive'
+                : 'viewer',
+              priority: 'normal',
+              createdAt: stale.createdAt,
+              targetViewerId: stale.viewerId,
+            },
           });
           return refreshOperatorQueue();
         })
         .catch(() => undefined);
       return;
     }
-    const next = operatorQueue.find(
-      (item) =>
-        item.status === 'ready' &&
-        item.preparedReply &&
-        item.createdAt >= runtimeScopeActivatedAtRef.current &&
-        (!item.assignedOwnerId ||
-          item.assignedOwnerId === runtimeOwnerIdRef.current),
-    );
     if (!next?.preparedReply) return;
     const preparedReply = next.preparedReply;
+    const attemptClaim = {
+      attemptId: next.attemptId,
+      ownerId: runtimeOwnerIdRef.current,
+    };
     if (liveHostSnapshot.activeTurn?.eventId !== next.eventId) {
       const turn = {
         eventId: next.eventId,
@@ -6296,10 +5520,12 @@ export default function App() {
       try {
         await updateOperatorQueue(next.eventId, 'claim-speak', {
           ownerId: runtimeOwnerIdRef.current,
+          attemptId: next.attemptId,
         });
         claimedSpeech = true;
         if (!claimSpeechPermission(next.eventId)) {
           await updateOperatorQueue(next.eventId, 'fail', {
+            ...attemptClaim,
             reason: 'coordinator_speak_turn_missing',
           }).catch(() => undefined);
           speakingOperatorTaskRef.current = null;
@@ -6310,6 +5536,7 @@ export default function App() {
           activeSoulScopeContextRef.current.scopeKey !== soulScopeKey
         ) {
           await updateOperatorQueue(next.eventId, 'fail', {
+            ...attemptClaim,
             reason: 'scope_changed_before_speech',
           }).catch(() => undefined);
           speakingOperatorTaskRef.current = null;
@@ -6320,7 +5547,7 @@ export default function App() {
         operatorAudioByteLengthRef.current = 0;
         leaseTimer = window.setInterval(() => {
           void updateOperatorQueue(next.eventId, 'renew-lease', {
-            ownerId: runtimeOwnerIdRef.current,
+            ...attemptClaim,
           }).catch(() => undefined);
         }, 10_000);
         if (
@@ -6339,12 +5566,16 @@ export default function App() {
             reason: 'injected_test_failure',
           });
           await updateOperatorQueue(next.eventId, 'consume-fault');
-          await updateOperatorQueue(next.eventId, 'retry');
+          await updateOperatorQueue(next.eventId, 'retry', {
+            ...attemptClaim,
+            reason: 'injected_tts_first_beat_failure',
+          });
           speakingOperatorTaskRef.current = null;
           return;
         }
         activeLifecycleRef.current = {
           eventId: next.eventId,
+          attemptId: next.attemptId,
           replyText: preparedReply,
           channel: next.source,
           label: next.sourceLabel || next.source,
@@ -6370,69 +5601,99 @@ export default function App() {
           operatorSpeechWatchdogRef.current = null;
         }
         operatorPlaybackObservedRef.current = false;
+        // A watchdog may have already durably settled this exact attempt and
+        // stopped the renderer. Its resulting playback rejection is not a
+        // second failure authority.
+        if (claimedSpeech && speakingOperatorTaskRef.current !== next.eventId) {
+          return;
+        }
         // A second control/overlay page may have rendered from a stale queue
         // snapshot. It lost the atomic server claim; that is not a playback
         // failure and must never overwrite the real owner's done state.
         if (!claimedSpeech) {
+          const reason = error instanceof Error ? error.message : String(error);
+          if (/stale queue .* attempt/i.test(reason)) {
+            setReliabilityMetrics((current) => ({
+              ...current,
+              staleCallbacks: current.staleCallbacks + 1,
+            }));
+            emitRuntimeEvent({
+              eventId: next.eventId,
+              attemptId: next.attemptId,
+              stage: 'stale_callback',
+              at: Date.now(),
+              reason,
+            });
+          }
+          dispatchLiveHostEvent({
+            type: 'generation',
+            at: Date.now(),
+            eventId: next.eventId,
+            stage: 'failed',
+            turn: {
+              eventId: next.eventId,
+              kind: next.source.includes('quiet-room') ? 'proactive' : 'viewer',
+              priority: 'normal',
+              createdAt: next.createdAt,
+              targetViewerId: next.viewerId,
+            },
+          });
           speakingOperatorTaskRef.current = null;
           return;
         }
-        // The core can invoke onChatError before this outer catch runs, which
-        // clears activeLifecycleRef.  Report from the queued item instead so
-        // a first-beat failure always remains correlated to its stress step.
-        emitRuntimeEvent({
-          eventId: next.eventId,
-          testRunId: next.testRunId,
-          stepId: next.stepId,
-          scenarioId: next.scenarioId,
-          stage: 'failed',
-          at: Date.now(),
-          source: next.source,
-          sourceLabel: next.sourceLabel,
-          viewerId: next.viewerId,
-          viewerName: next.viewerName,
-          sourcesSeen: next.sourcesSeen,
-          reason: 'tts_playback_failed',
-          error: error instanceof Error ? error.message : String(error),
-        });
-        const incompleteDelivery = resolveIncompleteDelivery({
-          beatCount: operatorBeatCountRef.current,
-          completedBeatCount: operatorCompletedBeatCountRef.current,
-          audioByteLength: operatorAudioByteLengthRef.current,
-          playbackObserved:
-            operatorPlaybackObservedRef.current ||
-            Boolean(activeLifecycleRef.current?.ttsStartAt),
-        });
-        await finalizeSoulOutcome(next.eventId, incompleteDelivery.status, {
-          deliveredFraction: incompleteDelivery.deliveredFraction,
-          reasonCode:
-            incompleteDelivery.status === 'partial'
-              ? 'tts-playback-failed-after-partial-delivery'
-              : 'tts-playback-failed',
-        });
-        if (activeLifecycleRef.current?.eventId === next.eventId) {
-          activeLifecycleRef.current = null;
+        try {
+          await settleOperatorSpeechFailure(
+            {
+              item: next,
+              ownerId: runtimeOwnerIdRef.current,
+              turns: turnEnvelopeByEventIdRef.current,
+              evidence: readSpeechDeliveryEvidence(),
+              failure: {
+                kind: 'playback',
+                error: error instanceof Error ? error.message : String(error),
+              },
+            },
+            {
+              mutateQueue: updateOperatorQueue,
+              finalizeSoulOutcome,
+              commitConversationHistoryOutcome,
+              emitRuntimeEvent,
+              dispatchLiveHostEvent,
+              retireLocalState: retireOperatorSpeechFailureState,
+            },
+          );
+        } catch (settlementError) {
+          const reason =
+            settlementError instanceof Error
+              ? settlementError.message
+              : String(settlementError);
+          if (
+            /stale queue .* attempt|queue lease owner mismatch/i.test(reason)
+          ) {
+            setReliabilityMetrics((current) => ({
+              ...current,
+              staleCallbacks: current.staleCallbacks + 1,
+            }));
+            emitRuntimeEvent({
+              eventId: next.eventId,
+              attemptId: next.attemptId,
+              stage: 'stale_callback',
+              at: Date.now(),
+              reason,
+            });
+          } else {
+            emitRuntimeEvent({
+              eventId: next.eventId,
+              attemptId: next.attemptId,
+              stage: 'speech_failure_settlement_failed',
+              at: Date.now(),
+              reason,
+            });
+          }
+          if (speakingOperatorTaskRef.current === next.eventId) {
+            speakingOperatorTaskRef.current = null;
+          }
         }
-        commitConversationHistoryOutcome(
-          next.eventId,
-          incompleteDelivery.status,
-          {
-            viewerId: next.viewerId,
-            deliveredFraction: incompleteDelivery.deliveredFraction,
-            reasonCode: 'tts_playback_failed',
-            ttsEndAt: Date.now(),
-          },
-        );
-        pendingDeliveredInteractionsRef.current.delete(next.eventId);
-        // The core already retries the first beat exactly once. Never requeue
-        // a heard response, and do not add a second outer retry loop.
-        await updateOperatorQueue(next.eventId, 'fail', {
-          reason:
-            operatorCompletedBeatCountRef.current > 0
-              ? 'later_beat_failed_partial_playback_preserved'
-              : 'tts_first_beat_failed_after_retry',
-        }).catch(() => undefined);
-        speakingOperatorTaskRef.current = null;
       } finally {
         if (leaseTimer !== null) window.clearInterval(leaseTimer);
         void refreshOperatorQueue();
@@ -6448,8 +5709,11 @@ export default function App() {
     isSpeaking,
     hostCoordinatorV2Enabled,
     liveHostSnapshot.activeTurn?.eventId,
+    readSpeechDeliveryEvidence,
+    retireOperatorSpeechFailureState,
     liveHostSnapshot.phase,
     operatorQueue,
+    planOperatorWork,
     refreshOperatorQueue,
     runtimeScopeReadyKey,
     soulScopeKey,
@@ -6690,57 +5954,22 @@ export default function App() {
       // Unlock audio while this Enter/click handler still has user-gesture
       // permission; TTS arrives asynchronously after the LLM response.
       void unlock().catch(() => undefined);
-      // Manual chat uses the same authoritative queue in legacy, shadow,
-      // canary and primary modes. No direct processChat/TTS bypass remains.
-      if (isLiveHostCoordinatorRequired()) {
-        const eventId = crypto.randomUUID();
-        markLiveActivity('web-chat');
-        if (!interruptProactiveSpeech(eventId, 'operator')) return;
-        void enqueueOperatorMessage({
-          eventId,
-          text,
-          source: 'web-chat',
-          sourceLabel: 'control-room-input',
-          sourcesSeen: ['local-control-room'],
-        });
-        return;
-      }
-      const lifecycle = beginConversationLifecycle({
-        channel: 'web-chat',
-        label: '总控手动输入',
-      });
-      replyLatencyRef.current = {
-        requestId: crypto.randomUUID(),
-        source: 'chat',
-        inputAt: Date.now(),
-        models: replyModelTrace,
-        input: text,
-        eventId: lifecycle.eventId,
-        origin: { channel: 'web-chat' },
-      };
+      // Manual chat always enters the authoritative operator queue. No direct
+      // processChat/TTS bypass remains.
+      const eventId = crypto.randomUUID();
       markLiveActivity('web-chat');
-      if (!interruptProactiveSpeech(lifecycle.eventId, 'operator')) {
-        activeLifecycleRef.current = null;
-        return;
-      }
-      // Stop previous audio if speech is currently playing
-      stop();
-      resetAvatarReaction();
-      void processWithHostExtensions(text, {
-        memoryContext: streamerMemory.contextFor(text),
-        eventId: lifecycle.eventId,
-        sourceLabel: lifecycle.label,
+      if (!interruptProactiveSpeech(eventId, 'operator')) return;
+      void enqueueOperatorMessage({
+        eventId,
+        text,
+        source: 'web-chat',
+        sourceLabel: 'control-room-input',
+        sourcesSeen: ['local-control-room'],
       });
     },
     [
       unlock,
-      stop,
-      resetAvatarReaction,
-      processWithHostExtensions,
-      streamerMemory,
       markLiveActivity,
-      replyModelTrace,
-      beginConversationLifecycle,
       enqueueOperatorMessage,
       interruptProactiveSpeech,
     ],
@@ -6826,6 +6055,41 @@ export default function App() {
     socialStreamSendRef.current = socialStreamBus.send;
   }, [socialStreamBus.send]);
 
+  const publishAudienceAwareness = useCallback(
+    (
+      snapshot: ReturnType<typeof liveDirector.getAudienceAwarenessSnapshot>,
+    ) => {
+      const key = [
+        snapshot.mode,
+        snapshot.reportedAudienceCount,
+        snapshot.activeAudienceCount,
+        snapshot.engageableAudienceCount,
+        snapshot.likelyRestingAudienceCount,
+      ].join(':');
+      if (lastAudienceAwarenessEventRef.current === key) return;
+      lastAudienceAwarenessEventRef.current = key;
+      emitRuntimeEvent({
+        eventId: `audience-awareness:${Date.now()}`,
+        stage: 'audience_awareness_changed',
+        at: Date.now(),
+        source: 'audience-awareness-ledger',
+        audienceActivityMode: snapshot.mode,
+        reportedAudienceCount: snapshot.reportedAudienceCount,
+        activeAudienceCount: snapshot.activeAudienceCount,
+        engageableAudienceCount: snapshot.engageableAudienceCount,
+        likelyRestingAudienceCount: snapshot.likelyRestingAudienceCount,
+      });
+    },
+    [emitRuntimeEvent, liveDirector],
+  );
+
+  // Awareness is telemetry, not a speech opportunity. Keep it observable even
+  // while generation/playback is busy or a stale queue item needs recovery.
+  useInterval(() => {
+    if (!isLiveRuntimeOwner) return;
+    publishAudienceAwareness(liveDirector.getAudienceAwarenessSnapshot());
+  }, 5_000);
+
   useInterval(() => {
     if (
       !isLiveRuntimeOwner ||
@@ -6878,12 +6142,19 @@ export default function App() {
         content: record.content.slice(0, 180),
       }));
     const audienceMembers = liveDirector.getAudienceSnapshot();
+    const audienceAwareness = liveDirector.getAudienceAwarenessSnapshot();
+    publishAudienceAwareness(audienceAwareness);
     const awarenessContext = {
       digitalHumanName: runtimeProfile.displayName,
       digitalHumanTitle: runtimeProfile.title,
       isLive: room.isLive,
-      audiencePresent: room.estimatedAudience > 0,
+      audiencePresent:
+        room.estimatedAudience > 0 || audienceAwareness.activeAudienceCount > 0,
       participantCount: room.estimatedAudience,
+      activeAudienceCount: audienceAwareness.activeAudienceCount,
+      engageableAudienceCount: audienceAwareness.engageableAudienceCount,
+      audienceActivityMode: audienceAwareness.mode,
+      likelyRestingMembers: audienceAwareness.likelyRestingMembers,
       busy:
         isProcessing || isSpeaking || queueDepth > 0 || oldestQueueAgeMs > 0,
       interfaceContext,
@@ -6903,7 +6174,9 @@ export default function App() {
       enqueueProactiveSpeech({
         prompt: awareness.prompt,
         awarenessSource: awareness.source,
-        audiencePresent: room.estimatedAudience > 0,
+        audiencePresent:
+          room.estimatedAudience > 0 ||
+          audienceAwareness.activeAudienceCount > 0,
         personaIntent:
           awareness.source === 'strategy' ? awareness.personaIntent : undefined,
         roomContext:
@@ -7658,297 +6931,306 @@ export default function App() {
           onUnlockAudio={() => void unlock().catch(() => undefined)}
         />
       ) : (
-        <ControlRoom
-          soulInspector={{
-            runtimeMode: soulRuntimeMode,
-            onRuntimeModeChange: (mode) => {
-              if (mode === 'primary' && !soulPrimaryGatePassed) {
-                settingsHook.updateSoulRuntimeMode('canary');
+        <Suspense
+          fallback={<div className="app-loading">Loading control room…</div>}
+        >
+          <ControlRoom
+            soulInspector={{
+              runtimeMode: soulRuntimeMode,
+              onRuntimeModeChange: (mode) => {
+                if (mode === 'primary' && !soulPrimaryGatePassed) {
+                  settingsHook.updateSoulRuntimeMode('canary');
+                  emitRuntimeEvent({
+                    stage: 'soul_primary_gate_blocked',
+                    at: Date.now(),
+                    reason:
+                      'requires-two-distinct-two-hour-production-canaries',
+                  });
+                  return;
+                }
+                settingsHook.updateSoulRuntimeMode(mode);
+              },
+              state:
+                soulInspectorTrace?.state ??
+                (soulSession ? projectSoulState(soulSession.getState()) : null),
+              event: soulInspectorTrace?.event,
+              decision: soulInspectorTrace?.decision,
+              outcome: soulInspectorTrace?.outcome,
+              telemetry: soulInspectorTrace?.telemetry,
+              memoryRefs: soulInspectorTrace?.memoryRefs,
+              canary: {
+                status:
+                  soulCanaryBusy ??
+                  (activeSoulCanary
+                    ? soulCanaryOperatorCredential?.runId ===
+                      activeSoulCanary.runId
+                      ? 'active'
+                      : 'active-elsewhere'
+                    : soulCanaryError
+                      ? 'error'
+                      : 'idle'),
+                runId: activeSoulCanary?.runId,
+                startedAt: activeSoulCanary?.startedAt,
+                elapsedMs: activeSoulCanary
+                  ? Math.max(0, soulCanaryClock - activeSoulCanary.startedAt)
+                  : undefined,
+                scopeLabel: activeSoulCanary
+                  ? `${activeSoulCanary.scope.platform}/${activeSoulCanary.scope.roomId}`
+                  : `${soulScope.platform}/${soulScope.roomId}`,
+                runtimeOwnerClaimedAt: activeSoulCanary?.runtimeOwnerClaimedAt,
+                primaryEligible: soulPrimaryGatePassed,
+                canStart:
+                  soulRuntimeMode === 'canary' &&
+                  soulScope.personaId === LINGLAN_SOUL_CONSTITUTION.personaId &&
+                  !activeSoulCanary &&
+                  !soulCanaryBusy,
+                canFinish: Boolean(
+                  activeSoulCanary &&
+                    soulCanaryOperatorCredential?.runId ===
+                      activeSoulCanary.runId &&
+                    soulCanaryClock - activeSoulCanary.startedAt >=
+                      SOUL_CANARY_MIN_DURATION_MS &&
+                    !soulCanaryBusy,
+                ),
+                canAbort: Boolean(
+                  activeSoulCanary &&
+                    soulCanaryOperatorCredential?.runId ===
+                      activeSoulCanary.runId &&
+                    !soulCanaryBusy,
+                ),
+                error: soulCanaryError || undefined,
+              },
+              onStartCanary: startSoulCanary,
+              onFinishCanary: finishSoulCanary,
+              onAbortCanary: abortSoulCanary,
+              controls: soulControlState,
+              onFreezeCognition: (cognitionFrozen) => {
+                setSoulControlState((state) => ({
+                  ...state,
+                  cognitionFrozen,
+                  cognitionFreezeOrigin: cognitionFrozen
+                    ? 'operator'
+                    : undefined,
+                }));
                 emitRuntimeEvent({
-                  stage: 'soul_primary_gate_blocked',
+                  stage: 'soul_operator_control',
+                  control: 'cognition',
+                  enabled: cognitionFrozen,
                   at: Date.now(),
-                  reason: 'requires-two-distinct-two-hour-production-canaries',
                 });
-                return;
-              }
-              settingsHook.updateSoulRuntimeMode(mode);
-            },
-            state:
-              soulInspectorTrace?.state ??
-              (soulSession ? projectSoulState(soulSession.getState()) : null),
-            event: soulInspectorTrace?.event,
-            decision: soulInspectorTrace?.decision,
-            outcome: soulInspectorTrace?.outcome,
-            telemetry: soulInspectorTrace?.telemetry,
-            memoryRefs: soulInspectorTrace?.memoryRefs,
-            canary: {
-              status:
-                soulCanaryBusy ??
-                (activeSoulCanary
-                  ? soulCanaryOperatorCredential?.runId ===
-                    activeSoulCanary.runId
-                    ? 'active'
-                    : 'active-elsewhere'
-                  : soulCanaryError
-                    ? 'error'
-                    : 'idle'),
-              runId: activeSoulCanary?.runId,
-              startedAt: activeSoulCanary?.startedAt,
-              elapsedMs: activeSoulCanary
-                ? Math.max(0, soulCanaryClock - activeSoulCanary.startedAt)
-                : undefined,
-              scopeLabel: activeSoulCanary
-                ? `${activeSoulCanary.scope.platform}/${activeSoulCanary.scope.roomId}`
-                : `${soulScope.platform}/${soulScope.roomId}`,
-              runtimeOwnerClaimedAt: activeSoulCanary?.runtimeOwnerClaimedAt,
-              primaryEligible: soulPrimaryGatePassed,
-              canStart:
-                soulRuntimeMode === 'canary' &&
-                soulScope.personaId === LINGLAN_SOUL_CONSTITUTION.personaId &&
-                !activeSoulCanary &&
-                !soulCanaryBusy,
-              canFinish: Boolean(
-                activeSoulCanary &&
-                  soulCanaryOperatorCredential?.runId ===
-                    activeSoulCanary.runId &&
-                  soulCanaryClock - activeSoulCanary.startedAt >=
-                    SOUL_CANARY_MIN_DURATION_MS &&
-                  !soulCanaryBusy,
-              ),
-              canAbort: Boolean(
-                activeSoulCanary &&
-                  soulCanaryOperatorCredential?.runId ===
-                    activeSoulCanary.runId &&
-                  !soulCanaryBusy,
-              ),
-              error: soulCanaryError || undefined,
-            },
-            onStartCanary: startSoulCanary,
-            onFinishCanary: finishSoulCanary,
-            onAbortCanary: abortSoulCanary,
-            controls: soulControlState,
-            onFreezeCognition: (cognitionFrozen) => {
-              setSoulControlState((state) => ({
-                ...state,
-                cognitionFrozen,
-                cognitionFreezeOrigin: cognitionFrozen ? 'operator' : undefined,
-              }));
-              emitRuntimeEvent({
-                stage: 'soul_operator_control',
-                control: 'cognition',
-                enabled: cognitionFrozen,
-                at: Date.now(),
-              });
-            },
-            onIsolateMemory: (memoryIsolated) => {
-              setSoulControlState((state) => ({
-                ...state,
-                memoryIsolated,
-              }));
-              emitRuntimeEvent({
-                stage: 'soul_operator_control',
-                control: 'memory-write-isolation',
-                enabled: memoryIsolated,
-                at: Date.now(),
-              });
-            },
-            onEnableNeutralFallback: (neutralFallbackActive) => {
-              setSoulControlState((state) => ({
-                ...state,
-                neutralFallbackActive,
-              }));
-              emitRuntimeEvent({
-                stage: 'soul_operator_control',
-                control: 'neutral-fallback',
-                enabled: neutralFallbackActive,
-                at: Date.now(),
-              });
-            },
-            onRecoverSnapshot: async () => {
-              if (!baseSoulSession) return;
-              setSoulControlState((state) => ({
-                ...state,
-                cognitionFrozen: true,
-                cognitionFreezeOrigin: 'snapshot-recovery',
-                busyControl: 'snapshot',
-              }));
-              emitRuntimeEvent({
-                stage: 'soul_snapshot_recovery_requested',
-                at: Date.now(),
-                scope: soulScope,
-              });
-              try {
-                const restored = await BrowserSoulRuntimeSession.recover({
-                  constitution: LINGLAN_SOUL_CONSTITUTION,
-                  profile: LINGLAN_SOUL_PROFILE,
-                  scope: soulScope,
+              },
+              onIsolateMemory: (memoryIsolated) => {
+                setSoulControlState((state) => ({
+                  ...state,
+                  memoryIsolated,
+                }));
+                emitRuntimeEvent({
+                  stage: 'soul_operator_control',
+                  control: 'memory-write-isolation',
+                  enabled: memoryIsolated,
+                  at: Date.now(),
                 });
-                soulSessionByEventIdRef.current.clear();
-                setSoulRecoveryState({
-                  scopeKey: soulScopeKey,
-                  status: 'ready',
-                  session: restored,
+              },
+              onEnableNeutralFallback: (neutralFallbackActive) => {
+                setSoulControlState((state) => ({
+                  ...state,
+                  neutralFallbackActive,
+                }));
+                emitRuntimeEvent({
+                  stage: 'soul_operator_control',
+                  control: 'neutral-fallback',
+                  enabled: neutralFallbackActive,
+                  at: Date.now(),
                 });
-                setSoulInspectorTrace((previous) =>
-                  previous
-                    ? {
-                        ...previous,
-                        state: projectSoulState(restored.getState()),
-                        outcome: {
-                          status: 'skipped',
-                          occurredAt: Date.now(),
-                          reasonCode: 'snapshot-restored-cognition-frozen',
-                        },
-                      }
-                    : previous,
-                );
+              },
+              onRecoverSnapshot: async () => {
+                if (!baseSoulSession) return;
                 setSoulControlState((state) => ({
                   ...state,
                   cognitionFrozen: true,
                   cognitionFreezeOrigin: 'snapshot-recovery',
-                  snapshotRecoveryAvailable: true,
-                  busyControl: undefined,
+                  busyControl: 'snapshot',
                 }));
                 emitRuntimeEvent({
-                  stage: 'soul_snapshot_recovered',
+                  stage: 'soul_snapshot_recovery_requested',
                   at: Date.now(),
                   scope: soulScope,
-                  stateVersion: restored.getState().version,
                 });
-              } catch (error) {
+                try {
+                  const restored = await BrowserSoulRuntimeSession.recover({
+                    constitution: LINGLAN_SOUL_CONSTITUTION,
+                    profile: LINGLAN_SOUL_PROFILE,
+                    scope: soulScope,
+                  });
+                  soulSessionByEventIdRef.current.clear();
+                  setSoulRecoveryState({
+                    scopeKey: soulScopeKey,
+                    status: 'ready',
+                    session: restored,
+                  });
+                  setSoulInspectorTrace((previous) =>
+                    previous
+                      ? {
+                          ...previous,
+                          state: projectSoulState(restored.getState()),
+                          outcome: {
+                            status: 'skipped',
+                            occurredAt: Date.now(),
+                            reasonCode: 'snapshot-restored-cognition-frozen',
+                          },
+                        }
+                      : previous,
+                  );
+                  setSoulControlState((state) => ({
+                    ...state,
+                    cognitionFrozen: true,
+                    cognitionFreezeOrigin: 'snapshot-recovery',
+                    snapshotRecoveryAvailable: true,
+                    busyControl: undefined,
+                  }));
+                  emitRuntimeEvent({
+                    stage: 'soul_snapshot_recovered',
+                    at: Date.now(),
+                    scope: soulScope,
+                    stateVersion: restored.getState().version,
+                  });
+                } catch (error) {
+                  setSoulControlState((state) => ({
+                    ...state,
+                    cognitionFrozen: true,
+                    cognitionFreezeOrigin: 'snapshot-recovery',
+                    snapshotRecoveryAvailable: false,
+                    busyControl: undefined,
+                  }));
+                  emitRuntimeEvent({
+                    stage: 'soul_snapshot_recovery_failed',
+                    at: Date.now(),
+                    scope: soulScope,
+                    error:
+                      error instanceof Error ? error.message : String(error),
+                  });
+                }
+              },
+              onOperatorTakeover: (operatorHasControl) => {
                 setSoulControlState((state) => ({
                   ...state,
-                  cognitionFrozen: true,
-                  cognitionFreezeOrigin: 'snapshot-recovery',
-                  snapshotRecoveryAvailable: false,
-                  busyControl: undefined,
+                  operatorHasControl,
                 }));
+                if (operatorHasControl) {
+                  emergencyTakeover();
+                } else {
+                  dispatchLiveHostEvent({
+                    type: 'operator-command',
+                    at: Date.now(),
+                    command: 'resume',
+                    isLive: liveDirector.isRoomLive(),
+                  });
+                }
                 emitRuntimeEvent({
-                  stage: 'soul_snapshot_recovery_failed',
+                  stage: 'soul_operator_control',
+                  control: 'execution-authority',
+                  enabled: operatorHasControl,
                   at: Date.now(),
-                  scope: soulScope,
-                  error: error instanceof Error ? error.message : String(error),
                 });
-              }
-            },
-            onOperatorTakeover: (operatorHasControl) => {
-              setSoulControlState((state) => ({
-                ...state,
-                operatorHasControl,
-              }));
-              if (operatorHasControl) {
-                emergencyTakeover();
-              } else {
-                dispatchLiveHostEvent({
-                  type: 'operator-command',
-                  at: Date.now(),
-                  command: 'resume',
-                  isLive: liveDirector.isRoomLive(),
-                });
-              }
-              emitRuntimeEvent({
-                stage: 'soul_operator_control',
-                control: 'execution-authority',
-                enabled: operatorHasControl,
-                at: Date.now(),
+              },
+            }}
+            messages={messages}
+            partialResponse={partialResponse}
+            isProcessing={isProcessing}
+            isSpeaking={isSpeaking}
+            mouthLevel={mouthLevel}
+            voiceLevel={smoothedValue}
+            queueDepth={queueDepth}
+            oldestQueueAgeMs={oldestQueueAgeMs}
+            interactionEvents={interactionEvents}
+            interactionSummary={interactionSummary}
+            operatorQueue={operatorQueue}
+            stressRun={stressRun}
+            onDiagnoseStressTest={() => runStressAction('diagnose')}
+            onStartStressTest={() => runStressAction('start')}
+            onPauseStressTest={() => runStressAction('pause')}
+            onResumeStressTest={() => runStressAction('resume')}
+            onAbortStressTest={() => runStressAction('abort')}
+            onCleanupStressTest={() => runStressAction('cleanup')}
+            onDeleteQueueItem={(eventId) => {
+              void updateOperatorQueue(eventId, 'delete', {
+                auditActor: 'control-room',
+              }).then(() => refreshOperatorQueue());
+            }}
+            onMoveQueueItem={(eventId, order) => {
+              void updateOperatorQueue(eventId, 'move', {
+                order,
+                auditActor: 'control-room',
+              }).then(() => refreshOperatorQueue());
+            }}
+            onEditQueueReply={(eventId, reply) => {
+              void updateOperatorQueue(eventId, 'edit-reply', {
+                reply,
+                auditActor: 'control-room',
+              }).then(() => refreshOperatorQueue());
+            }}
+            settings={settingsHook.settings}
+            avatarPackage={avatarPackage}
+            avatarReaction={avatarReaction}
+            avatarMotion={avatarMotion}
+            speakingAvatarVideoUrl={speakingAvatarVideoUrl}
+            avatarViewTransform={avatarViewTransform}
+            onAvatarViewTransformChange={settingsHook.updateVisualAvatarView}
+            onBroadcast={(text) => {
+              void enqueueManualBroadcast(text);
+            }}
+            onStop={() => {
+              stop();
+              resetAvatarReaction();
+            }}
+            onEmergencyTakeover={emergencyTakeover}
+            liveHostSnapshot={liveHostSnapshot}
+            unsupportedAvatarActionCount={unsupportedAvatarActionCount}
+            reliabilityMetrics={reliabilityMetrics}
+            autoBroadcastEnabled={autoBroadcastEnabled}
+            onToggleAutoBroadcast={() => {
+              setAutoBroadcastEnabled((value) => {
+                const enabled = !value;
+                if (enabled) {
+                  dispatchLiveHostEvent({
+                    type: 'operator-command',
+                    at: Date.now(),
+                    command: 'resume',
+                    isLive: liveDirector.isRoomLive(),
+                  });
+                }
+                return enabled;
               });
-            },
-          }}
-          messages={messages}
-          partialResponse={partialResponse}
-          isProcessing={isProcessing}
-          isSpeaking={isSpeaking}
-          mouthLevel={mouthLevel}
-          voiceLevel={smoothedValue}
-          queueDepth={queueDepth}
-          oldestQueueAgeMs={oldestQueueAgeMs}
-          interactionEvents={interactionEvents}
-          interactionSummary={interactionSummary}
-          operatorQueue={operatorQueue}
-          stressRun={stressRun}
-          onDiagnoseStressTest={() => runStressAction('diagnose')}
-          onStartStressTest={() => runStressAction('start')}
-          onPauseStressTest={() => runStressAction('pause')}
-          onResumeStressTest={() => runStressAction('resume')}
-          onAbortStressTest={() => runStressAction('abort')}
-          onCleanupStressTest={() => runStressAction('cleanup')}
-          onDeleteQueueItem={(eventId) => {
-            void updateOperatorQueue(eventId, 'delete', {
-              auditActor: 'control-room',
-            }).then(() => refreshOperatorQueue());
-          }}
-          onMoveQueueItem={(eventId, order) => {
-            void updateOperatorQueue(eventId, 'move', {
-              order,
-              auditActor: 'control-room',
-            }).then(() => refreshOperatorQueue());
-          }}
-          onEditQueueReply={(eventId, reply) => {
-            void updateOperatorQueue(eventId, 'edit-reply', {
-              reply,
-              auditActor: 'control-room',
-            }).then(() => refreshOperatorQueue());
-          }}
-          settings={settingsHook.settings}
-          avatarPackage={avatarPackage}
-          avatarReaction={avatarReaction}
-          avatarMotion={avatarMotion}
-          speakingAvatarVideoUrl={speakingAvatarVideoUrl}
-          avatarViewTransform={avatarViewTransform}
-          onAvatarViewTransformChange={settingsHook.updateVisualAvatarView}
-          onBroadcast={(text) => {
-            void enqueueManualBroadcast(text);
-          }}
-          onStop={() => {
-            stop();
-            resetAvatarReaction();
-          }}
-          onEmergencyTakeover={emergencyTakeover}
-          liveHostSnapshot={liveHostSnapshot}
-          unsupportedAvatarActionCount={unsupportedAvatarActionCount}
-          autoBroadcastEnabled={autoBroadcastEnabled}
-          onToggleAutoBroadcast={() => {
-            setAutoBroadcastEnabled((value) => {
-              const enabled = !value;
-              if (enabled) {
-                dispatchLiveHostEvent({
-                  type: 'operator-command',
-                  at: Date.now(),
-                  command: 'resume',
-                  isLive: liveDirector.isRoomLive(),
-                });
-              }
-              return enabled;
-            });
-          }}
-          onUpdateEmptyRoomAwareness={settingsHook.updateEmptyRoomAwareness}
-          onOpenLegacySettings={() => setSettingsOpen(true)}
-          socialBusHealth={socialStreamBus.health}
-          socialBusError={socialStreamBus.error}
-          socialDiscoveredPlatforms={socialStreamBus.discoveredPlatforms}
-          ordinaryRoadStatus={ordinaryRoadStatus}
-          onUpdateLiveConnectors={settingsHook.updateLiveConnectors}
-          onSimulateLiveRoomEvent={handleSimulatedLiveRoomEvent}
-          onSelectDigitalHuman={settingsHook.selectDigitalHuman}
-          onAddDigitalHuman={settingsHook.addDigitalHuman}
-          onUpdateDigitalHuman={settingsHook.updateDigitalHuman}
-          onSetDigitalHumanEnabled={settingsHook.setDigitalHumanEnabled}
-          onRemoveDigitalHuman={(id) => {
-            void streamerMemory.removeDigitalHuman(id);
-            settingsHook.removeDigitalHuman(id);
-          }}
-          onAvatarPackageUpload={handleDigitalHumanAvatarUpload}
-          onPreviewVoice={handlePreviewDigitalHumanVoice}
-          memory={streamerMemory}
-          onAuditAction={(event) =>
-            emitRuntimeEvent({
-              stage: 'operator_ui_action',
-              actor: { type: 'operator', id: 'control-room' },
-              at: Date.now(),
-              ...event,
-            })
-          }
-        />
+            }}
+            onUpdateEmptyRoomAwareness={settingsHook.updateEmptyRoomAwareness}
+            onOpenLegacySettings={() => setSettingsOpen(true)}
+            socialBusHealth={socialStreamBus.health}
+            socialBusError={socialStreamBus.error}
+            socialDiscoveredPlatforms={socialStreamBus.discoveredPlatforms}
+            ordinaryRoadStatus={ordinaryRoadStatus}
+            onUpdateLiveConnectors={settingsHook.updateLiveConnectors}
+            onSimulateLiveRoomEvent={handleSimulatedLiveRoomEvent}
+            onSelectDigitalHuman={settingsHook.selectDigitalHuman}
+            onAddDigitalHuman={settingsHook.addDigitalHuman}
+            onUpdateDigitalHuman={settingsHook.updateDigitalHuman}
+            onSetDigitalHumanEnabled={settingsHook.setDigitalHumanEnabled}
+            onRemoveDigitalHuman={(id) => {
+              void streamerMemory.removeDigitalHuman(id);
+              settingsHook.removeDigitalHuman(id);
+            }}
+            onAvatarPackageUpload={handleDigitalHumanAvatarUpload}
+            onPreviewVoice={handlePreviewDigitalHumanVoice}
+            memory={streamerMemory}
+            onAuditAction={(event) =>
+              emitRuntimeEvent({
+                stage: 'operator_ui_action',
+                actor: { type: 'operator', id: 'control-room' },
+                at: Date.now(),
+                ...event,
+              })
+            }
+          />
+        </Suspense>
       )}
 
       {!isObsOverlay && settingsOpen && (
@@ -7966,19 +7248,23 @@ export default function App() {
                 &times;
               </button>
             </div>
-            <SettingsPanel
-              {...settingsHook}
-              isProcessing={isProcessing}
-              backgroundImageUrl={backgroundImageUrl}
-              streamErrorMessage={streamErrorMessage}
-              avatarPackage={avatarPackage}
-              avatarPackageSource={avatarPackageSource}
-              avatarLoadError={avatarLoadError}
-              screenVisionController={screenVisionController}
-              onBackgroundImageChange={handleBackgroundImageChange}
-              onAvatarPackageChange={handleAvatarPackageChange}
-              memory={streamerMemory}
-            />
+            <Suspense
+              fallback={<div className="app-loading">Loading settings…</div>}
+            >
+              <SettingsPanel
+                {...settingsHook}
+                isProcessing={isProcessing}
+                backgroundImageUrl={backgroundImageUrl}
+                streamErrorMessage={streamErrorMessage}
+                avatarPackage={avatarPackage}
+                avatarPackageSource={avatarPackageSource}
+                avatarLoadError={avatarLoadError}
+                screenVisionController={screenVisionController}
+                onBackgroundImageChange={handleBackgroundImageChange}
+                onAvatarPackageChange={handleAvatarPackageChange}
+                memory={streamerMemory}
+              />
+            </Suspense>
           </div>
         </div>
       )}

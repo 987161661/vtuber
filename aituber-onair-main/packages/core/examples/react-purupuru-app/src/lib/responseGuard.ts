@@ -36,10 +36,12 @@ const HOSTILE_PHRASES = [
   '别给自己加戏',
   '查户口',
 ];
-const PAID_SUPPORT_LANGUAGE = /(?:礼物|辣条|打赏|投喂|上舰|舰长|充电|送了|刷了|收了)/u;
+const PAID_SUPPORT_LANGUAGE =
+  /(?:礼物|辣条|打赏|投喂|上舰|舰长|充电|送了|刷了|收了)/u;
 const RETENTION_PRESSURE =
   /(?:不许|不能|不准|必须|得).{0,8}(?:走|跑|离开|留下|陪)|(?:收了|送了|刷了).{0,10}(?:还(?:想|能)?跑|别跑|不能跑|得陪|留下)|(?:欠我|欠着).{0,8}(?:陪|关注|礼物)/u;
-const SUPPORT_CTA = /(?:点个|记得|赶紧|必须|得).{0,6}(?:关注|点赞|投币|送礼|上舰)/u;
+const SUPPORT_CTA =
+  /(?:点个|记得|赶紧|必须|得).{0,6}(?:关注|点赞|投币|送礼|上舰)/u;
 const UNSUPPORTED_CERTAINTY = [
   /(?:一定|肯定|必然).{0,8}(?:登陆|经过|进入|影响)/,
   /(?:一定|肯定|必然).{0,8}(?:达到|增强|减弱|升级|成为)/,
@@ -49,6 +51,8 @@ const UNSUPPORTED_CERTAINTY = [
 ];
 const WEATHER_DEFERRAL =
   /(?:哪个|哪一个)台风|告诉我.*(?:台风|城市|时间)|(?:没法|无法)(?:查|判断)|先报(?:上|出).*(?:台风|城市)/;
+const UNSUPPORTED_VIEWER_OBSERVATION_REWRITE =
+  /(?:你看到的|你那边).{0,20}(?:雾气|窗户).{0,20}(?:像|显得).{0,8}(?:下雨|雨)/u;
 const PROVINCE_NAMES = [
   '北京',
   '天津',
@@ -341,9 +345,8 @@ export function guardViewerResponse(
   context?: ResponseFactGuard,
 ): GuardedResponse {
   const initiallySanitized = sanitizeSpeechText(input);
-  const recoveredStructuredText = unwrapStructuredSpeechPlan(
-    initiallySanitized,
-  );
+  const recoveredStructuredText =
+    unwrapStructuredSpeechPlan(initiallySanitized);
   const sanitized = recoveredStructuredText ?? initiallySanitized;
   const unsafeArtifacts = hasUnsafeSpeechArtifacts(sanitized);
   const reasons: string[] = [];
@@ -391,6 +394,9 @@ export function guardViewerResponse(
       reasons.push('off_topic');
     }
     if (WEATHER_DEFERRAL.test(sanitized)) reasons.push('weather_deferral');
+    if (UNSUPPORTED_VIEWER_OBSERVATION_REWRITE.test(sanitized)) {
+      reasons.push('unsupported_viewer_observation_rewrite');
+    }
     if (!hasEvidenceFor(sanitized, evidence)) reasons.push('missing_evidence');
     if (hasUnsupportedNumber(sanitized, evidence)) {
       reasons.push('unsupported_number');

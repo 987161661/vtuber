@@ -641,6 +641,21 @@ function sameScopeValue(left: SoulScopeV1, right: SoulScopeV1): boolean {
   );
 }
 
+export function isSnapshotReplacementAuthorized(
+  existing: Pick<SoulSnapshotV1, 'stateHash' | 'state'>,
+  next: Pick<SoulSnapshotV1, 'state'>,
+  expectedStateHash?: string,
+): boolean {
+  const previousState = recordValue(existing.state);
+  const nextState = recordValue(next.state);
+  return Boolean(
+    expectedStateHash &&
+      expectedStateHash === existing.stateHash &&
+      previousState?.profileId === nextState?.profileId &&
+      previousState?.constitutionId === nextState?.constitutionId,
+  );
+}
+
 function uniqueStrings(values: readonly string[]): string[] {
   return [...new Set(values.map((value) => value.trim()).filter(Boolean))];
 }
@@ -773,7 +788,10 @@ export function createSoulRuntimePlugin(
     return operation;
   };
 
-  const putSnapshot = (snapshot: SoulSnapshotV1) => {
+  const putSnapshot = (
+    snapshot: SoulSnapshotV1,
+    replaceStateHash?: string,
+  ) => {
     const operation = snapshotMutation.then(async () => {
       const scopedPath = scopedSnapshotPath(
         options.paths.snapshotPath,
@@ -790,16 +808,33 @@ export function createSoulRuntimePlugin(
           recordValue(snapshot.state)?.version,
           -1,
         );
-        if (nextVersion < previousVersion) {
+        const replacementRequested = Boolean(replaceStateHash);
+        const replacementAuthorized = isSnapshotReplacementAuthorized(
+          existing,
+          snapshot,
+          replaceStateHash,
+        );
+        if (replacementRequested && !replacementAuthorized) {
+          throw new SoulRequestError(
+            'snapshot_identity_migration_forbidden',
+            409,
+          );
+        }
+        if (nextVersion < previousVersion && !replacementAuthorized) {
           throw new SoulRequestError('snapshot_version_regression', 409);
         }
         if (
           nextVersion === previousVersion &&
           snapshot.stateHash !== existing.stateHash
         ) {
-          throw new SoulRequestError('snapshot_version_conflict', 409);
+          if (!replacementAuthorized) {
+            throw new SoulRequestError('snapshot_version_conflict', 409);
+          }
         }
-        if (snapshot.ledgerSequence < existing.ledgerSequence) {
+        if (
+          snapshot.ledgerSequence < existing.ledgerSequence &&
+          !replacementAuthorized
+        ) {
           throw new SoulRequestError('snapshot_ledger_regression', 409);
         }
         if (
@@ -900,6 +935,7 @@ interface SoulHandlerContext {
   ) => Promise<{ entry: SoulLedgerEntryV1; created: boolean }>;
   putSnapshot: (
     snapshot: SoulSnapshotV1,
+    replaceStateHash?: string,
   ) => Promise<{ snapshot: SoulSnapshotV1; stored: boolean }>;
 }
 
@@ -1209,7 +1245,17 @@ async function handleSnapshotRequest(
   if (requestedScope) {
     assertSameScope(requestedScope, snapshot.scope, 'snapshot_put');
   }
-  const result = await context.putSnapshot(snapshot);
+  const replaceStateHash = Array.isArray(
+    req.headers['x-soul-replace-state-hash'],
+  )
+    ? req.headers['x-soul-replace-state-hash'][0]
+    : req.headers['x-soul-replace-state-hash'];
+  const result = await context.putSnapshot(
+    snapshot,
+    typeof replaceStateHash === 'string'
+      ? replaceStateHash.trim().slice(0, 200)
+      : undefined,
+  );
   sendJson(res, result.stored ? 201 : 200, result);
 }
 

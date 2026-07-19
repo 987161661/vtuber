@@ -226,7 +226,7 @@ export class BrowserSoulRuntimeSession {
           now: options.now,
         });
       } catch (error) {
-        if (!isLedgerCheckpointRestoreError(error)) throw error;
+        if (!isRebuildableSnapshotRestoreError(error)) throw error;
         // The append-only ledger is authoritative. A checkpoint can become
         // unverifiable after a repaired/corrupt ledger segment is replaced;
         // replay the complete validated ledger and immediately supersede the
@@ -260,7 +260,10 @@ export class BrowserSoulRuntimeSession {
       const decision = entry.payload as SoulDecisionV1;
       session.decisionsByEventId.set(decision.eventId, structuredClone(decision));
     }
-    if (rebuiltFromLedger && !(await session.persistProjection())) {
+    if (
+      rebuiltFromLedger &&
+      !(await session.persistProjection(snapshotBody.snapshot?.stateHash))
+    ) {
       throw new Error(
         `soul_snapshot_rebuild_failed:${session.lastPersistenceError ?? 'unknown'}`,
       );
@@ -443,7 +446,9 @@ export class BrowserSoulRuntimeSession {
     }
   }
 
-  private async persistProjection(): Promise<boolean> {
+  private async persistProjection(
+    replaceStateHash?: string,
+  ): Promise<boolean> {
     this.lastPersistenceError = undefined;
     try {
       const entries = await this.runtime.getLedger().list({
@@ -473,7 +478,12 @@ export class BrowserSoulRuntimeSession {
       const snapshot = await this.runtime.snapshot(this.now());
       const snapshotResponse = await this.fetchImpl('/api/soul/snapshot', {
         method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          ...(replaceStateHash
+            ? { 'X-Soul-Replace-State-Hash': replaceStateHash }
+            : {}),
+        },
         body: JSON.stringify(snapshot),
       });
       if (!snapshotResponse.ok) {
@@ -511,14 +521,17 @@ async function persistenceHttpError(
   );
 }
 
-function isLedgerCheckpointRestoreError(
+function isRebuildableSnapshotRestoreError(
   error: unknown,
 ): error is SoulSnapshotRestoreError {
   return (
     error instanceof SoulSnapshotRestoreError &&
     (error.message ===
       'Snapshot ledger checkpoint is missing from the supplied ledger' ||
-      error.message === 'Snapshot ledger head does not match the supplied ledger')
+      error.message === 'Snapshot ledger head does not match the supplied ledger' ||
+      error.message === 'Snapshot profile hash does not match the active profile' ||
+      error.message ===
+        'Snapshot constitution hash does not match the active constitution')
   );
 }
 

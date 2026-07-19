@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { lazy, Suspense, useEffect, useMemo, useState } from 'react';
 import type { PuruPuruAvatarPackage } from '../lib/purupuruPackage';
 import type { PuruPuruReaction } from '../lib/purupuruReactions';
 import type { AvatarMotion } from '../lib/avatarMotion';
@@ -26,17 +26,30 @@ import {
   type MinimaxVoiceOption,
 } from '../lib/minimaxVoicePreview';
 import type { StressRunState } from './StressTestPanel';
-import { LiveConnectorConsole } from './LiveConnectorConsole';
-import { SimulatorRoomConsole } from './SimulatorRoomConsole';
-import {
-  BroadcastTopologyPanel,
-  type BroadcastRuntimeHealth,
-} from './BroadcastTopologyPanel';
-import {
-  SoulInspectorPanel,
-  type SoulInspectorPanelProps,
-} from './SoulInspectorPanel';
+import type { BroadcastRuntimeHealth } from './BroadcastTopologyPanel';
+import type { SoulInspectorPanelProps } from './SoulInspectorPanel';
 import type { LiveHostSnapshot } from '@aituber-onair/live-companion';
+
+const LiveConnectorConsole = lazy(async () => {
+  const module = await import('./LiveConnectorConsole');
+  return { default: module.LiveConnectorConsole };
+});
+const SimulatorRoomConsole = lazy(async () => {
+  const module = await import('./SimulatorRoomConsole');
+  return { default: module.SimulatorRoomConsole };
+});
+const BroadcastTopologyPanel = lazy(async () => {
+  const module = await import('./BroadcastTopologyPanel');
+  return { default: module.BroadcastTopologyPanel };
+});
+const SoulInspectorPanel = lazy(async () => {
+  const module = await import('./SoulInspectorPanel');
+  return { default: module.SoulInspectorPanel };
+});
+
+const workspacePanelFallback = (
+  <output className="workspace-card">Loading workspace…</output>
+);
 
 type Workspace =
   | 'avatars'
@@ -74,6 +87,12 @@ interface ControlRoomProps {
   onEmergencyTakeover: () => void;
   liveHostSnapshot: LiveHostSnapshot;
   unsupportedAvatarActionCount: number;
+  reliabilityMetrics: {
+    bindingErrors: number;
+    staleCallbacks: number;
+    proactiveRepeatSuppressions: number;
+    coordinatorRecoveries: number;
+  };
   autoBroadcastEnabled: boolean;
   onToggleAutoBroadcast: () => void;
   onUpdateEmptyRoomAwareness: (
@@ -1048,6 +1067,26 @@ export function ControlRoom(props: ControlRoomProps) {
                 <strong>{props.unsupportedAvatarActionCount}</strong>
                 <span>不支持动作</span>
               </article>
+              <article>
+                <strong>{props.reliabilityMetrics.bindingErrors}</strong>
+                <span>绑定错误拦截</span>
+              </article>
+              <article>
+                <strong>{props.reliabilityMetrics.staleCallbacks}</strong>
+                <span>迟到回调</span>
+              </article>
+              <article>
+                <strong>
+                  {props.reliabilityMetrics.proactiveRepeatSuppressions}
+                </strong>
+                <span>主动重复抑制</span>
+              </article>
+              <article>
+                <strong>
+                  {props.reliabilityMetrics.coordinatorRecoveries}
+                </strong>
+                <span>协调器卡死恢复</span>
+              </article>
             </div>
             <small className="queue-age">
               最近决策：{props.liveHostSnapshot.lastDecisionReason}
@@ -1141,7 +1180,16 @@ export function ControlRoom(props: ControlRoomProps) {
             </section>
             <small className="queue-age">
               最近故障：
-              {(['soul', 'model', 'skill', 'tts', 'flashhead', 'platform'] as const)
+              {(
+                [
+                  'soul',
+                  'model',
+                  'skill',
+                  'tts',
+                  'flashhead',
+                  'platform',
+                ] as const
+              )
                 .map((kind) =>
                   runtimeHealth.lastFaults?.[kind]
                     ? `${kind}=${runtimeHealth.lastFaults[kind]?.stage}`
@@ -1710,7 +1758,9 @@ export function ControlRoom(props: ControlRoomProps) {
           </section>
         )}
         {workspace === 'simulator' && (
-          <SimulatorRoomConsole onEmit={props.onSimulateLiveRoomEvent} />
+          <Suspense fallback={workspacePanelFallback}>
+            <SimulatorRoomConsole onEmit={props.onSimulateLiveRoomEvent} />
+          </Suspense>
         )}
         {workspace === 'insights' && (
           <section className="workspace-card broadcast-strategy-workspace">
@@ -1721,7 +1771,9 @@ export function ControlRoom(props: ControlRoomProps) {
               </div>
               <p>管理主播何时主动开口，以及静息时从哪里获得自然的话题。</p>
             </div>
-            <SoulInspectorPanel {...props.soulInspector} />
+            <Suspense fallback={workspacePanelFallback}>
+              <SoulInspectorPanel {...props.soulInspector} />
+            </Suspense>
             <div className="awareness-control-panel">
               <header>
                 <div>
@@ -2146,13 +2198,15 @@ export function ControlRoom(props: ControlRoomProps) {
           </section>
         )}
         {workspace === 'pipeline' && (
-          <BroadcastTopologyPanel
-            records={pipelineLatencyRecords}
-            queue={props.operatorQueue}
-            health={runtimeHealth}
-            events={pipelineRuntimeEvents}
-            onOpenModelSettings={props.onOpenLegacySettings}
-          />
+          <Suspense fallback={workspacePanelFallback}>
+            <BroadcastTopologyPanel
+              records={pipelineLatencyRecords}
+              queue={props.operatorQueue}
+              health={runtimeHealth}
+              events={pipelineRuntimeEvents}
+              onOpenModelSettings={props.onOpenLegacySettings}
+            />
+          </Suspense>
         )}
         {workspace === 'config' && (
           <section className="workspace-card config-workspace">
@@ -2166,14 +2220,16 @@ export function ControlRoom(props: ControlRoomProps) {
                 与数字人链路。
               </p>
             </div>
-            <LiveConnectorConsole
-              settings={props.settings.liveConnectors}
-              ordinaryRoadStatus={props.ordinaryRoadStatus}
-              socialBusHealth={props.socialBusHealth}
-              socialBusError={props.socialBusError}
-              socialDiscoveredPlatforms={props.socialDiscoveredPlatforms}
-              onChange={props.onUpdateLiveConnectors}
-            />
+            <Suspense fallback={workspacePanelFallback}>
+              <LiveConnectorConsole
+                settings={props.settings.liveConnectors}
+                ordinaryRoadStatus={props.ordinaryRoadStatus}
+                socialBusHealth={props.socialBusHealth}
+                socialBusError={props.socialBusError}
+                socialDiscoveredPlatforms={props.socialDiscoveredPlatforms}
+                onChange={props.onUpdateLiveConnectors}
+              />
+            </Suspense>
           </section>
         )}
       </section>

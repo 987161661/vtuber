@@ -291,6 +291,7 @@ export type {
 export {
   AITuberOnAirCore,
   AITuberOnAirCoreEvent,
+  SpeechPlaybackError,
 } from './core/AITuberOnAirCore';
 
 // Constants exports

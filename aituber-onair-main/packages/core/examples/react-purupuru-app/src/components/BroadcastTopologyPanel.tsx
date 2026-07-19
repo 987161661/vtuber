@@ -1,4 +1,13 @@
 import { useEffect, useMemo, useState } from 'react';
+import {
+  isCurrentBroadcastFault,
+  isProductionEvent,
+  routeBroadcastEvent,
+  type BroadcastEdgeId as EdgeId,
+  type BroadcastFault as Fault,
+  type BroadcastNodeId as NodeId,
+  type BroadcastRuntimeEvent,
+} from '../lib/broadcastTopology';
 import type { OperatorQueueItem } from '../lib/operatorQueue';
 
 export type BroadcastTraceRecord = {
@@ -15,30 +24,7 @@ export type BroadcastTraceRecord = {
   firstPlaybackAt?: number;
 };
 
-export type BroadcastRuntimeEvent = {
-  eventId?: string;
-  stage?: string;
-  source?: string;
-  at?: number;
-  runtimeMode?: 'legacy' | 'shadow' | 'canary' | 'primary';
-  reason?: string;
-  error?: string;
-  fallback?: boolean;
-  fallbackReason?: string;
-};
-
-type Fault = { at: number; stage: string; reason?: string };
 type FaultRef = { nodeId: string; at: number; stage: string };
-
-export function isCurrentBroadcastFault(
-  reference: FaultRef | undefined,
-  current: Fault | undefined,
-): boolean {
-  if (!reference) return true;
-  return Boolean(
-    current && current.at === reference.at && current.stage === reference.stage,
-  );
-}
 export type BroadcastRuntimeHealth = {
   lastFaults?: Partial<
     Record<'soul' | 'model' | 'skill' | 'tts' | 'flashhead' | 'platform', Fault>
@@ -77,41 +63,6 @@ export type BroadcastRuntimeHealth = {
     checkedAt?: number;
   };
 };
-
-type NodeId =
-  | 'platform'
-  | 'connector'
-  | 'obs'
-  | 'viewer'
-  | 'idle'
-  | 'external'
-  | 'manual'
-  | 'director'
-  | 'persona'
-  | 'model'
-  | 'queue'
-  | 'tts'
-  | 'behavior'
-  | 'renderer'
-  | 'playback';
-type EdgeId =
-  | 'connector-platform'
-  | 'connector-viewer'
-  | 'viewer-director'
-  | 'idle-director'
-  | 'external-director'
-  | 'manual-queue'
-  | 'director-persona'
-  | 'persona-model'
-  | 'model-queue'
-  | 'queue-tts'
-  | 'tts-behavior'
-  | 'tts-renderer'
-  | 'behavior-playback'
-  | 'renderer-playback'
-  | 'playback-connector'
-  | 'playback-obs'
-  | 'obs-platform';
 
 const nodes: Array<{
   id: NodeId;
@@ -225,185 +176,6 @@ const edges: Array<{ id: EdgeId; d: string; label?: string }> = [
   { id: 'playback-obs', d: 'M 1128 275 L 1140 275' },
   { id: 'obs-platform', d: 'M 1204 245 C 1230 190, 1230 110, 1204 85' },
 ];
-
-export function isProductionEvent(event: BroadcastRuntimeEvent) {
-  if (!event.eventId || !event.stage) return false;
-  const stage = event.stage;
-  return (
-    [
-      'received',
-      'queued',
-      'generating',
-      'proactive-selected',
-      'program_decision',
-      'selected',
-      'generated',
-      'started',
-      'speaking',
-      'tts_first_audio',
-      'completed',
-      'done',
-      'dropped',
-      'failed',
-      'interrupted',
-    ].includes(stage) ||
-    stage.startsWith('persona_plan_') ||
-    stage.startsWith('persona_state_') ||
-    stage.startsWith('soul_') ||
-    stage === 'generation_error' ||
-    stage.startsWith('tts-') ||
-    stage.startsWith('model_') ||
-    stage.startsWith('live_platform_delivery_') ||
-    stage.includes('avatar_action') ||
-    stage.includes('_render_')
-  );
-}
-
-function sourceNode(
-  event?: BroadcastRuntimeEvent,
-  queueItem?: OperatorQueueItem,
-): NodeId {
-  const source = `${event?.source || queueItem?.source || ''}`.toLowerCase();
-  if (
-    source.includes('quiet') ||
-    source.includes('proactive') ||
-    source.includes('awareness')
-  )
-    return 'idle';
-  if (source.includes('operator-manual')) return 'manual';
-  if (
-    source.includes('radar') ||
-    source.includes('external') ||
-    source.includes('parent')
-  )
-    return 'external';
-  return 'viewer';
-}
-
-function isPlatformIngress(
-  event?: BroadcastRuntimeEvent,
-  queueItem?: OperatorQueueItem,
-) {
-  const source = `${event?.source || queueItem?.source || ''}`.toLowerCase();
-  return [
-    'ordinaryroad',
-    'social-stream',
-    'bilibili',
-    'douyin',
-    'douyu',
-    'huya',
-    'kuaishou',
-    'youtube',
-    'twitch',
-  ].some((platform) => source.includes(platform));
-}
-
-export function routeFor(
-  event?: BroadcastRuntimeEvent,
-  queueItem?: OperatorQueueItem,
-) {
-  const source = sourceNode(event, queueItem);
-  const stage = event?.stage || '';
-  let node: NodeId = source;
-  let activeEdges: EdgeId[] = [];
-  if (!stage && queueItem) {
-    if (queueItem.status === 'preparing')
-      activeEdges =
-        source === 'manual'
-          ? ['manual-queue']
-          : [`${source}-director` as EdgeId];
-    if (queueItem.status === 'ready') {
-      node = 'queue';
-      activeEdges = ['queue-tts'];
-    }
-    if (queueItem.status === 'speaking') {
-      node = 'playback';
-      activeEdges = ['renderer-playback'];
-    }
-  }
-  if (
-    stage === 'received' ||
-    stage === 'queued' ||
-    stage === 'proactive-selected'
-  ) {
-    activeEdges =
-      source === 'manual' ? ['manual-queue'] : [`${source}-director` as EdgeId];
-    if (
-      source === 'viewer' &&
-      isPlatformIngress(event, queueItem) &&
-      (stage === 'received' || stage === 'queued')
-    ) {
-      activeEdges.unshift('connector-platform', 'connector-viewer');
-    }
-  } else if (stage === 'program_decision' || stage === 'selected') {
-    node = 'director';
-    activeEdges = ['director-persona'];
-  } else if (stage.startsWith('persona_plan_')) {
-    node = 'persona';
-    activeEdges =
-      stage === 'persona_plan_started'
-        ? ['director-persona']
-        : stage === 'persona_plan_skipped'
-          ? []
-          : ['persona-model'];
-  } else if (stage.startsWith('persona_state_')) {
-    node = 'persona';
-  } else if (
-    stage === 'soul_shadow_decision' ||
-    stage === 'soul_decision_selected' ||
-    stage === 'soul_formal_silence' ||
-    stage.startsWith('soul_reflection_') ||
-    stage.startsWith('soul_operator_') ||
-    stage.startsWith('soul_snapshot_')
-  ) {
-    node = 'persona';
-    activeEdges =
-      stage === 'soul_formal_silence' ? [] : ['persona-model'];
-  } else if (stage === 'soul_speech_plan_built') {
-    node = 'queue';
-    activeEdges = ['model-queue'];
-  } else if (
-    stage === 'soul_outcome_committed' ||
-    stage === 'soul_delivered_projection_committed'
-  ) {
-    node = 'playback';
-  } else if (stage === 'generating' || stage.startsWith('model_')) {
-    node = 'model';
-  } else if (stage === 'generated') {
-    node = 'model';
-    activeEdges = ['model-queue'];
-  } else if (stage === 'started') {
-    node = 'queue';
-    activeEdges = ['queue-tts'];
-  } else if (
-    stage === 'tts_first_audio' ||
-    stage === 'speaking' ||
-    stage.startsWith('tts-beat-')
-  ) {
-    node = 'tts';
-    activeEdges = ['tts-behavior', 'tts-renderer'];
-  } else if (stage.includes('avatar_action')) {
-    node = 'behavior';
-    activeEdges = ['behavior-playback'];
-  } else if (stage.includes('_render_completed')) {
-    node = 'renderer';
-    activeEdges = ['renderer-playback'];
-  } else if (stage.includes('_render_')) {
-    node = 'renderer';
-  } else if (stage === 'completed' || stage === 'done') {
-    node = 'playback';
-  } else if (stage === 'live_platform_delivery_requested') {
-    node = 'playback';
-    activeEdges = ['playback-connector'];
-  } else if (
-    stage === 'live_platform_delivery_succeeded' ||
-    stage === 'live_platform_delivery_failed'
-  ) {
-    node = 'connector';
-    activeEdges = ['playback-connector', 'connector-platform'];
-  }
-  return { source, node, activeEdges };
-}
 
 function ms(value?: number) {
   if (!value) return '—';
@@ -519,7 +291,7 @@ export function BroadcastTopologyPanel({
     (event?.eventId
       ? queue.find((entry) => entry.eventId === event.eventId)
       : undefined);
-  const route = useMemo(() => routeFor(event, item), [event, item]);
+  const route = useMemo(() => routeBroadcastEvent(event, item), [event, item]);
   // Reply-latency records are written only after a real end-to-end completion.
   // Keep that completion snapshot visible while the room is idle; clear it as
   // soon as a different dialogue event enters the production pipeline.
@@ -533,14 +305,6 @@ export function BroadcastTopologyPanel({
     lastCompleted?.llmCompletedAt ?? lastCompleted?.endedAt,
   );
   const completedNodeTimings = nodeTimings(lastCompleted);
-  useEffect(() => {
-    if (!detail) return;
-    const closeOnEscape = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') setDetail(null);
-    };
-    window.addEventListener('keydown', closeOnEscape);
-    return () => window.removeEventListener('keydown', closeOnEscape);
-  }, [detail]);
   const nodeFaults = new Map<NodeId, Fault>();
   const freshFault = (fault?: Fault) =>
     fault && now - fault.at < 120_000 ? fault : undefined;
@@ -569,9 +333,15 @@ export function BroadcastTopologyPanel({
         nodeFaults.get(detail.faultRef.nodeId as NodeId),
       )
     : true;
+  const visibleDetail = detailFaultIsCurrent ? detail : null;
   useEffect(() => {
-    if (detail?.faultRef && !detailFaultIsCurrent) setDetail(null);
-  }, [detail?.faultRef, detailFaultIsCurrent]);
+    if (!visibleDetail) return;
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setDetail(null);
+    };
+    window.addEventListener('keydown', closeOnEscape);
+    return () => window.removeEventListener('keydown', closeOnEscape);
+  }, [visibleDetail]);
   const itemAge = item ? now - item.updatedAt : 0;
   if (
     item?.status === 'preparing' &&
@@ -637,8 +407,10 @@ export function BroadcastTopologyPanel({
   if (overlayOnline) statusEdges.add('playback-obs');
   if (health.obs?.streamState === 'streaming') statusEdges.add('obs-platform');
   const copy = async () => {
-    if (!detail) return;
-    await navigator.clipboard?.writeText(`${detail.title}\n${detail.text}`);
+    if (!visibleDetail) return;
+    await navigator.clipboard?.writeText(
+      `${visibleDetail.title}\n${visibleDetail.text}`,
+    );
     setCopied(true);
     window.setTimeout(() => setCopied(false), 1400);
   };
@@ -716,7 +488,7 @@ export function BroadcastTopologyPanel({
                   : node.id === 'model' &&
                       health.model?.credentialConfigured === false
                     ? 'MiniMax key 未保存'
-                  : node.meta;
+                    : node.meta;
           const offline =
             (node.id === 'platform' &&
               configuredPlatforms.length > 0 &&
@@ -856,15 +628,15 @@ export function BroadcastTopologyPanel({
           </ol>
         </section>
       )}
-      {detail && (
+      {visibleDetail && (
         <section className="pipeline-fault-detail" role="alert">
           <div>
             <span>故障详情</span>
-            <strong>{detail.title}</strong>
+            <strong>{visibleDetail.title}</strong>
           </div>
-          <p>{detail.text}</p>
+          <p>{visibleDetail.text}</p>
           <div className="pipeline-fault-actions">
-            {detail.action === 'open-model-settings' &&
+            {visibleDetail.action === 'open-model-settings' &&
               onOpenModelSettings && (
                 <button
                   type="button"

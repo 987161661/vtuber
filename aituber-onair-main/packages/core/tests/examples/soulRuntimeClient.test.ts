@@ -354,6 +354,7 @@ describe('browser soul runtime session', () => {
       ledgerHeadHash: 'fnv1a32:stale-checkpoint',
     };
     let replacement: SoulSnapshotV1 | undefined;
+    let replacementStateHashHeader: string | null = null;
     const recoveryFetch = vi.fn(
       async (input: RequestInfo | URL, init?: RequestInit) => {
         const url = String(input);
@@ -375,6 +376,9 @@ describe('browser soul runtime session', () => {
         }
         if (url.endsWith('/api/soul/snapshot')) {
           replacement = JSON.parse(String(init?.body ?? '{}'));
+          replacementStateHashHeader = new Headers(init?.headers).get(
+            'X-Soul-Replace-State-Hash',
+          );
           return new Response('{}', { status: 200 });
         }
         throw new Error(`unexpected request: ${url}`);
@@ -393,6 +397,7 @@ describe('browser soul runtime session', () => {
       hashSoulState(original.getState()),
     );
     expect(replacement?.ledgerHeadHash).toBe(snapshot?.ledgerHeadHash);
+    expect(replacementStateHashHeader).toBe(staleSnapshot.stateHash);
     expect(recoveryFetch).toHaveBeenCalledTimes(3);
   });
 

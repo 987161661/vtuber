@@ -56,11 +56,46 @@ describe('city weather extension', () => {
     expect(result?.fallbackReply).not.toContain('台风');
   });
 
+  it('retries once in the current turn before using the unavailable fallback', async () => {
+    const fetchMock = vi
+      .fn()
+      .mockRejectedValueOnce(new Error('transient'))
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            requiredAnswer:
+              '\u56db\u5e73\u5e02\u57ce\u5e02\u4ee3\u8868\u70b9\u5f53\u524d\u4e3a\u96fe\u3002',
+            claims: [
+              {
+                type: 'representative_point_observation',
+                text: '\u56db\u5e73\u5e02\u5f53\u524d 20\u2103\u3002',
+              },
+            ],
+          }),
+          { status: 200 },
+        ),
+      );
+    vi.stubGlobal('fetch', fetchMock);
+
+    const result = await createCityWeatherExtension().enrich({
+      query: '\u5409\u6797\u56db\u5e73\u5e02',
+      inheritedSkillIds: [CITY_WEATHER_EXTENSION_ID],
+    });
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(result).toMatchObject({
+      forceFallback: false,
+      fallbackReply:
+        '\u56db\u5e73\u5e02\u57ce\u5e02\u4ee3\u8868\u70b9\u5f53\u524d\u4e3a\u96fe\u3002',
+    });
+  });
+
   it('does not replace a radar city-result envelope that already carries verified facts', async () => {
     const fetchMock = vi.fn();
     vi.stubGlobal('fetch', fetchMock);
     const result = await createCityWeatherExtension().enrich({
-      query: '<city_report_engagement>已核验天气事实：上海气温37℃</city_report_engagement>',
+      query:
+        '<city_report_engagement>已核验天气事实：上海气温37℃</city_report_engagement>',
       inheritedSkillIds: [CITY_WEATHER_EXTENSION_ID],
     });
 

@@ -17,7 +17,31 @@ function cityWeatherBanterContract(payload: CityWeatherPayload): string {
 }
 
 const CITY_WEATHER_UNAVAILABLE_REPLY =
-  '城市天气数据这次没有回来，我先不拿旧印象猜。稍后再查一次。';
+  '城市天气数据这次没有回来，我刚刚重试了还是没查到，先不拿旧印象乱猜。';
+
+async function fetchCityWeatherPayload(
+  query: string,
+): Promise<CityWeatherPayload> {
+  let lastError: unknown;
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      const response = await fetch(
+        `/api/city-weather?location=${encodeURIComponent(query)}`,
+        { cache: 'no-store', signal: AbortSignal.timeout(6_000) },
+      );
+      const payload = (await response.json()) as CityWeatherPayload;
+      if (!response.ok || payload.error) {
+        throw new Error('city_weather_failed');
+      }
+      return payload;
+    } catch (error) {
+      lastError = error;
+    }
+  }
+  throw lastError instanceof Error
+    ? lastError
+    : new Error('city_weather_failed');
+}
 
 /** Built-in factual weather capability, deliberately separate from typhoons. */
 export function createCityWeatherExtension(): HostExtension {
@@ -31,13 +55,7 @@ export function createCityWeatherExtension(): HostExtension {
       }
 
       try {
-        const response = await fetch(
-          `/api/city-weather?location=${encodeURIComponent(input.query)}`,
-          { cache: 'no-store' },
-        );
-        const payload = (await response.json()) as CityWeatherPayload;
-        if (!response.ok || payload.error)
-          throw new Error('city_weather_failed');
+        const payload = await fetchCityWeatherPayload(input.query);
         const requiredAnswer =
           typeof payload.requiredAnswer === 'string'
             ? payload.requiredAnswer

@@ -105,12 +105,12 @@ export function buildOpenAIRequestBody({
     stream,
   };
 
-  // MiniMax-M3 enables thinking by default. The browser AITuber runtime needs
-  // a single parseable screenplay JSON object, so keep hidden reasoning out of
-  // the content stream for this OpenAI-compatible endpoint.
+  // MiniMax-M3 enables thinking by default. Its endpoint is commonly exposed
+  // through a same-origin credential proxy, so model identity is the stable
+  // signal here rather than the public MiniMax hostname. Keep hidden reasoning
+  // out of the content stream consumed as the final spoken response.
   if (
     provider === 'openai-compatible' &&
-    /(^|\.)minimaxi\.com/i.test(new URL(endpoint).hostname) &&
     model.toLowerCase() === 'minimax-m3'
   ) {
     body.thinking = { type: 'disabled' };

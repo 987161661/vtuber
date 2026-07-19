@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   AITuberOnAirCore,
   AITuberOnAirCoreEvent,
@@ -9,9 +9,11 @@ import {
   isXaiReasoningEffortModel,
   MinimaxEngine,
   sanitizeSpeechText,
+  SpeechPlaybackError,
   type SpeechPlanV2BuilderHints,
 } from '@aituber-onair/core';
 import { ManneriDetector } from '@aituber-onair/manneri';
+import { type ChatServiceOptions, type Message } from '@aituber-onair/chat';
 import type {
   VoiceServiceOptions,
   ElevenLabsApplyTextNormalization,
@@ -39,6 +41,7 @@ import {
 } from '../lib/responseGuard';
 import { formatTtsSpeechScript } from '../lib/ttsSpeechScript';
 import type { PreparedSpeechPlan } from '../lib/operatorQueue';
+import { createStatelessChatService } from '../lib/statelessChatService';
 
 interface ScreenplayLike {
   emotion?: string;
@@ -108,6 +111,7 @@ interface UseAituberCoreOptions {
       viewerName?: string;
       source?: 'chat' | 'live' | 'vision';
       eventId?: string;
+      attemptId?: string;
       commentAt?: number;
       receivedAt?: number;
       queuedAt?: number;
@@ -122,6 +126,7 @@ interface UseAituberCoreOptions {
     error: unknown,
     metadata?: {
       eventId?: string;
+      attemptId?: string;
     },
   ) => void;
   speechPlanV2Enabled?: boolean;
@@ -135,6 +140,7 @@ type ProcessChatOptions = {
   viewerName?: string;
   source?: 'chat' | 'live' | 'vision';
   eventId?: string;
+  attemptId?: string;
   commentAt?: number;
   receivedAt?: number;
   queuedAt?: number;
@@ -196,7 +202,11 @@ function inspectSpeechPlanEnvelope(raw: unknown) {
     );
     return {
       kind: 'json_object',
-      valid: value.version === 2 && beats.length >= 1 && beats.length <= 3 && missingFields.length === 0,
+      valid:
+        value.version === 2 &&
+        beats.length >= 1 &&
+        beats.length <= 3 &&
+        missingFields.length === 0,
       version: value.version,
       beatCount: beats.length,
       missingFields,
@@ -649,6 +659,7 @@ export function useAituberCore({
     viewerName?: string;
     source?: 'chat' | 'live' | 'vision';
     eventId?: string;
+    attemptId?: string;
     commentAt?: number;
     receivedAt?: number;
     queuedAt?: number;
@@ -708,42 +719,55 @@ export function useAituberCore({
       : settings.llm.model;
   const isOpenAIGPT5Model =
     settings.llm.provider === 'openai' && isGPT5Model(resolvedModel);
-  const xaiProviderOptions =
-    settings.llm.provider === 'xai' && isXaiReasoningEffortModel(resolvedModel)
-      ? {
-          reasoning_effort:
-            settings.llm.xaiReasoningEffort ||
-            getDefaultXaiReasoningEffort(resolvedModel) ||
-            'none',
-        }
-      : undefined;
-  const providerOptions = isOpenAICompatibleProvider
-    ? {
-        endpoint: openAICompatibleEndpoint,
-        // The screenplay contract is machine-consumed. Prompt-only JSON
-        // instructions are probabilistic, especially for empathetic replies;
-        // request the OpenAI-compatible provider's JSON mode as well.
-        responseFormat: { type: 'json_object' as const },
-        protocolAudit: (audit: {
-          phase: 'request' | 'response_headers';
-          provider: string;
-          model: string;
-          endpointHost: string;
-          stream: boolean;
-          responseFormatType?: string;
-          status?: number;
-          contentType?: string | null;
-        }) =>
-          emitRuntimeTrace({
-            stage: 'llm_protocol_transport_audit',
-            actor: { type: 'system', id: 'openai-compatible-transport' },
-            at: Date.now(),
-            ...audit,
-          }),
-      }
-    : isOpenAIGPT5Model
-      ? GPT5_SAMPLE_PROVIDER_OPTIONS
-      : xaiProviderOptions;
+  const xaiProviderOptions = useMemo(
+    () =>
+      settings.llm.provider === 'xai' &&
+      isXaiReasoningEffortModel(resolvedModel)
+        ? {
+            reasoning_effort:
+              settings.llm.xaiReasoningEffort ||
+              getDefaultXaiReasoningEffort(resolvedModel) ||
+              'none',
+          }
+        : undefined,
+    [resolvedModel, settings.llm.provider, settings.llm.xaiReasoningEffort],
+  );
+  const providerOptions = useMemo(
+    () =>
+      isOpenAICompatibleProvider
+        ? {
+            endpoint: openAICompatibleEndpoint,
+            // The screenplay contract is machine-consumed. Prompt-only JSON
+            // instructions are probabilistic, especially for empathetic replies;
+            // request the OpenAI-compatible provider's JSON mode as well.
+            responseFormat: { type: 'json_object' as const },
+            protocolAudit: (audit: {
+              phase: 'request' | 'response_headers';
+              provider: string;
+              model: string;
+              endpointHost: string;
+              stream: boolean;
+              responseFormatType?: string;
+              status?: number;
+              contentType?: string | null;
+            }) =>
+              emitRuntimeTrace({
+                stage: 'llm_protocol_transport_audit',
+                actor: { type: 'system', id: 'openai-compatible-transport' },
+                at: Date.now(),
+                ...audit,
+              }),
+          }
+        : isOpenAIGPT5Model
+          ? GPT5_SAMPLE_PROVIDER_OPTIONS
+          : xaiProviderOptions,
+    [
+      isOpenAIGPT5Model,
+      isOpenAICompatibleProvider,
+      openAICompatibleEndpoint,
+      xaiProviderOptions,
+    ],
+  );
   const createMessageId = useCallback(() => {
     messageIdSequenceRef.current += 1;
     return `${Date.now()}-${messageIdSequenceRef.current}`;
@@ -1171,6 +1195,9 @@ export function useAituberCore({
           }),
         }).catch(() => undefined);
       }
+      // Explicit speakPrepared callers own speech terminal settlement. The
+      // generic ERROR observer remains diagnostic-only for this marked error.
+      if (error instanceof SpeechPlaybackError) return;
       setIsProcessing(false);
       if (deliverVerifiedFactFallback(error)) {
         onSpeechEndRef.current?.();
@@ -1178,6 +1205,7 @@ export function useAituberCore({
       }
       onChatErrorRef.current?.(error, {
         eventId: pendingMemoryRef.current?.eventId,
+        attemptId: pendingMemoryRef.current?.attemptId,
       });
       onSpeechEndRef.current?.();
     });
@@ -1256,6 +1284,7 @@ export function useAituberCore({
         viewerName: options?.viewerName,
         source: options?.source ?? 'chat',
         eventId: options?.eventId,
+        attemptId: options?.attemptId,
         commentAt: options?.commentAt,
         receivedAt: options?.receivedAt,
         queuedAt: options?.queuedAt,
@@ -1335,7 +1364,10 @@ export function useAituberCore({
         });
       } catch (err) {
         console.error('processChat error:', err);
-        onChatErrorRef.current?.(err, { eventId: options?.eventId });
+        onChatErrorRef.current?.(err, {
+          eventId: options?.eventId,
+          attemptId: options?.attemptId,
+        });
         setIsProcessing(false);
         return false;
       }
@@ -1347,6 +1379,74 @@ export function useAituberCore({
       settings.llm.provider,
       speechPlanV2Enabled,
       personaPlannerEnabled,
+    ],
+  );
+
+  /**
+   * Runs one stateless model call.  It deliberately creates a fresh service
+   * and accepts the complete message list from the caller, so city-report
+   * facts can never inherit the ordinary room chat log or its pending refs.
+   */
+  const generateIsolatedReply = useCallback(
+    async (
+      isolatedMessages: Message[],
+      options: { timeoutMs?: number; maxTokens?: number } = {},
+    ): Promise<string> => {
+      if (!isApiKeyOptionalProvider && !llmApiKey) {
+        throw new Error('isolated_generation_api_key_missing');
+      }
+      if (isOpenAICompatibleProvider && !openAICompatibleEndpoint) {
+        throw new Error('isolated_generation_endpoint_missing');
+      }
+      const isolatedProviderOptions = providerOptions
+        ? { ...providerOptions, responseFormat: undefined }
+        : undefined;
+      // ChatServiceFactory uses its static `this.providers` registry. Calling
+      // an extracted method loses that receiver and crashes with
+      // "Cannot read properties of undefined (reading 'providers')".
+      const service = createStatelessChatService(
+        settings.llm.provider,
+        {
+          apiKey: llmApiKey.trim(),
+          model: resolvedModel,
+          tools: [],
+          ...isolatedProviderOptions,
+        } as ChatServiceOptions,
+      );
+      const timeoutMs = Math.max(2_000, options.timeoutMs ?? 12_000);
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        const completion = await Promise.race([
+          service.chatOnce(
+            isolatedMessages,
+            false,
+            () => undefined,
+            options.maxTokens ?? 180,
+          ),
+          new Promise<never>((_, reject) => {
+            timer = setTimeout(
+              () => reject(new Error('isolated_generation_timeout')),
+              timeoutMs,
+            );
+          }),
+        ]);
+        return completion.blocks
+          .filter((block) => block.type === 'text')
+          .map((block) => block.text)
+          .join('')
+          .trim();
+      } finally {
+        if (timer) clearTimeout(timer);
+      }
+    },
+    [
+      isApiKeyOptionalProvider,
+      isOpenAICompatibleProvider,
+      llmApiKey,
+      openAICompatibleEndpoint,
+      providerOptions,
+      resolvedModel,
+      settings.llm.provider,
     ],
   );
 
@@ -1418,8 +1518,18 @@ export function useAituberCore({
             const audioStream = engine.fetchAudioStream(
               {
                 style: ([
-                  'talk', 'neutral', 'happy', 'sad', 'angry', 'surprised',
-                  'relaxed', 'bored', 'impatient', 'embarrassed', 'awkward', 'serious',
+                  'talk',
+                  'neutral',
+                  'happy',
+                  'sad',
+                  'angry',
+                  'surprised',
+                  'relaxed',
+                  'bored',
+                  'impatient',
+                  'embarrassed',
+                  'awkward',
+                  'serious',
                 ].includes(beat.emotion || '')
                   ? beat.emotion
                   : 'talk') as TalkStyle,
@@ -1452,12 +1562,18 @@ export function useAituberCore({
               }
               await onAudioPlayRef.current(audio.buffer);
             }
-            onSpeechChunkRef.current?.('end', { ...chunk, endedAt: Date.now() });
+            onSpeechChunkRef.current?.('end', {
+              ...chunk,
+              endedAt: Date.now(),
+            });
             activeChunk = undefined;
             const pauseAfterMs = beat.pauseAfterMs ?? 0;
             if (index < beats.length - 1 && pauseAfterMs) {
               await new Promise<void>((resolve) =>
-                window.setTimeout(resolve, Math.min(2_500, Math.max(0, pauseAfterMs))),
+                window.setTimeout(
+                  resolve,
+                  Math.min(2_500, Math.max(0, pauseAfterMs)),
+                ),
               );
             }
           }
@@ -1509,6 +1625,7 @@ export function useAituberCore({
     isProcessing,
     partialResponse,
     processChat,
+    generateIsolatedReply,
     speakPrepared,
     processVisionChat,
     isCoreReady,

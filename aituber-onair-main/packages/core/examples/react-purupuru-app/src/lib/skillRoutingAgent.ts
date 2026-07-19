@@ -1,4 +1,7 @@
-import type { RecentLiveTurn, SkillRoutingDecision } from './liveConversationContext';
+import type {
+  RecentLiveTurn,
+  SkillRoutingDecision,
+} from './liveConversationContext';
 
 const SPECIALIST_ROUTE_SIGNAL =
   /(?:\u53f0\u98ce|\u5929\u6c14|\u96f7\u8fbe|\u98ce\u529b|\u66b4\u96e8|\u964d\u96e8|\u8def\u5f84|\u767b\u9646|\u6c14\u8c61|\u9884\u8b66|\u64a4\u79bb|\u907f\u9669|\u6c42\u52a9|\u5371\u9669|\u5531\u6b4c|\u6545\u4e8b|\u6e38\u620f|\u9001\u793c|\u70b9\u8d5e|\u5173\u6ce8|\u6eda|\u95ed\u5634|\u5783\u573e|\u9a97\u5b50)/u;
@@ -28,6 +31,13 @@ const WEATHER_QUERY_SIGNAL =
 const WEATHER_QUERY_NOISE =
   /(?:今天|今日|现在|今晚|明天|后天|当地|这里|这边|我在|你那里|你那边|天气|气温|温度|会不会|有没有|会|下雨|降雨|晴天|阴天|多云|刮风|风大|冷不冷|热不热|怎么样|如何|什么情况|多少度|吗|呢|呀|啊|吧|请问|帮我|查一下|看看|[\s，。！？、,.!?])/gu;
 
+const NON_LOCATION_CONVERSATION_RESIDUE =
+  /(?:我|你|他|她|它|怎么|为什么|真服|到底|又|还|都|气死|烦|崩溃|受不了)/u;
+const DECLARED_LOCATION_PREFIX =
+  /(?:我|本人|人|现在)?(?:在|来自|住在|定位在)([\p{Script=Han}·]{2,20})(?=[\s，。！？，,.!?]|$)/u;
+const NON_LOCATION_DECLARATION =
+  /^(?:家|家里|这里|这边|现场|床上|房间|直播间)$/u;
+
 export function unwrapViewerMessageText(text: string): string {
   const normalized = text.normalize('NFKC').trim();
   // Live-room adapters retain an operator-visible author envelope in the
@@ -41,7 +51,46 @@ export function extractWeatherLocation(text: string): string | null {
   if (WEATHER_ROLE_IDENTITY_SIGNAL.test(normalized)) return null;
   if (!WEATHER_QUERY_SIGNAL.test(normalized)) return null;
   const location = normalized.replace(WEATHER_QUERY_NOISE, '').trim();
-  return location ? location.slice(0, 40) : null;
+  if (!location || NON_LOCATION_CONVERSATION_RESIDUE.test(location))
+    return null;
+  return location.slice(0, 40);
+}
+
+export function extractDeclaredWeatherLocation(text: string): string | null {
+  const normalized = unwrapViewerMessageText(text);
+  const location = normalized.match(DECLARED_LOCATION_PREFIX)?.[1]?.trim();
+  if (!location || NON_LOCATION_DECLARATION.test(location)) return null;
+  return location;
+}
+
+function recentViewerWeatherLocation(input: {
+  text: string;
+  viewerId?: string;
+  sourceLabel?: string;
+  turns: RecentLiveTurn[];
+}): string | null {
+  if (
+    !input.viewerId ||
+    !WEATHER_QUERY_SIGNAL.test(unwrapViewerMessageText(input.text))
+  ) {
+    return null;
+  }
+  const cutoff = Date.now() - 10 * 60_000;
+  for (const turn of [...input.turns].reverse()) {
+    // The queue keeps both a user-facing source label and an internal source
+    // id. Compare like with like before falling back to the internal id.
+    const turnPlatform = turn.sourceLabel || turn.sourcesSeen?.[0];
+    if (
+      turn.at < cutoff ||
+      turn.viewerId !== input.viewerId ||
+      (input.sourceLabel && turnPlatform && input.sourceLabel !== turnPlatform)
+    ) {
+      continue;
+    }
+    const location = extractDeclaredWeatherLocation(turn.input);
+    if (location) return location;
+  }
+  return null;
 }
 
 export function getWeatherLocationClarification(text: string): string | null {
@@ -52,6 +101,15 @@ export function getWeatherLocationClarification(text: string): string | null {
   return '先告诉我城市或地区，我才能查今天的天气。';
 }
 
+export function routedWeatherLocationClarification(
+  text: string,
+  routing: Pick<SkillRoutingDecision, 'intent'>,
+): string | null {
+  return routing.intent === 'clarify_location'
+    ? getWeatherLocationClarification(text)
+    : null;
+}
+
 function canUseCompanionFastPath(input: {
   text: string;
   turns: RecentLiveTurn[];
@@ -59,9 +117,9 @@ function canUseCompanionFastPath(input: {
   if (SPECIALIST_ROUTE_SIGNAL.test(input.text)) return false;
   // Terse follow-ups after a verified weather turn still need the agent to
   // decide whether skill context should be inherited.
-  return !input.turns.slice(-3).some((turn) =>
-    turn.skills?.includes('typhoon-boss-radar'),
-  );
+  return !input.turns
+    .slice(-3)
+    .some((turn) => turn.skills?.includes('typhoon-boss-radar'));
 }
 
 const COMPANION_FAST_PATH: SkillRoutingDecision = {
@@ -106,7 +164,8 @@ const TYPHOON_ROOM_STATUS_FAST_PATH: SkillRoutingDecision = {
   reason: 'dedicated_typhoon_room_entity_status',
   mode: 'weather',
   intent: 'typhoon_status_query',
-  direction: '\u8c03\u7528\u53f0\u98ce\u6280\u80fd\u6838\u67e5\u89c2\u4f17\u70b9\u540d\u7684\u7cfb\u7edf\uff1b\u6ca1\u6709\u8bc1\u636e\u65f6\u660e\u786e\u8bf4\u672c\u6b21\u672a\u53d6\u5f97\u8d44\u6599\uff0c\u4e0d\u8865\u5386\u53f2\u7ed3\u8bba\u3002',
+  direction:
+    '\u8c03\u7528\u53f0\u98ce\u6280\u80fd\u6838\u67e5\u89c2\u4f17\u70b9\u540d\u7684\u7cfb\u7edf\uff1b\u6ca1\u6709\u8bc1\u636e\u65f6\u660e\u786e\u8bf4\u672c\u6b21\u672a\u53d6\u5f97\u8d44\u6599\uff0c\u4e0d\u8865\u5386\u53f2\u7ed3\u8bba\u3002',
   shouldSpeak: true,
   moderation: 'none',
 };
@@ -116,7 +175,8 @@ const WEATHER_HAZARD_FAST_PATH: SkillRoutingDecision = {
   reason: 'weather_hazard_fact_route',
   mode: 'urgent',
   intent: 'weather_hazard_query',
-  direction: '\u8fd9\u662f\u707e\u5bb3\u4e0e\u5b89\u5168\u95ee\u9898\uff1b\u5fc5\u987b\u8c03\u7528\u4e8b\u5b9e\u6280\u80fd\uff0c\u65e0\u9884\u8b66\u6216\u707e\u60c5\u8bc1\u636e\u65f6\u660e\u786e\u8bf4\u65e0\u6cd5\u5224\u65ad\uff0c\u7981\u6b62\u62a5\u5e73\u5b89\u3002',
+  direction:
+    '\u8fd9\u662f\u707e\u5bb3\u4e0e\u5b89\u5168\u95ee\u9898\uff1b\u5fc5\u987b\u8c03\u7528\u4e8b\u5b9e\u6280\u80fd\uff0c\u65e0\u9884\u8b66\u6216\u707e\u60c5\u8bc1\u636e\u65f6\u660e\u786e\u8bf4\u65e0\u6cd5\u5224\u65ad\uff0c\u7981\u6b62\u62a5\u5e73\u5b89\u3002',
   shouldSpeak: true,
   moderation: 'none',
 };
@@ -166,6 +226,13 @@ export function routeSoulSkillDeterministically(input: {
   }
   const weatherLocation = extractWeatherLocation(input.text);
   if (weatherLocation) return cityWeatherFastPath(weatherLocation);
+  const contextualWeatherLocation = recentViewerWeatherLocation(input);
+  if (contextualWeatherLocation) {
+    return {
+      ...cityWeatherFastPath(contextualWeatherLocation),
+      reason: 'city_weather_context_route',
+    };
+  }
   if (isDedicatedTyphoonRoomStatusQuestion(input.text, input.sourceLabel)) {
     return { ...TYPHOON_ROOM_STATUS_FAST_PATH };
   }
@@ -190,7 +257,8 @@ export async function routeTyphoonSkillWithAgent(input: {
     return {
       ...COMPANION_FAST_PATH,
       reason: 'viewer_entry_welcome_companion_fast_path',
-      direction: '高兴、温暖地欢迎指定的新进场观众；本轮不调用天气技能，也不追加关注或点赞请求。',
+      direction:
+        '高兴、温暖地欢迎指定的新进场观众；本轮不调用天气技能，也不追加关注或点赞请求。',
     };
   }
   if (input.text.includes('<city_report_engagement>')) {
@@ -222,6 +290,13 @@ export async function routeTyphoonSkillWithAgent(input: {
   }
   const weatherLocation = extractWeatherLocation(input.text);
   if (weatherLocation) return cityWeatherFastPath(weatherLocation);
+  const contextualWeatherLocation = recentViewerWeatherLocation(input);
+  if (contextualWeatherLocation) {
+    return {
+      ...cityWeatherFastPath(contextualWeatherLocation),
+      reason: 'city_weather_context_route',
+    };
+  }
   if (isDedicatedTyphoonRoomStatusQuestion(input.text, input.sourceLabel)) {
     return { ...TYPHOON_ROOM_STATUS_FAST_PATH };
   }
@@ -235,20 +310,30 @@ export async function routeTyphoonSkillWithAgent(input: {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         text: input.text,
-        speaker: { id: input.viewerId, name: input.viewerName, source: input.sourceLabel },
+        speaker: {
+          id: input.viewerId,
+          name: input.viewerName,
+          source: input.sourceLabel,
+        },
         turns: input.turns.slice(-16),
       }),
     });
     if (!response.ok) throw new Error(`skill_router_http_${response.status}`);
-    const data = await response.json() as Partial<SkillRoutingDecision>;
+    const data = (await response.json()) as Partial<SkillRoutingDecision>;
     return {
       inheritTyphoon: data.inheritTyphoon === true,
-      reason: typeof data.reason === 'string' ? data.reason.slice(0, 100) : 'agent_route',
+      reason:
+        typeof data.reason === 'string'
+          ? data.reason.slice(0, 100)
+          : 'agent_route',
       mode:
-        data.mode === 'weather' || data.mode === 'urgent' || data.mode === 'variety'
+        data.mode === 'weather' ||
+        data.mode === 'urgent' ||
+        data.mode === 'variety'
           ? data.mode
           : 'companion',
-      intent: typeof data.intent === 'string' ? data.intent.slice(0, 60) : 'casual',
+      intent:
+        typeof data.intent === 'string' ? data.intent.slice(0, 60) : 'casual',
       direction:
         typeof data.direction === 'string'
           ? data.direction.slice(0, 140)

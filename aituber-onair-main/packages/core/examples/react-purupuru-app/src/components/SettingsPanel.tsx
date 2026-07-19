@@ -929,19 +929,17 @@ export function SettingsPanel({
                       : ''}
                   </label>
                   <ServerManagedCredentialInput
-                    key={settings.llm.provider}
+                    key={`${settings.llm.provider}:${llmCredentialIsServerManaged ? 'managed' : 'local'}`}
                     id="llm-apikey"
                     value={getApiKeyForProvider(settings.llm.provider)}
                     isServerManaged={llmCredentialIsServerManaged}
-                    onChange={(e) =>
-                      updateLLMApiKey(settings.llm.provider, e)
-                    }
+                    onChange={(e) => updateLLMApiKey(settings.llm.provider, e)}
                     placeholder={
                       isMiniMaxLlmGateway
                         ? '必填：请输入原 MiniMax API key'
                         : settings.llm.provider === 'openai-compatible'
-                        ? '仅在服务要求时填写'
-                        : 'XXX-...'
+                          ? '仅在服务要求时填写'
+                          : 'XXX-...'
                     }
                     disabled={disabled}
                   />
@@ -2134,6 +2132,7 @@ export function SettingsPanel({
                 <div className="settings-field">
                   <label htmlFor="tts-minimax-apikey">API 密钥</label>
                   <ServerManagedCredentialInput
+                    key={`minimax:${minimaxCredentialIsServerManaged ? 'managed' : 'local'}`}
                     id="tts-minimax-apikey"
                     value={settings.tts.minimaxApiKey || ''}
                     isServerManaged={minimaxCredentialIsServerManaged}
@@ -2178,8 +2177,7 @@ export function SettingsPanel({
                     {!settings.tts.minimaxApiKey && (
                       <option value="">输入 API 密钥后获取音色列表</option>
                     )}
-                    {settings.tts.minimaxApiKey &&
-                      isFetchingMinimaxVoices && (
+                    {settings.tts.minimaxApiKey && isFetchingMinimaxVoices && (
                       <option value="">正在获取音色列表……</option>
                     )}
                     {settings.tts.minimaxApiKey &&
