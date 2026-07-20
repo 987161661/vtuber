@@ -703,8 +703,8 @@ function loadSettings(allowTransientCredentialMigration = false): AppSettings {
             {
               ...defaults.liveConnectors.ordinaryRoad.platforms,
               bilibili: createPlatformConnection('', legacyBilibiliEnabled, {
-                viewerReplies: legacyBilibiliReplyEnabled,
-                proactiveSpeech: legacyBilibiliReplyEnabled,
+                viewerReplies: true,
+                proactiveSpeech: false,
                 operatorBroadcasts: legacyBilibiliReplyEnabled,
               }),
             },
@@ -743,7 +743,7 @@ function loadSettings(allowTransientCredentialMigration = false): AppSettings {
         if (legacyBilibiliReplyEnabled) {
           bilibili.outbound = {
             viewerReplies: true,
-            proactiveSpeech: true,
+            proactiveSpeech: false,
             operatorBroadcasts: true,
           };
         }

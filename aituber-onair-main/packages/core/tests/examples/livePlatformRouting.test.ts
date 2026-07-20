@@ -77,14 +77,47 @@ describe('multi-platform connector routing', () => {
     ]);
   });
 
-  it('applies proactive and operator policies independently', () => {
+  it('routes a radar city report back to the original comment platform', () => {
+    expect(
+      resolveSpeechDeliveryTargets(settings(), {
+        eventId: 'city-engagement:bilibili:request-1',
+        kind: 'viewer-reply',
+        sourcePlatformId: 'typhoon-radar',
+      }),
+    ).toEqual([
+      {
+        connectorId: 'ordinaryroad',
+        platformId: 'bilibili',
+        roomId: '21573209',
+      },
+    ]);
+  });
+
+  it('does not let a stale disabled reply preference block automated replies', () => {
+    const current = settings();
+    current.ordinaryRoad.platforms.bilibili.outbound.viewerReplies = false;
+
+    expect(
+      resolveSpeechDeliveryTargets(current, {
+        eventId: 'city-engagement:bilibili:request-2',
+        kind: 'viewer-reply',
+        sourcePlatformId: 'typhoon-radar',
+      }).map((target) => target.platformId),
+    ).toEqual(['bilibili']);
+  });
+
+  it('never mirrors idle proactive speech into automated platform comments', () => {
     const current = settings();
     expect(
       resolveSpeechDeliveryTargets(current, {
         eventId: 'event-2',
         kind: 'proactive-speech',
       }).map((target) => target.platformId),
-    ).toEqual(['twitch']);
+    ).toEqual([]);
+  });
+
+  it('keeps explicit operator broadcasts independently routable', () => {
+    const current = settings();
     expect(
       resolveSpeechDeliveryTargets(current, {
         eventId: 'event-3',
@@ -135,10 +168,14 @@ describe('OrdinaryRoad generic API', () => {
   });
 
   it('never places a credential in a URL', async () => {
-    const fetchMock = vi.fn().mockResolvedValue({ ok: true, json: async () => ({}) });
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValue({ ok: true, json: async () => ({}) });
     vi.stubGlobal('fetch', fetchMock);
     await saveOrdinaryRoadCredential('/gateway', 'bilibili', 'SESSDATA=secret');
-    expect(fetchMock.mock.calls[0][0]).toBe('/gateway/platforms/bilibili/credential');
+    expect(fetchMock.mock.calls[0][0]).toBe(
+      '/gateway/platforms/bilibili/credential',
+    );
     expect(fetchMock.mock.calls[0][1]).toMatchObject({ method: 'PUT' });
   });
 });
