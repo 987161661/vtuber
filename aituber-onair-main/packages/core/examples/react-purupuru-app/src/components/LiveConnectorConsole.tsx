@@ -25,7 +25,9 @@ interface LiveConnectorConsoleProps {
   socialBusHealth: StreamBusHealth;
   socialBusError: string;
   socialDiscoveredPlatforms: string[];
-  onChange: (update: (current: LiveConnectorSettings) => LiveConnectorSettings) => void;
+  onChange: (
+    update: (current: LiveConnectorSettings) => LiveConnectorSettings,
+  ) => void;
 }
 
 type ConnectorTab = LiveConnectorId;
@@ -95,7 +97,9 @@ function updatePlatform(
 
 export function LiveConnectorConsole(props: LiveConnectorConsoleProps) {
   const [tab, setTab] = useState<ConnectorTab>('ordinaryroad');
-  const [selectedByTab, setSelectedByTab] = useState<Record<ConnectorTab, string>>({
+  const [selectedByTab, setSelectedByTab] = useState<
+    Record<ConnectorTab, string>
+  >({
     ordinaryroad: 'bilibili',
     'social-stream-ninja': '',
   });
@@ -108,24 +112,26 @@ export function LiveConnectorConsole(props: LiveConnectorConsoleProps) {
   const social = props.settings.socialStreamNinja;
   const socialPlatforms = useMemo(
     () =>
-      [...new Set([
-        ...props.socialDiscoveredPlatforms,
-        ...Object.keys(social.platforms),
-      ])].sort(),
+      [
+        ...new Set([
+          ...props.socialDiscoveredPlatforms,
+          ...Object.keys(social.platforms),
+        ]),
+      ].sort(),
     [props.socialDiscoveredPlatforms, social.platforms],
   );
   const platformIds =
     tab === 'ordinaryroad'
       ? ORDINARYROAD_PLATFORMS.map((platform) => platform.id)
       : socialPlatforms;
-  const selectedPlatform =
-    selectedByTab[tab] || platformIds[0] || '';
+  const selectedPlatform = selectedByTab[tab] || platformIds[0] || '';
   const manifest = ORDINARYROAD_PLATFORMS.find(
     (platform) => platform.id === selectedPlatform,
   );
   const currentConnector = tab === 'ordinaryroad' ? ordinary : social;
   const connection = selectedPlatform
-    ? currentConnector.platforms[selectedPlatform] ?? createPlatformConnection()
+    ? (currentConnector.platforms[selectedPlatform] ??
+      createPlatformConnection())
     : createPlatformConnection();
   const owner = selectedPlatform
     ? platformOwner(props.settings, selectedPlatform)
@@ -153,7 +159,9 @@ export function LiveConnectorConsole(props: LiveConnectorConsoleProps) {
       });
       setNotice('平台配置已同步到本地网关。');
     } catch (error) {
-      setNotice(`网关同步失败：${error instanceof Error ? error.message : '未知错误'}`);
+      setNotice(
+        `网关同步失败：${error instanceof Error ? error.message : '未知错误'}`,
+      );
     } finally {
       setBusy(false);
     }
@@ -238,7 +246,9 @@ export function LiveConnectorConsole(props: LiveConnectorConsoleProps) {
       );
       setNotice('凭据已提交给本地网关；输入框已清空。');
     } catch (error) {
-      setNotice(`凭据提交失败：${error instanceof Error ? error.message : '未知错误'}`);
+      setNotice(
+        `凭据提交失败：${error instanceof Error ? error.message : '未知错误'}`,
+      );
     } finally {
       setCredentialDraft('');
       setBusy(false);
@@ -270,7 +280,9 @@ export function LiveConnectorConsole(props: LiveConnectorConsoleProps) {
 
       <div className="connector-command-bar">
         <div>
-          <span className={`health-dot ${tab === 'ordinaryroad' ? props.ordinaryRoadStatus.state : props.socialBusHealth}`} />
+          <span
+            className={`health-dot ${tab === 'ordinaryroad' ? props.ordinaryRoadStatus.state : props.socialBusHealth}`}
+          />
           {tab === 'ordinaryroad'
             ? connectionStateLabel(props.ordinaryRoadStatus.state)
             : connectionStateLabel(props.socialBusHealth)}
@@ -288,7 +300,9 @@ export function LiveConnectorConsole(props: LiveConnectorConsoleProps) {
       {tab === 'social-stream-ninja' && (
         <div className="ssn-prerequisite">
           <strong>SSN 必要条件</strong>
-          <span>扩展中须同时开启“远程 API”和“向 API server 发布聊天消息”。</span>
+          <span>
+            扩展中须同时开启“远程 API”和“向 API server 发布聊天消息”。
+          </span>
         </div>
       )}
 
@@ -299,8 +313,8 @@ export function LiveConnectorConsole(props: LiveConnectorConsoleProps) {
             const itemOwner = platformOwner(props.settings, platformId);
             const status = props.ordinaryRoadStatus.platforms?.[platformId];
             const label =
-              ORDINARYROAD_PLATFORMS.find((entry) => entry.id === platformId)?.label ??
-              platformId;
+              ORDINARYROAD_PLATFORMS.find((entry) => entry.id === platformId)
+                ?.label ?? platformId;
             return (
               <button
                 key={platformId}
@@ -353,7 +367,9 @@ export function LiveConnectorConsole(props: LiveConnectorConsoleProps) {
                   <input
                     type="checkbox"
                     checked={connection.enabled && owner === tab}
-                    onChange={(event) => void togglePlatform(event.target.checked)}
+                    onChange={(event) =>
+                      void togglePlatform(event.target.checked)
+                    }
                     disabled={!connectorEnabled || busy}
                   />
                   接管平台
@@ -369,7 +385,9 @@ export function LiveConnectorConsole(props: LiveConnectorConsoleProps) {
                       onChange={(event) => {
                         const roomId = event.target.value;
                         props.onChange((current) =>
-                          updatePlatform(current, tab, selectedPlatform, { roomId }),
+                          updatePlatform(current, tab, selectedPlatform, {
+                            roomId,
+                          }),
                         );
                       }}
                       onBlur={() =>
@@ -390,20 +408,30 @@ export function LiveConnectorConsole(props: LiveConnectorConsoleProps) {
                           type="password"
                           autoComplete="off"
                           value={credentialDraft}
-                          onChange={(event) => setCredentialDraft(event.target.value)}
+                          onChange={(event) =>
+                            setCredentialDraft(event.target.value)
+                          }
                           placeholder={`状态：${credentialLabel(platformStatus?.credentialState)}`}
                         />
                       </label>
-                      <button disabled={!credentialDraft.trim() || busy} onClick={() => void submitCredential()}>
+                      <button
+                        disabled={!credentialDraft.trim() || busy}
+                        onClick={() => void submitCredential()}
+                      >
                         安全保存
                       </button>
                       <button
                         className="secondary"
                         disabled={busy}
                         onClick={() => {
-                          void clearOrdinaryRoadCredential(ordinary.gatewayUrl, selectedPlatform)
+                          void clearOrdinaryRoadCredential(
+                            ordinary.gatewayUrl,
+                            selectedPlatform,
+                          )
                             .then(() => setNotice('本地凭据已清除。'))
-                            .catch((error) => setNotice(`清除失败：${String(error)}`));
+                            .catch((error) =>
+                              setNotice(`清除失败：${String(error)}`),
+                            );
                         }}
                       >
                         清除
@@ -449,27 +477,55 @@ export function LiveConnectorConsole(props: LiveConnectorConsoleProps) {
               )}
 
               <div className="capability-row">
-                <span>接收：{tab === 'ordinaryroad' && manifest?.capabilities.inbound === false ? '不支持' : '支持'}</span>
                 <span>
-                  回写：{tab === 'ordinaryroad' && manifest?.capabilities.outbound === false ? '仅接收' : '支持'}
+                  接收：
+                  {tab === 'ordinaryroad' &&
+                  manifest?.capabilities.inbound === false
+                    ? '不支持'
+                    : '支持'}
                 </span>
-                {platformStatus?.lastEventAt && <span>最近事件：{new Date(platformStatus.lastEventAt).toLocaleTimeString()}</span>}
-                {platformStatus?.lastSentAt && <span>最后发送：{new Date(platformStatus.lastSentAt).toLocaleTimeString()}</span>}
+                <span>
+                  回写：
+                  {tab === 'ordinaryroad' &&
+                  manifest?.capabilities.outbound === false
+                    ? '仅接收'
+                    : '支持'}
+                </span>
+                {platformStatus?.lastEventAt && (
+                  <span>
+                    最近事件：
+                    {new Date(platformStatus.lastEventAt).toLocaleTimeString()}
+                  </span>
+                )}
+                {platformStatus?.lastSentAt && (
+                  <span>
+                    最后发送：
+                    {new Date(platformStatus.lastSentAt).toLocaleTimeString()}
+                  </span>
+                )}
               </div>
-              {manifest?.note && <p className="capability-note">{manifest.note}</p>}
+              {manifest?.note && (
+                <p className="capability-note">{manifest.note}</p>
+              )}
 
               <fieldset className="delivery-policies">
                 <legend>文字回写策略</legend>
-                {(Object.keys(policyLabels) as PolicyKey[]).map((key) => {
+                <p className="capability-note">
+                  观众回复与天气实况固定回写到消息来源平台；静息自语不会回写。
+                </p>
+                {(['operatorBroadcasts'] as PolicyKey[]).map((key) => {
                   const unsupported =
-                    tab === 'ordinaryroad' && manifest?.capabilities.outbound === false;
+                    tab === 'ordinaryroad' &&
+                    manifest?.capabilities.outbound === false;
                   return (
                     <label key={key}>
                       <input
                         type="checkbox"
                         checked={!unsupported && connection.outbound[key]}
                         disabled={!connection.enabled || unsupported}
-                        onChange={(event) => updatePolicy(key, event.target.checked)}
+                        onChange={(event) =>
+                          updatePolicy(key, event.target.checked)
+                        }
                       />
                       <span>{policyLabels[key]}</span>
                       <small>
@@ -494,11 +550,17 @@ export function LiveConnectorConsole(props: LiveConnectorConsoleProps) {
       </div>
 
       <div className="signal-route-strip" aria-label="实时信号路由">
-        <span className={connectorEnabled ? 'active' : ''}>{tab === 'ordinaryroad' ? 'OrdinaryRoad' : 'SSN'}</span>
-        <i>→</i><span>{selectedPlatform || '等待平台'}</span>
-        <i>→</i><span>回复队列</span>
-        <i>→</i><span>TTS 开始</span>
-        <i>→</i><span className={connection.enabled ? 'active' : ''}>文字回写</span>
+        <span className={connectorEnabled ? 'active' : ''}>
+          {tab === 'ordinaryroad' ? 'OrdinaryRoad' : 'SSN'}
+        </span>
+        <i>→</i>
+        <span>{selectedPlatform || '等待平台'}</span>
+        <i>→</i>
+        <span>回复队列</span>
+        <i>→</i>
+        <span>TTS 开始</span>
+        <i>→</i>
+        <span className={connection.enabled ? 'active' : ''}>文字回写</span>
       </div>
     </div>
   );

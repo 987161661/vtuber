@@ -2,6 +2,7 @@ package local.aituber.gateway;
 
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.JsonNode;
 import tech.ordinaryroad.live.chat.client.bilibili.client.BilibiliLiveChatClient;
 import tech.ordinaryroad.live.chat.client.bilibili.config.BilibiliLiveChatClientConfig;
 import tech.ordinaryroad.live.chat.client.bilibili.listener.IBilibiliMsgListener;
@@ -226,6 +227,17 @@ public final class OrdinaryRoadBridge {
       public void onGiftMsg(SendGiftMsg msg) { publishGift(id, "bilibili", room, msg); }
       public void onSuperChatMsg(SuperChatMessageMsg msg) { publishDanmu(id, "bilibili", room, msg, "superchat"); }
       public void onEnterRoomMsg(InteractWordMsg msg) { publishEntry(id, "bilibili", room, msg); }
+      @Override
+      public void onMsg(IMsg rawMsg) {
+        // IBaseMsgListener guarantees this callback for every decoded packet,
+        // before the library decides whether its command is known. Reading
+        // INTERACT_WORD_V2 here avoids depending on the library's unknown-CMD
+        // dispatch, which did not reach the application listener in the live
+        // room even though the packet itself was decoded.
+        if (rawMsg instanceof ICmdMsg<?> commandMessage) {
+          publishBilibiliV2Entry(id, room, commandMessage.getCmd(), rawMsg);
+        }
+      }
       public void onLikeMsg(LikeInfoV3ClickMsg msg) { publishLike(id, "bilibili", room, msg); }
       public void onLiveStatusMsg(BilibiliLiveStatusChangeMsg msg) { publishLiveStatus(id, "bilibili", room, msg); }
       public void onRoomStatsMsg(BilibiliRoomStatsMsg msg) { publishStats(id, "bilibili", room, msg); }
@@ -293,6 +305,57 @@ public final class OrdinaryRoadBridge {
 
   private void publishEntry(String id, String platform, String room, IEnterRoomMsg msg) {
     publishEvent(id, platform, room, "entry", msg.getUid(), msg.getUsername(), msg.getUserAvatar(), "", Map.of());
+  }
+
+  /**
+   * OrdinaryRoad 1.5.8 only declares INTERACT_WORD in BilibiliCmdEnum. Bilibili
+   * currently sends ordinary viewer arrivals as INTERACT_WORD_V2, which the
+   * library decodes as a generic MessageMsg. Normalize it from the base
+   * onMsg callback so named real-room arrivals reach the same entry path as the
+   * legacy command regardless of specialized unknown-command dispatch.
+   */
+  private void publishBilibiliV2Entry(
+      String connectionId, String roomId, String command, IMsg rawMsg
+  ) {
+    if (command == null || !command.startsWith("INTERACT_WORD_V2")) return;
+    if (!(rawMsg instanceof MessageMsg message)) {
+      emit("bridge-warning", Map.of(
+          "connectionId", connectionId,
+          "platform", "bilibili",
+          "command", "INTERACT_WORD_V2",
+          "error", "unexpected_interact_word_v2_payload"
+      ));
+      return;
+    }
+    JsonNode interaction = message.getData();
+    if (interaction != null && interaction.has("data") && interaction.get("data").isObject()) {
+      interaction = interaction.get("data");
+    }
+    if (interaction == null || !interaction.isObject()) return;
+    String uid = jsonText(interaction, "uid");
+    String username = jsonText(interaction, "uname");
+    String avatar = "";
+    JsonNode userInfo = interaction.get("uinfo");
+    if (userInfo != null && userInfo.isObject()) {
+      if (uid.isBlank()) uid = jsonText(userInfo, "uid");
+      JsonNode base = userInfo.get("base");
+      if (base != null && base.isObject()) {
+        if (username.isBlank()) username = jsonText(base, "name");
+        avatar = jsonText(base, "face");
+      }
+    }
+    if (uid.isBlank() && username.isBlank()) return;
+    publishEvent(
+        connectionId,
+        "bilibili",
+        roomId,
+        "entry",
+        uid.isBlank() ? username : uid,
+        username.isBlank() ? "观众" : username,
+        avatar,
+        "",
+        Map.of("command", "INTERACT_WORD_V2")
+    );
   }
 
   private void publishLike(String id, String platform, String room, ILikeMsg msg) {
@@ -397,6 +460,11 @@ public final class OrdinaryRoadBridge {
   }
 
   private static String string(Object value) { return value == null ? "" : String.valueOf(value); }
+  private static String jsonText(JsonNode node, String field) {
+    if (node == null) return "";
+    JsonNode value = node.get(field);
+    return value == null || value.isNull() ? "" : value.asText("");
+  }
   private static long parseLong(Object value) {
     try { return Long.parseLong(string(value)); } catch (Exception ignored) { return 0L; }
   }

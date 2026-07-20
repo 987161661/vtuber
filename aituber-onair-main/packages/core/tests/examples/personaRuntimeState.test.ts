@@ -9,6 +9,11 @@ const context: EmptyRoomAwarenessContext = {
   digitalHumanTitle: '岚台主播',
   isLive: true,
   audiencePresent: true,
+  participantCount: 1,
+  activeAudienceCount: 1,
+  engageableAudienceCount: 1,
+  audienceActivityMode: 'active',
+  likelyRestingMembers: [],
   busy: false,
   interfaceContext: '节目处于安静待机状态',
   memoryCues: [

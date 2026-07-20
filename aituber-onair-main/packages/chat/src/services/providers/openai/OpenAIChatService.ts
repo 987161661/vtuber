@@ -51,9 +51,7 @@ export class OpenAIChatService implements ChatService {
   private reasoning_effort?: OpenAIReasoningEffort;
   private enableReasoningSummary?: boolean;
   private responseFormat?: OpenAIResponseFormat;
-  private protocolAudit?: NonNullable<
-    BaseChatServiceOptions['protocolAudit']
-  >;
+  private protocolAudit?: NonNullable<BaseChatServiceOptions['protocolAudit']>;
 
   /**
    * Constructor

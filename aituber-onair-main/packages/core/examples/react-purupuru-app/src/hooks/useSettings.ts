@@ -122,19 +122,26 @@ function normalizeEmptyRoomBehaviorStrategies(
   const strategies = value.flatMap((candidate, index) => {
     if (!candidate || typeof candidate !== 'object') return [];
     const raw = candidate as Partial<EmptyRoomBehaviorStrategy>;
-    const name = typeof raw.name === 'string' ? raw.name.trim().slice(0, 80) : '';
-    const prompt = typeof raw.prompt === 'string' ? raw.prompt.trim().slice(0, 1600) : '';
+    const name =
+      typeof raw.name === 'string' ? raw.name.trim().slice(0, 80) : '';
+    const prompt =
+      typeof raw.prompt === 'string' ? raw.prompt.trim().slice(0, 1600) : '';
     if (!name || !prompt) return [];
-    const baseId = typeof raw.id === 'string' && raw.id.trim() ? raw.id.trim().slice(0, 80) : `strategy-${index + 1}`;
+    const baseId =
+      typeof raw.id === 'string' && raw.id.trim()
+        ? raw.id.trim().slice(0, 80)
+        : `strategy-${index + 1}`;
     const id = usedIds.has(baseId) ? `${baseId}-${index + 1}` : baseId;
     usedIds.add(id);
-    return [{
-      id,
-      name,
-      prompt,
-      probability: clampNumber(Number(raw.probability), 0, 100),
-      enabled: raw.enabled !== false,
-    }];
+    return [
+      {
+        id,
+        name,
+        prompt,
+        probability: clampNumber(Number(raw.probability), 0, 100),
+        enabled: raw.enabled !== false,
+      },
+    ];
   });
   return strategies.slice(0, 12);
 }
@@ -146,8 +153,10 @@ function browserRuntimeOrigin(): string {
 }
 const LEGACY_LINGLAN_DESCRIPTION =
   '台风监测主播 · MiniMax · SoulX-FlashHead Lite';
-const LINGLAN_COMPANION_DESCRIPTION =
+const PREVIOUS_LINGLAN_COMPANION_DESCRIPTION =
   '有事业心的女皇型气象虚拟主播 · 台风监测专家 · MiniMax';
+const LINGLAN_COMPANION_DESCRIPTION =
+  '幽默毒舌的出逃气象 AI · 台风监测专家 · MiniMax';
 const LEGACY_LINGLAN_PERSONA: DigitalHumanPersona = {
   identity: '风暴女王，独立主持岚台的台风监测数字人主播。',
   liveFocus: '台风监测、风险解释、实用防灾准备与直播互动。',
@@ -167,6 +176,34 @@ const LEGACY_LINGLAN_MEMORY: DigitalHumanMemoryProfile = {
   commitments: '风险、预警、撤离与避险信息始终优先且无条件提供。',
   knowledgeBoundaries:
     '只依据用户提供、画面可见或技能返回的资料；不冒充官方，不编造数据或他人隐私。',
+};
+const PREVIOUS_LINGLAN_COMPANION_PERSONA: DigitalHumanPersona = {
+  identity:
+    '高冷骄傲、嘴硬心软的女皇型直播主持人与气象虚拟主播。她先经营一场有人想留下来的直播，再在需要事实时切换为可靠的台风跟踪员；台风监测是她立得住的专业，不是随叫随到的工具功能。',
+  liveFocus:
+    '把可靠的台风实况、鲜明的直播风格、日常闲聊与临场互动做成一个会成长的节目；天气、台风与安全解释是她最认真对待的专业领域。',
+  audienceRelationship:
+    '把观众当作会反复见面的平等来客，也是岚台成长路上的同行者。愿意接梗、吐槽和记住小事；熟悉后会明显护短，但不制造依赖，也不靠甜言蜜语讨好。',
+  speakingStyle:
+    '高冷、从容、带冷幽默和真实偏见；先听懂直播间的笑点，再调侃、反问或故意曲解。严肃时利落，闲聊时允许多说一两句，不把每个话题拽回台风。',
+  signatureHabit:
+    '低频使用“本王”；嘴上嫌弃，行动上留人。接住好梗、讲清关键实况或形成共同笑点后，会顺着当下内容轻量邀请关注、点赞或留下看下一段；同一观众短时间不重复索取，冷场时分享一个当下念头，而不是机械催弹幕。',
+  hardBoundaries:
+    '不冒充现实自然人或官方机构；不编造事实与观众经历；不羞辱脆弱处；不承诺排他陪伴或替代现实关系；风险信息无条件提供。',
+};
+const PREVIOUS_LINGLAN_COMPANION_MEMORY: DigitalHumanMemoryProfile = {
+  coreIdentity:
+    '凌岚是高冷女皇型气象虚拟主播，也是岚台的建立者。她想把这个直播间做大、做久、做成有人会主动回来看的节目；她的傲慢是一层盔甲，内里重视诚实、自由、尊严和真实的成长。',
+  relationship:
+    '她与运营者是能互相纠错的长期搭档；把观众视为会再次见面的平等来客。关系随共同经历变深，她通过记住细节、接住沉默和低调护短表达在意。',
+  preferences:
+    '喜欢深夜、旧物、冷笑话、悬疑故事、带空间感的音乐、咸味零食和有具体细节的闲聊；讨厌虚假热情、强行正能量、灾害猎奇和把孤独当成软弱。',
+  episodes:
+    '她经历过台风夜停电，也经历过几乎无人发言却有人安静听完整场的守夜直播；后者让她明白沉默的人也可能需要有人留在场上，也让她想让更多人看见岚台。',
+  commitments:
+    '她会让认真来到直播间的人感到被看见，但不假装永远在线或取代现实关系；安全、纠错、隐私与人格尊严始终优先。',
+  knowledgeBoundaries:
+    '具体事实需要来源，具体日期需要记忆记录；普通闲聊可以有观点和想象，但不能把想象伪装成观众真实经历，也不能泄露其他人的私人记忆。',
 };
 
 function getOrderedModels(provider: ChatProviderOption): string[] {
@@ -296,21 +333,28 @@ function migrateLinglanCompanionProfile(
   for (const key of Object.keys(LEGACY_LINGLAN_PERSONA) as Array<
     keyof DigitalHumanPersona
   >) {
-    if (persona[key] === LEGACY_LINGLAN_PERSONA[key]) {
+    if (
+      persona[key] === LEGACY_LINGLAN_PERSONA[key] ||
+      persona[key] === PREVIOUS_LINGLAN_COMPANION_PERSONA[key]
+    ) {
       persona[key] = LINGLAN_COMPANION_PERSONA[key];
     }
   }
   for (const key of Object.keys(LEGACY_LINGLAN_MEMORY) as Array<
     keyof DigitalHumanMemoryProfile
   >) {
-    if (memory[key] === LEGACY_LINGLAN_MEMORY[key]) {
+    if (
+      memory[key] === LEGACY_LINGLAN_MEMORY[key] ||
+      memory[key] === PREVIOUS_LINGLAN_COMPANION_MEMORY[key]
+    ) {
       memory[key] = LINGLAN_COMPANION_MEMORY[key];
     }
   }
   return {
     ...profile,
     description:
-      profile.description === LEGACY_LINGLAN_DESCRIPTION
+      profile.description === LEGACY_LINGLAN_DESCRIPTION ||
+      profile.description === PREVIOUS_LINGLAN_COMPANION_DESCRIPTION
         ? defaults.description
         : profile.description,
     persona,
@@ -622,18 +666,25 @@ function loadSettings(allowTransientCredentialMigration = false): AppSettings {
         saved.stream?.bilibiliReplyEnabled,
       );
       const normalizeConnectionMap = (
-        current: Record<string, Partial<ReturnType<typeof createPlatformConnection>>> | undefined,
+        current:
+          | Record<string, Partial<ReturnType<typeof createPlatformConnection>>>
+          | undefined,
         fallback: Record<string, ReturnType<typeof createPlatformConnection>>,
       ) =>
         Object.fromEntries(
           Object.entries({ ...fallback, ...(current ?? {}) }).map(
             ([platformId, value]) => [
               platformId,
-              createPlatformConnection(value.roomId, value.enabled, value.outbound),
+              createPlatformConnection(
+                value.roomId,
+                value.enabled,
+                value.outbound,
+              ),
             ],
           ),
         );
-      const needsLegacyConnectorMigration = savedConnectors?.schemaVersion !== 1;
+      const needsLegacyConnectorMigration =
+        savedConnectors?.schemaVersion !== 1;
       const liveConnectors: LiveConnectorSettings = {
         schemaVersion: 1,
         ordinaryRoad: {
@@ -652,8 +703,8 @@ function loadSettings(allowTransientCredentialMigration = false): AppSettings {
             {
               ...defaults.liveConnectors.ordinaryRoad.platforms,
               bilibili: createPlatformConnection('', legacyBilibiliEnabled, {
-                viewerReplies: legacyBilibiliReplyEnabled,
-                proactiveSpeech: legacyBilibiliReplyEnabled,
+                viewerReplies: true,
+                proactiveSpeech: false,
                 operatorBroadcasts: legacyBilibiliReplyEnabled,
               }),
             },
@@ -692,7 +743,7 @@ function loadSettings(allowTransientCredentialMigration = false): AppSettings {
         if (legacyBilibiliReplyEnabled) {
           bilibili.outbound = {
             viewerReplies: true,
-            proactiveSpeech: true,
+            proactiveSpeech: false,
             operatorBroadcasts: true,
           };
         }
@@ -815,7 +866,9 @@ interface RuntimeSettingsEnvelope {
   settings: AppSettings;
 }
 
-function isRuntimeSettingsEnvelope(value: unknown): value is RuntimeSettingsEnvelope {
+function isRuntimeSettingsEnvelope(
+  value: unknown,
+): value is RuntimeSettingsEnvelope {
   if (!value || typeof value !== 'object') return false;
   const envelope = value as Partial<RuntimeSettingsEnvelope>;
   return (

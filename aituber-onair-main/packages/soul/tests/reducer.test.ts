@@ -106,6 +106,29 @@ describe('causal soul reducer', () => {
     expect(engaged.affect.boredom).toBeGreaterThan(0);
   });
 
+  it('converges on cumulative quiet duration instead of adding every poll as new silence', () => {
+    const first = makeEvent({
+      id: 'silence-poll-1',
+      kind: 'silence-tick',
+      occurredAt: 301_000,
+      data: { durationMs: 300_000, selfDirectedEngagement: false },
+      actor: undefined,
+    });
+    const second = makeEvent({
+      ...first,
+      id: 'silence-poll-2',
+      occurredAt: 311_000,
+      data: { durationMs: 310_000, selfDirectedEngagement: false },
+    });
+    const afterFirst = applySoulEvent(makeState(), profile, first).state;
+    const afterSecond = applySoulEvent(afterFirst, profile, second).state;
+
+    expect(afterSecond.affect.boredom).toBeGreaterThan(
+      afterFirst.affect.boredom,
+    );
+    expect(afterSecond.affect.boredom).toBeLessThan(0.13);
+  });
+
   it('is idempotent for duplicate event ids', () => {
     const event = makeEvent();
     const first = applySoulEvent(makeState(), profile, event);

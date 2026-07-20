@@ -52,4 +52,30 @@ describe('RoomInteractionTracker', () => {
     );
     expect(tracker.snapshot().samples).toHaveLength(12);
   });
+
+  it('does not let a one-viewer scheduler batch erase recent participants', () => {
+    const now = 5_000_000;
+    const tracker = new RoomInteractionTracker(() => now);
+    const xiaoyu = comment('1', 'xiaoyu', '小雨', '在干嘛', now - 2_000);
+    const beichen = comment('2', 'beichen', '北辰', '好无聊', now - 1_000);
+    tracker.observe([xiaoyu, beichen]);
+    const beichenSample = tracker
+      .snapshot()
+      .samples.find((sample) => sample.id === '2')!;
+
+    const snapshot = tracker.snapshot({
+      totalCount: 1,
+      participantCount: 1,
+      catchup: false,
+      mergedCount: 1,
+      laneCounts: { conversation: 1 },
+      samples: [beichenSample],
+    });
+
+    expect(snapshot.participantCount).toBe(2);
+    expect(snapshot.samples.map((sample) => sample.viewerName)).toEqual([
+      '小雨',
+      '北辰',
+    ]);
+  });
 });

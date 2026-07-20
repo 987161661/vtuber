@@ -19,6 +19,11 @@ export interface PersonaTopicCandidate {
 }
 
 const SEMANTIC_FAMILIES: Array<[string, RegExp]> = [
+  [
+    'support_ack',
+    /点赞|点了赞|赞收|谢谢.*赞|感谢.*赞|亮一格|点亮|靠你们养|靠你们撑|多撑.*格/u,
+  ],
+  ['time_mood', /周[一二三四五六日天]|摸鱼|下班|还挂着|没处去|躲清静|躲清净/u],
   ['drinks', /茶|咖啡|饮料|水杯|茶杯|保温杯|喝水|泡了/u],
   ['food', /零食|吃饭|午饭|晚饭|夜宵|咸味|甜点/u],
   ['music', /音乐|歌曲|歌单|旋律|节奏|耳机/u],
@@ -27,14 +32,84 @@ const SEMANTIC_FAMILIES: Array<[string, RegExp]> = [
   ['room_presence', /直播间|房间|在场|安静|没人|观众/u],
   ['relationships', /朋友|女朋友|男朋友|家人|关系|认识/u],
   ['weather', /天气|台风|下雨|雷达|气温|风雨/u],
+  ['hazards', /洪灾|洪水|雨灾|水灾|内涝|积水|山洪|泥石流|灾情|预警/u],
 ];
 
-function normalizedTokens(text: string) {
+function semanticFamilies(text: string) {
+  return SEMANTIC_FAMILIES.flatMap(([family, pattern]) =>
+    pattern.test(text) ? [family] : [],
+  );
+}
+
+function normalizedComparableText(text: string) {
   return text
     .normalize('NFKC')
     .toLowerCase()
-    .match(/[\p{Script=Han}]{2,6}|[a-z0-9]{3,16}/gu)
-    ?.slice(0, 4) ?? [];
+    .replace(/[\p{P}\p{S}\s]/gu, '')
+    .replace(/(?:这个|那个|现在|目前|就是|其实|一下|已经|还是|可以)/gu, '');
+}
+
+function bigrams(text: string) {
+  const chars = Array.from(normalizedComparableText(text));
+  const values = new Set<string>();
+  for (let index = 0; index < chars.length - 1; index += 1) {
+    values.add(`${chars[index]}${chars[index + 1]}`);
+  }
+  return values;
+}
+
+/**
+ * Final deterministic guard for low-priority proactive speech. It compares
+ * meaning-bearing topic families first and lexical overlap second, so a model
+ * cannot repeat the just-finished audience topic merely by paraphrasing it.
+ */
+export function isRecentSemanticTopicRepeat(
+  candidate: string,
+  recentTexts: readonly string[],
+) {
+  const candidateFamilies = new Set(semanticFamilies(candidate));
+  const candidateNormalized = normalizedComparableText(candidate);
+  const candidateBigrams = bigrams(candidate);
+  if (!candidateNormalized || candidateBigrams.size < 2) return false;
+  return recentTexts.some((recentText) => {
+    const recentFamilies = semanticFamilies(recentText);
+    if (recentFamilies.some((family) => candidateFamilies.has(family))) {
+      return true;
+    }
+    const recentNormalized = normalizedComparableText(recentText);
+    if (
+      Math.min(candidateNormalized.length, recentNormalized.length) >= 8 &&
+      (candidateNormalized.includes(recentNormalized) ||
+        recentNormalized.includes(candidateNormalized))
+    ) {
+      return true;
+    }
+    const recentBigrams = bigrams(recentText);
+    const intersection = [...candidateBigrams].filter((value) =>
+      recentBigrams.has(value),
+    ).length;
+    const union = new Set([...candidateBigrams, ...recentBigrams]).size;
+    return union > 0 && intersection / union >= 0.45;
+  });
+}
+
+/**
+ * Support acknowledgements are single-use interaction replies, never a source
+ * for later quiet-room monologues. Keeping this rule deterministic prevents a
+ * single like from driving an hour of paraphrased proactive speech.
+ */
+export function isSingleUseEngagementEcho(candidate: string): boolean {
+  return semanticFamilies(candidate).includes('support_ack');
+}
+
+function normalizedTokens(text: string) {
+  return (
+    text
+      .normalize('NFKC')
+      .toLowerCase()
+      .match(/[\p{Script=Han}]{2,6}|[a-z0-9]{3,16}/gu)
+      ?.slice(0, 4) ?? []
+  );
 }
 
 export function inferTopicFamily(text: string, fallback = 'inner_life') {
@@ -57,18 +132,17 @@ export class PersonaTopicLedger {
   private readonly cooldownTurns: number;
   private readonly cooldownMs: number;
 
-  constructor(
-    maxEntries = 12,
-    cooldownTurns = 6,
-    cooldownMs = 30 * 60_000,
-  ) {
+  constructor(maxEntries = 12, cooldownTurns = 6, cooldownMs = 30 * 60_000) {
     this.maxEntries = maxEntries;
     this.cooldownTurns = cooldownTurns;
     this.cooldownMs = cooldownMs;
   }
 
   snapshot() {
-    return this.entries.map((entry) => ({ ...entry, entities: [...entry.entities] }));
+    return this.entries.map((entry) => ({
+      ...entry,
+      entities: [...entry.entities],
+    }));
   }
 
   isCooling(candidate: PersonaTopicCandidate, at = Date.now()) {

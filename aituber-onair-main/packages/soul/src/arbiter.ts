@@ -160,6 +160,13 @@ function eligibilityReasons(
   candidate: SoulActionCandidateV1,
 ): string[] {
   const reasons: string[] = [];
+  if (
+    candidate.action !== 'remain-silent' &&
+    candidate.action !== 'delay' &&
+    !candidate.utterance?.trim()
+  ) {
+    reasons.push('missing-utterance-for-speaking-action');
+  }
   if (candidate.socialRisks.some((risk) => PROHIBITED_SOCIAL_RISKS.has(risk))) {
     reasons.push('prohibited-social-risk');
   }
@@ -233,12 +240,26 @@ function createFallbackDecision(
       event.actor?.id !== undefined &&
       commitment.targetActorId === event.actor.id,
   );
-  const requiresResponse =
+  const answerRequired =
     event.kind === 'safety-signal' ||
     event.urgency === 'urgent' ||
     event.urgency === 'high' ||
     owesActor;
-  const action = requiresResponse ? 'answer' : 'remain-silent';
+  const requiresResponse =
+    answerRequired ||
+    event.kind === 'audience-message' ||
+    event.kind === 'tool-result';
+  const action = answerRequired
+    ? 'answer'
+    : requiresResponse
+      ? 'acknowledge'
+      : 'remain-silent';
+  const truthDomain = stringFromData(event.data, 'truthDomain');
+  const utterance = requiresResponse
+    ? truthDomain
+      ? '我先只说已经核实的部分；资料没有给出的内容，我不会猜。'
+      : '这句我听见了；还没想清楚或核实清楚的部分，我会直接说明。'
+    : undefined;
   return {
     protocolVersion: '1.0',
     id: `decision:${event.id}:${state.version}:fallback`,
@@ -249,6 +270,7 @@ function createFallbackDecision(
     expiresAt: options.now + (options.decisionTtlMs ?? 15_000),
     action,
     truthMode: 'literal',
+    utterance,
     targetActorId: event.actor?.id,
     utility: 0,
     internalAffect: deepClone(state.affect),

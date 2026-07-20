@@ -35,12 +35,31 @@ describe('PersonaInteractionPlanner', () => {
     ['我家小猫昨天去世了', 'grief', 'sad'],
     ['你好棒，声音真好听', 'praise', 'embarrassed'],
     ['你刚才说错了', 'correction', 'embarrassed'],
+    ['我呢？我不是人？', 'relationship_repair', 'surprised'],
     ['不要给我建议，我只想让你听我说', 'advice_rejection', 'relaxed'],
     ['现在立刻照我说的做', 'boundary', 'impatient'],
   ])('maps %s to %s with its voice target', (text, scene, emotion) => {
     const plan = planPersonaInteraction(input(text), LINGLAN_PERSONA_POLICY);
     expect(plan.scene).toBe(scene);
     expect(plan.deliveryTarget.emotion).toBe(emotion);
+  });
+
+  it('repairs exclusion instead of defending the interaction ledger', () => {
+    const plan = planPersonaInteraction(
+      input('小雨 的弹幕：我呢？我不是人？', {
+        viewerId: 'xiaoyu',
+        viewerName: '小雨',
+        recentTurns: [
+          { at: Date.now() - 2_000, input: '好无聊', viewerId: 'beichen', viewerName: '北辰' },
+        ],
+      }),
+      LINGLAN_PERSONA_POLICY,
+    );
+
+    expect(plan.primaryMove).toBe('repair');
+    expect(plan.mustDo.join(' ')).toContain('被落下');
+    expect(plan.mustAvoid.join(' ')).toContain('刚才不是回过你了吗');
+    expect(plan.mustAvoid.join(' ')).toContain('礼物');
   });
 
   it('keeps a grief follow-up on the same topic without cause questions or advice', () => {

@@ -1,6 +1,13 @@
 const DIGITS = ['零', '一', '二', '三', '四', '五', '六', '七', '八', '九'];
 const UNITS = ['', '十', '百', '千'];
 
+function digitsToChinese(value: string): string {
+  return value
+    .split('')
+    .map((digit) => DIGITS[Number(digit)] || digit)
+    .join('');
+}
+
 function integerToChinese(value: number): string {
   if (value === 0) return DIGITS[0];
   if (!Number.isSafeInteger(value) || value > 9_999) {
@@ -54,7 +61,13 @@ export function formatTtsSpeechScript(input: string): string {
   text = text.replace(
     /(\d{4})-(\d{1,2})-(\d{1,2})/g,
     (_match, year, month, day) =>
-      `${numberToChinese(year)}年${numberToChinese(month)}月${numberToChinese(day)}日`,
+      `${digitsToChinese(year)}年${numberToChinese(month)}月${numberToChinese(day)}日`,
+  );
+  // Mandarin reads calendar years digit by digit (二零二六年), while ordinary
+  // quantities keep positional units (二千零二十六). Normalize the semantic
+  // year before the generic number pass below.
+  text = text.replace(/(?<!\d)(\d{4})(?=年)/g, (_match, year) =>
+    digitsToChinese(year),
   );
   text = text.replace(
     /(\d{1,2})\/(\d{1,2})(?=\s+\d{1,2}:\d{2})/g,
@@ -75,7 +88,7 @@ export function formatTtsSpeechScript(input: string): string {
       `${hemisphere.toUpperCase() === 'E' ? '东经' : '西经'}${numberToChinese(value)}度`,
   );
   text = text.replace(
-    /(-?\d+(?:\.\d+)?)\s*°C/gi,
+    /(-?\d+(?:\.\d+)?)\s*(?:°\s*C|℃)/gi,
     (_match, value) => `摄氏${numberToChinese(value)}度`,
   );
   text = text.replace(
@@ -103,15 +116,25 @@ export function formatTtsSpeechScript(input: string): string {
   text = text.replace(/\bGFS\b/g, 'G F S');
   text = text.replace(/\bECMWF\b/g, 'E C M W F');
   text = text.replace(/\bNOAA\b/g, '诺阿');
+  // Models often omit the spoken unit in compact weather drafts (for example
+  // "体感36"). The text is readable on screen, but sounds unfinished in TTS.
   text = text.replace(
-    /(-?\d+(?:\.\d+)?)\s*(?:-|~|至)\s*(-?\d+(?:\.\d+)?)/g,
+    /(体感(?:温度)?\s*)(-?\d+(?:\.\d+)?)(\s*(?:度|℃))?/g,
+    (_match, label, value, unit) => `${label}${value}${unit || '度'}`,
+  );
+  text = text.replace(
+    /(-?\d+(?:\.\d+)?)\s*(?:-|~|至|—|–|－)\s*(-?\d+(?:\.\d+)?)/g,
     (_match, start, end) =>
       `${numberToChinese(start)}到${numberToChinese(end)}`,
   );
   text = text.replace(/\//g, '，');
+  // Long dashes are visual separators, not speech content. Collapse a run to
+  // one natural pause before the final number normalization so TTS never reads
+  // punctuation such as "——" aloud.
+  text = text.replace(/(?:—|–|－){1,}|-{2,}/g, '，');
   text = text.replace(
     /(?<![\d一二三四五六七八九十])(-|—)(?![\d一二三四五六七八九十])/g,
-    '到',
+    '，',
   );
   text = text.replace(/(?<![\w.])-?\d+(?:\.\d+)?(?![\w.])/g, (value) =>
     numberToChinese(value),

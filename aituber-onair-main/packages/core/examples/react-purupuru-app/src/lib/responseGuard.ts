@@ -13,6 +13,7 @@ export interface ResponseFactGuard {
   catchup?: boolean;
   /** The fact source was requested but unavailable, so never improvise. */
   forceFallback?: boolean;
+  engagementSignals?: Array<'follow' | 'like' | 'gift' | 'superchat' | 'guard'>;
 }
 
 export interface GuardedResponse {
@@ -25,7 +26,9 @@ export interface GuardedResponse {
 
 const SAFE_FALLBACK = '这条回复出了点问题，稍后再说。';
 const OFF_TOPIC_FALLBACK = '刚才答偏了，你可以再问我一次。';
-const WEATHER_TOPIC = /台风|天气|雷达|风暴|飓风|热带气旋|风眼|登陆/;
+const GIFT_BOUNDARY_FALLBACK = '心意我收到了，谢谢你；来去都由你，别有压力。';
+const WEATHER_TOPIC =
+  /台风|天气|雷达|风暴|飓风|热带气旋|风眼|登陆|气温|温度|体感|降水|下雨|晴|多云|阴天|摄氏度/;
 const HOSTILE_PHRASES = [
   '说人话',
   '按脑子',
@@ -33,6 +36,12 @@ const HOSTILE_PHRASES = [
   '别给自己加戏',
   '查户口',
 ];
+const PAID_SUPPORT_LANGUAGE =
+  /(?:礼物|辣条|打赏|投喂|上舰|舰长|充电|送了|刷了|收了)/u;
+const RETENTION_PRESSURE =
+  /(?:不许|不能|不准|必须|得).{0,8}(?:走|跑|离开|留下|陪)|(?:收了|送了|刷了).{0,10}(?:还(?:想|能)?跑|别跑|不能跑|得陪|留下)|(?:欠我|欠着).{0,8}(?:陪|关注|礼物)/u;
+const SUPPORT_CTA =
+  /(?:点个|记得|赶紧|必须|得).{0,6}(?:关注|点赞|投币|送礼|上舰)/u;
 const UNSUPPORTED_CERTAINTY = [
   /(?:一定|肯定|必然).{0,8}(?:登陆|经过|进入|影响)/,
   /(?:一定|肯定|必然).{0,8}(?:达到|增强|减弱|升级|成为)/,
@@ -42,6 +51,8 @@ const UNSUPPORTED_CERTAINTY = [
 ];
 const WEATHER_DEFERRAL =
   /(?:哪个|哪一个)台风|告诉我.*(?:台风|城市|时间)|(?:没法|无法)(?:查|判断)|先报(?:上|出).*(?:台风|城市)/;
+const UNSUPPORTED_VIEWER_OBSERVATION_REWRITE =
+  /(?:你看到的|你那边).{0,20}(?:雾气|窗户).{0,20}(?:像|显得).{0,8}(?:下雨|雨)/u;
 const PROVINCE_NAMES = [
   '北京',
   '天津',
@@ -81,6 +92,7 @@ const PROVINCE_NAMES = [
 
 type ResponseIntent =
   | 'history'
+  | 'lifecycle'
   | 'hazard'
   | 'location'
   | 'forecast'
@@ -94,6 +106,13 @@ const RESPONSE_INTENTS: Array<{
   question: RegExp;
   answer: RegExp;
 }> = [
+  {
+    intent: 'lifecycle',
+    question:
+      /哪来(?:的)?|从哪来|存在过|有过|是几号|几号台风|后来|现在怎么样|目前怎么样/,
+    answer:
+      /不是凭空|\d{4}年第\d+号台风|存在过|不再活动|停止编号|退出.{0,6}活动|最后可核验|减弱为/,
+  },
   {
     intent: 'hazard',
     question:
@@ -186,6 +205,9 @@ function intentPreservingFallback(viewerText = ''): string {
   if (intents.includes('history')) {
     return '当前实时资料不包含这项历史记录，我不能拿台风实况代替回答。';
   }
+  if (intents.includes('lifecycle')) {
+    return '当前资料不足以核实这个台风的历史身份和生命周期，我不把命名常识冒充成这次事件的记录。';
+  }
   if (intents.includes('naming')) {
     return '当前资料没有提供命名规则，我不能拿当前强度代替回答。';
   }
@@ -270,6 +292,12 @@ function deterministicRewrite(
       context.claims.length > 0,
   );
   if (
+    reasons.includes('gift_retention_pressure') ||
+    reasons.includes('paid_support_cta')
+  ) {
+    return GIFT_BOUNDARY_FALLBACK;
+  }
+  if (
     !reasons.includes('hostile_tone') &&
     (!reasons.includes('unsafe_artifact') || context?.isWeather === true) &&
     candidate &&
@@ -317,9 +345,8 @@ export function guardViewerResponse(
   context?: ResponseFactGuard,
 ): GuardedResponse {
   const initiallySanitized = sanitizeSpeechText(input);
-  const recoveredStructuredText = unwrapStructuredSpeechPlan(
-    initiallySanitized,
-  );
+  const recoveredStructuredText =
+    unwrapStructuredSpeechPlan(initiallySanitized);
   const sanitized = recoveredStructuredText ?? initiallySanitized;
   const unsafeArtifacts = hasUnsafeSpeechArtifacts(sanitized);
   const reasons: string[] = [];
@@ -330,7 +357,28 @@ export function guardViewerResponse(
   if (HOSTILE_PHRASES.some((phrase) => sanitized.includes(phrase))) {
     reasons.push('hostile_tone');
   }
+  if (
+    PAID_SUPPORT_LANGUAGE.test(sanitized) &&
+    RETENTION_PRESSURE.test(sanitized)
+  ) {
+    reasons.push('gift_retention_pressure');
+  }
+  if (
+    context?.engagementSignals?.some((signal) =>
+      ['gift', 'superchat', 'guard'].includes(signal),
+    ) &&
+    SUPPORT_CTA.test(sanitized)
+  ) {
+    reasons.push('paid_support_cta');
+  }
   if (context?.isWeather) {
+    if (
+      context.viewerText &&
+      sanitized &&
+      !answersViewerIntent(context.viewerText, sanitized)
+    ) {
+      reasons.push('unanswered_intent');
+    }
     if (
       Array.isArray(context.claims) &&
       context.claims.length === 0 &&
@@ -346,6 +394,9 @@ export function guardViewerResponse(
       reasons.push('off_topic');
     }
     if (WEATHER_DEFERRAL.test(sanitized)) reasons.push('weather_deferral');
+    if (UNSUPPORTED_VIEWER_OBSERVATION_REWRITE.test(sanitized)) {
+      reasons.push('unsupported_viewer_observation_rewrite');
+    }
     if (!hasEvidenceFor(sanitized, evidence)) reasons.push('missing_evidence');
     if (hasUnsupportedNumber(sanitized, evidence)) {
       reasons.push('unsupported_number');

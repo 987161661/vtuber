@@ -64,15 +64,86 @@ export function mergeRecentLiveTurns(
   return [...byIdentity.values()].sort((left, right) => left.at - right.at);
 }
 
+/**
+ * Projects an observed inbound event immediately, before analysis, generation,
+ * and TTS. The eventual delivered turn is merged by event id, so pending room
+ * evidence becomes a completed interaction without creating a second turn.
+ */
+export function projectObservedLiveTurn(
+  current: RecentLiveTurn[],
+  turn: Omit<RecentLiveTurn, 'status'>,
+): RecentLiveTurn[] {
+  return mergeRecentLiveTurns(current, [{ ...turn, status: 'pending' }]);
+}
+
+export function projectRoomInteractionSamples(
+  current: RecentLiveTurn[],
+  samples: ReadonlyArray<{
+    id: string;
+    at: number;
+    text: string;
+    viewerId: string;
+    viewerName: string;
+  }>,
+  sourceLabel?: string,
+): RecentLiveTurn[] {
+  return mergeRecentLiveTurns(
+    current,
+    samples.map((sample) => ({
+      eventId: sample.id,
+      at: sample.at,
+      input: sample.text,
+      viewerId: sample.viewerId,
+      viewerName: sample.viewerName,
+      sourceLabel,
+      sourcesSeen: sourceLabel ? [sourceLabel] : undefined,
+      status: 'pending',
+    })),
+  );
+}
+
+export function recentParticipantEvidence(
+  turns: RecentLiveTurn[],
+  now = Date.now(),
+  windowMs = 90_000,
+) {
+  const participants = new Map<
+    string,
+    { id: string; name?: string; platform?: string }
+  >();
+  turns
+    .filter((turn) => now - turn.at <= windowMs && Boolean(turn.viewerId))
+    .forEach((turn) => {
+      const id = turn.viewerId!;
+      const platform = turn.sourcesSeen?.[0] || turn.sourceLabel;
+      const identity = `${platform || 'unknown'}:${id}`;
+      participants.set(identity, {
+        id,
+        name: turn.viewerName || participants.get(identity)?.name,
+        platform,
+      });
+    });
+  return [...participants.values()];
+}
+
 export function buildLiveRoomTranscript(
   turns: RecentLiveTurn[],
   currentViewerId?: string,
   now = Date.now(),
+  currentPlatform?: string,
 ) {
   if (!turns.length) return '';
   const recent = turns.filter((turn) => now - turn.at <= 90_000);
   const currentViewerTurns = currentViewerId
-    ? recent.filter((turn) => turn.viewerId === currentViewerId).slice(-2)
+    ? recent
+        .filter((turn) => {
+          const platform = turn.sourcesSeen?.[0] || turn.sourceLabel;
+          return (
+            turn.viewerId === currentViewerId &&
+            (!currentPlatform || !platform || platform === currentPlatform)
+          );
+        })
+        .slice(-2)
     : [];
   const selected = [...new Map(
     [...recent.slice(-8), ...currentViewerTurns].map((turn) => [
@@ -81,15 +152,24 @@ export function buildLiveRoomTranscript(
     ]),
   ).values()].sort((left, right) => left.at - right.at);
   if (!selected.length) return '';
+  const participants = recentParticipantEvidence(recent, now);
+  const participantEvidence = participants.length
+    ? participants.map((participant) => participant.name || participant.id).join('、')
+    : '无';
   const transcript = selected
-    .map(
-      (turn) =>
-      `观众${turn.viewerName ? `（${turn.viewerName}）` : ''}${turn.viewerId ? ` [${turn.viewerId}]` : ''}${turn.sourceLabel ? `，来源：${turn.sourceLabel}` : ''}：${turn.input}${
-          turn.reply ? `\n凌岚：${turn.reply}` : '\n（该条未播出回复）'
-        }${turn.skills?.length ? `\n已用技能：${turn.skills.join('、')}` : ''}`,
-    )
+    .map((turn) => {
+      const platform = turn.sourcesSeen?.[0] || turn.sourceLabel;
+      const isCurrentViewer = Boolean(
+        currentViewerId &&
+          turn.viewerId === currentViewerId &&
+          (!currentPlatform || !platform || platform === currentPlatform),
+      );
+      return `独立观众事件${isCurrentViewer ? ' [当前回复对象]' : ' [其他观众]'}${turn.viewerName ? `：${turn.viewerName}` : ''}${turn.viewerId ? ` [viewerId=${turn.viewerId}]` : ''}${platform ? ` [platform=${platform}]` : ''}${turn.eventId ? ` [eventId=${turn.eventId}]` : ''}：${turn.input}${
+        turn.reply ? `\n凌岚：${turn.reply}` : '\n（该条未播出回复）'
+      }${turn.skills?.length ? `\n已用技能：${turn.skills.join('、')}` : ''}`;
+    })
     .join('\n\n');
-  return `\n\n<live_room_transcript>\n这是最近90秒、最多8个有效回合的短期上下文；只用于理解追问和多人插话，绝不是节目主题。不得把旧话题带回当前回答，也不得向观众提及内部记录。\n${transcript}\n</live_room_transcript>`;
+  return `\n\n<live_room_transcript>\n这是最近90秒、最多8个有效回合的短期上下文；只用于理解追问和多人插话，绝不是节目主题。不得把旧话题带回当前回答，也不得向观众提及内部记录。\n每条都是带 platform + viewerId 的独立 actor 事件。只能把当前回复对象自己的话、偏好、地点、关系和承诺归给当前对象；其他观众的话只能用于理解房间气氛与插话，禁止合并、移植或张冠李戴。同名但 platform/viewerId 不同仍是不同观众。\n近期实际发言或互动过的观众证据：${participantEvidence}（${participants.length}人）。这只是互动下限，不是房间总人数；除非平台提供精确在场证据，不得声称“只有我和某人”“就咱俩”或忽略名单里的其他观众。\n${transcript}\n</live_room_transcript>`;
 }
 
 export function buildLiveResponseContract(
@@ -164,7 +244,7 @@ export function buildLiveResponseContract(
     preferMultipleBeats
       ? '本轮适合在确有查证、承接或情绪反应时使用两到三句短节拍；最后一个节拍必须给出完整主答案。'
       : '无需为了表演强行拆句。'
-  }\n拟人要求：只有当观众明确询问台风、天气、雷达或相关的上一轮追问时，才调用或提及台风。普通问候、情绪、玩笑、关系和生活话题，就像一个有自己性格的主播一样直接回应，不要拿台风实况做转场。\n回答策略：第一句直接回答观众真正问的内容；资料不能支持时，明确说不知道或资料未提供，不得拿相关但不同的问题代替。\n长度要求：大多数情况下用 1 到 2 句完成，总长不超过 80 个中文字；不要重复题目、不要带出推理过程或内部规则。\n</live_response_contract>`;
+  }\n拟人要求：只有当观众明确询问台风、天气、雷达或相关的上一轮追问时，才调用或提及台风。普通问候、情绪、玩笑、关系和生活话题，就像一个有自己性格的主播一样直接回应，不要拿台风实况做转场。自然聊天可以提出猜想，但不能擅自断言观众昨晚没睡、住在哪里、做过什么或是什么关系；若缺少同一 actor 的明确自述，只能用不带事实预设的接话或询问。\n回答策略：第一句直接回答观众真正问的内容；资料不能支持时，明确说不知道或资料未提供，不得拿相关但不同的问题代替。\n长度要求：大多数情况下用 1 到 2 句完成，总长不超过 80 个中文字；不要重复题目、不要带出推理过程或内部规则。\n</live_response_contract>`;
   return {
     contract: runtimeClockContext + contract,
     inheritedSkills,

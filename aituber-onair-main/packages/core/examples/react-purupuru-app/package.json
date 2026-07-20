@@ -4,8 +4,12 @@
   "version": "0.0.0",
   "type": "module",
   "scripts": {
+    "build:chat": "npm --prefix ../../../chat run build:cjs && npm --prefix ../../../chat run build:esm",
+    "build:core": "npm run build:chat && npm --prefix ../.. run build",
+    "predev": "npm run build:core",
     "dev": "vite",
-    "build": "tsc -b && vite build",
+    "prebuild": "npm run build:core",
+    "build": "tsc -b && vite build && node scripts/check-client-bundle.mjs",
     "lint": "eslint .",
     "preview": "vite preview"
   },

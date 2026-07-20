@@ -35,6 +35,10 @@ const context: EmptyRoomAwarenessContext = {
   isLive: true,
   audiencePresent: false,
   participantCount: 0,
+  activeAudienceCount: 0,
+  engageableAudienceCount: 0,
+  audienceActivityMode: 'empty',
+  likelyRestingMembers: [],
   busy: false,
   interfaceContext: '直播界面处于安静待机状态。',
   memoryCues: [],
@@ -187,6 +191,10 @@ describe('empty room awareness planner', () => {
     const result = planner.poll(settings, {
       ...context,
       audiencePresent: true,
+      participantCount: 1,
+      activeAudienceCount: 1,
+      engageableAudienceCount: 1,
+      audienceActivityMode: 'active',
       audienceMembers: [{ id: 'viewer-1', name: '小周', platform: 'bilibili', enteredAt: 500, lastSeenAt: 119_000, lastInteractionAt: 1_000, messageCount: 1 }],
     }, 120_000);
 
@@ -206,5 +214,48 @@ describe('empty room awareness planner', () => {
 
     planner.markActivity(settings, 0);
     expect(planner.poll(settings, { ...context, busy: true }, 120_000)).toBeNull();
+  });
+
+  it('keeps likely-resting viewers in do-not-disturb mode', () => {
+    const planner = new EmptyRoomAwarenessPlanner(() => 0);
+    planner.markActivity(settings, 0);
+    expect(
+      planner.poll(
+        settings,
+        {
+          ...context,
+          audiencePresent: true,
+          participantCount: 1,
+          activeAudienceCount: 1,
+          engageableAudienceCount: 0,
+          audienceActivityMode: 'likely-resting',
+          likelyRestingMembers: [
+            {
+              id: 'viewer-1',
+              name: '小周',
+              platform: 'bilibili',
+              lastInteractionAt: 100_000,
+              restIntentAt: 100_000,
+              evidence: 'explicit-rest-intent',
+            },
+          ],
+        },
+        120_000,
+      ),
+    ).toBeNull();
+  });
+
+  it('allows at most one passive-room turn per thirty minutes', () => {
+    const planner = new EmptyRoomAwarenessPlanner(() => 0);
+    const passive = {
+      ...context,
+      audiencePresent: true,
+      participantCount: 1,
+      audienceActivityMode: 'passive' as const,
+    };
+    planner.markActivity(settings, 0);
+    expect(planner.poll(settings, passive, 120_000)).not.toBeNull();
+    expect(planner.poll(settings, passive, 240_000)).toBeNull();
+    expect(planner.poll(settings, passive, 1_920_000)).not.toBeNull();
   });
 });

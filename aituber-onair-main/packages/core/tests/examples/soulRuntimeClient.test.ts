@@ -237,6 +237,170 @@ describe('browser soul runtime session', () => {
     expect(recoveryFetch).toHaveBeenCalledTimes(2);
   });
 
+  it('opens a new scope when no snapshot exists and the server ledger is empty', async () => {
+    const fetchImpl = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes('/api/soul/snapshot?')) {
+        return new Response(JSON.stringify({ error: 'snapshot_not_found' }), {
+          status: 404,
+        });
+      }
+      if (url.includes('/api/soul/ledger?')) {
+        return new Response(JSON.stringify({ entries: [] }), { status: 200 });
+      }
+      throw new Error(`unexpected request: ${url}`);
+    }) as unknown as typeof fetch;
+
+    const session = await BrowserSoulRuntimeSession.recover({
+      constitution: LINGLAN_SOUL_CONSTITUTION,
+      profile: LINGLAN_SOUL_PROFILE,
+      scope,
+      fetchImpl,
+      now: () => 4_000,
+    });
+
+    expect(session.getState().version).toBe(0);
+    expect(session.getPersistenceError()).toBeUndefined();
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
+  });
+
+  it('surfaces the server persistence rejection instead of returning only false', async () => {
+    const event = createLinglanSoulEvent({
+      id: 'persistence-conflict',
+      scope,
+      kind: 'audience-message',
+      occurredAt: 5_000,
+      receivedAt: 5_000,
+      evidenceLevel: 'synthetic',
+      provenance: 'unit-test',
+      data: { text: 'test persistence reporting' },
+    });
+    const fetchImpl = vi.fn(
+      async (input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url.endsWith('/fast')) {
+          return new Response(
+            JSON.stringify({ proposal: proposal(event.id) }),
+            { status: 200 },
+          );
+        }
+        if (url.endsWith('/ledger')) {
+          return new Response(JSON.stringify({ stored: true }), { status: 200 });
+        }
+        if (url.endsWith('/snapshot')) {
+          return new Response(
+            JSON.stringify({ error: 'snapshot_version_regression' }),
+            { status: 409 },
+          );
+        }
+        throw new Error(`unexpected request: ${url}`);
+      },
+    ) as unknown as typeof fetch;
+    const session = new BrowserSoulRuntimeSession({
+      constitution: LINGLAN_SOUL_CONSTITUTION,
+      profile: LINGLAN_SOUL_PROFILE,
+      scope,
+      fetchImpl,
+      now: () => 5_000,
+    });
+
+    const result = await session.evaluate(event);
+
+    expect(result.persistenceOk).toBe(false);
+    expect(result.persistenceError).toBe(
+      'soul_snapshot_http_409:snapshot_version_regression',
+    );
+  });
+
+  it('rebuilds a stale checkpoint from the authoritative ledger and supersedes it', async () => {
+    const event = createLinglanSoulEvent({
+      id: 'checkpoint-rebuild',
+      scope,
+      kind: 'audience-message',
+      occurredAt: 5_500,
+      receivedAt: 5_500,
+      evidenceLevel: 'synthetic',
+      provenance: 'unit-test',
+      data: { text: 'rebuild from ledger' },
+    });
+    const ledgerInputs: SoulLedgerInputV1[] = [];
+    let snapshot: SoulSnapshotV1 | undefined;
+    const persistenceFetch = vi.fn(
+      async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        if (url.endsWith('/fast')) {
+          return new Response(
+            JSON.stringify({ proposal: proposal(event.id) }),
+            { status: 200 },
+          );
+        }
+        const body = JSON.parse(String(init?.body ?? '{}'));
+        if (url.endsWith('/ledger')) ledgerInputs.push(body);
+        if (url.endsWith('/snapshot')) snapshot = body;
+        return new Response('{}', { status: 200 });
+      },
+    ) as unknown as typeof fetch;
+    const original = new BrowserSoulRuntimeSession({
+      constitution: LINGLAN_SOUL_CONSTITUTION,
+      profile: LINGLAN_SOUL_PROFILE,
+      scope,
+      fetchImpl: persistenceFetch,
+      now: () => 5_500,
+    });
+    await original.evaluate(event);
+    expect(snapshot).toBeDefined();
+    const staleSnapshot = {
+      ...snapshot!,
+      ledgerHeadHash: 'fnv1a32:stale-checkpoint',
+    };
+    let replacement: SoulSnapshotV1 | undefined;
+    let replacementStateHashHeader: string | null = null;
+    const recoveryFetch = vi.fn(
+      async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        if (url.includes('/api/soul/snapshot?')) {
+          return new Response(JSON.stringify({ snapshot: staleSnapshot }), {
+            status: 200,
+          });
+        }
+        if (url.includes('/api/soul/ledger?')) {
+          return new Response(
+            JSON.stringify({
+              entries: ledgerInputs.map((entry, index) => ({
+                ...entry,
+                sequence: index + 1,
+              })),
+            }),
+            { status: 200 },
+          );
+        }
+        if (url.endsWith('/api/soul/snapshot')) {
+          replacement = JSON.parse(String(init?.body ?? '{}'));
+          replacementStateHashHeader = new Headers(init?.headers).get(
+            'X-Soul-Replace-State-Hash',
+          );
+          return new Response('{}', { status: 200 });
+        }
+        throw new Error(`unexpected request: ${url}`);
+      },
+    ) as unknown as typeof fetch;
+
+    const recovered = await BrowserSoulRuntimeSession.recover({
+      constitution: LINGLAN_SOUL_CONSTITUTION,
+      profile: LINGLAN_SOUL_PROFILE,
+      scope,
+      fetchImpl: recoveryFetch,
+      now: () => 5_600,
+    });
+
+    expect(hashSoulState(recovered.getState())).toBe(
+      hashSoulState(original.getState()),
+    );
+    expect(replacement?.ledgerHeadHash).toBe(snapshot?.ledgerHeadHash);
+    expect(replacementStateHashHeader).toBe(staleSnapshot.stateHash);
+    expect(recoveryFetch).toHaveBeenCalledTimes(3);
+  });
+
   it('commits an explicit reflection review and restores it without inert model proposals', async () => {
     let now = 6_000;
     const ledgerInputs: SoulLedgerInputV1[] = [];
@@ -355,9 +519,27 @@ describe('browser soul runtime session', () => {
         proposal: reflectionProposal,
       },
     };
+    const validReview = ledgerInputs.find(
+      (entry) =>
+        entry.kind === 'reflection' &&
+        (entry.payload as { recordType?: string }).recordType ===
+          'reflection-review',
+    );
+    expect(validReview).toBeDefined();
+    const invalidLegacyReview: SoulLedgerInputV1 = {
+      ...validReview!,
+      id: 'ledger:reflection-review:legacy-invalid-state',
+      payload: {
+        ...(validReview!.payload as Record<string, unknown>),
+        reflectionId: 'legacy-invalid-state',
+        stateVersionBefore: 999,
+        stateVersionAfter: 1_000,
+      },
+    };
     const serverInputs = [
       ...ledgerInputs.slice(0, reviewIndex),
       inertProposal,
+      invalidLegacyReview,
       ...ledgerInputs.slice(reviewIndex),
     ];
     const recoveryFetch = vi.fn(async (input: RequestInfo | URL) => {
@@ -395,6 +577,7 @@ describe('browser soul runtime session', () => {
     expect(recovered.getState().processedReflectionIds).toEqual([
       reflectionProposal.id,
     ]);
+    expect(recoveryFetch).toHaveBeenCalledTimes(2);
     expect(
       recovered.getState().beliefs['strategy:short-opening'],
     ).toMatchObject({ sourceReflectionId: reflectionProposal.id });

@@ -18,6 +18,20 @@ import type {
 const messages: Message[] = [{ role: 'user', content: 'hello' }];
 
 describe('buildOpenAIRequestBody', () => {
+  it('disables MiniMax-M3 thinking through a local OpenAI-compatible proxy', () => {
+    const body = buildOpenAIRequestBody({
+      provider: 'openai-compatible',
+      endpoint: 'http://127.0.0.1:5173/api/minimax-chat',
+      messages,
+      model: 'MiniMax-M3',
+      stream: false,
+      tools: [],
+      mcpServers: [],
+    });
+
+    expect(body.thinking).toEqual({ type: 'disabled' });
+  });
+
   it('raises chat completions token limit for GPT-5.4 responseLength presets', () => {
     const body = buildOpenAIRequestBody({
       provider: 'openai',

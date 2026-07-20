@@ -14,8 +14,8 @@ describe('city report engagement policy', () => {
     viewerName: '小雨',
   };
 
-  it.each(['legacy', 'shadow', 'canary'] as const)(
-    'removes stale city-triggered CTA copy in %s mode',
+  it.each(['legacy', 'shadow', 'canary', 'primary'] as const)(
+    'removes stale city-triggered CTA copy and canned speech in %s mode',
     (mode) => {
       const normalized = normalizeCityReportEngagementPayload(
         stalePayload,
@@ -24,21 +24,31 @@ describe('city report engagement policy', () => {
 
       expect(normalized.isCityReportResult).toBe(true);
       expect(normalized.legacySupportRequestRemoved).toBe(true);
-      expect(normalized.directReply).toBe('@小雨，伊宁的战报已经展开了。');
-      expect(normalized.directReply).not.toMatch(/关注|点赞|礼物|打赏/);
+      expect(normalized.directReply).toBeUndefined();
       expect(normalized.text).not.toContain('请自然引导关注');
     },
   );
 
-  it('removes the direct-reply bypass in primary mode', () => {
+  it('preserves verified weather facts while removing the direct-reply bypass', () => {
     const normalized = normalizeCityReportEngagementPayload(
-      stalePayload,
+      {
+        eventId: 'city-engagement:new-weather-1',
+        text: `<city_report_engagement>
+目标观众：@小雨；查询城市：上海
+已核验天气事实：气温36℃，体感42℃，全国城市体感温度第2/300
+表达规则：普通天气，幽默毒舌地根据事实调侃。
+</city_report_engagement>`,
+        directReply: '上海的战报已经展开了。',
+      },
       'primary',
     );
 
     expect(normalized.directReply).toBeUndefined();
-    expect(normalized.text).toContain('只证明城市卡片已展开');
-    expect(normalized.text).toContain('其他行动只能由主播运行时');
+    expect(normalized.text).toContain('气温36℃');
+    expect(normalized.text).toContain('体感温度第2/300');
+    expect(normalized.text).toContain('幽默毒舌');
+    expect(normalized.text).not.toContain('战报已经展开');
+    expect(normalized.text).toContain('不得索取关注、点赞、礼物');
   });
 
   it('does not report a current non-authorizing envelope as stale coupling', () => {
@@ -50,7 +60,7 @@ describe('city report engagement policy', () => {
 已展开城市：伊宁
 这是结果事件，不携带关注状态，也不授权索取关注、点赞或礼物。
 </city_report_engagement>`,
-        directReply: '@小雨，伊宁的战报已经展开了。',
+        directReply: undefined,
       },
       'shadow',
     );

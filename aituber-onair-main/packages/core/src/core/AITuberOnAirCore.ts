@@ -178,6 +178,21 @@ export enum AITuberOnAirCoreEvent {
 }
 
 /**
+ * Marks failures owned by an explicit speech invocation. Global ERROR
+ * observers may log this error, but terminal settlement belongs to the caller
+ * awaiting speakTextWithOptions().
+ */
+export class SpeechPlaybackError extends Error {
+  readonly originalError: unknown;
+
+  constructor(error: unknown) {
+    super(error instanceof Error ? error.message : String(error));
+    this.name = 'SpeechPlaybackError';
+    this.originalError = error;
+  }
+}
+
+/**
  * AITuberOnAirCore is a core class that integrates the main features of AITuber
  * - Chat processing (ChatService, ChatProcessor)
  * - Speech synthesis (VoiceService)
@@ -475,7 +490,7 @@ export class AITuberOnAirCore extends EventEmitter {
 
   private async withProcessing(
     startPayload: Record<string, unknown>,
-    action: () => Promise<boolean | void>,
+    action: () => Promise<unknown>,
     errorMessage: string,
   ): Promise<boolean> {
     if (this.isProcessing) {
@@ -652,7 +667,12 @@ export class AITuberOnAirCore extends EventEmitter {
       );
     } catch (error) {
       this.log('Error in speakTextWithOptions:', error);
-      this.emit(AITuberOnAirCoreEvent.ERROR, error);
+      const speechError =
+        error instanceof SpeechPlaybackError
+          ? error
+          : new SpeechPlaybackError(error);
+      this.emit(AITuberOnAirCoreEvent.ERROR, speechError);
+      throw speechError;
     } finally {
       // Restore original options if they were changed
       if (this.voiceService) {

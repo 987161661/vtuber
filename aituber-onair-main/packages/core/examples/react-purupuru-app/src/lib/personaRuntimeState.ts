@@ -124,7 +124,7 @@ function candidatesFor(
       drives: ['connection', 'autonomy', 'play'],
     },
   ];
-  if (context.audiencePresent) {
+  if (context.engageableAudienceCount > 0) {
     candidates.push({
       topicFamily: 'audience_presence',
       entities: ['audience_presence'],

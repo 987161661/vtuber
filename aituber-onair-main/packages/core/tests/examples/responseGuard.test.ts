@@ -42,6 +42,23 @@ describe('guardViewerResponse', () => {
     expect(result.text).toBe('这条回复出了点问题，稍后再说。');
   });
 
+  it('removes gift-based pressure to stay', () => {
+    const result = guardViewerResponse('在呢，辣条都收了还能跑了你？', {
+      isWeather: false,
+    });
+    expect(result.reasons).toContain('gift_retention_pressure');
+    expect(result.text).toBe('心意我收到了，谢谢你；来去都由你，别有压力。');
+  });
+
+  it('does not turn paid support into a follow CTA', () => {
+    const result = guardViewerResponse('谢谢礼物，赶紧点个关注吧。', {
+      isWeather: false,
+      engagementSignals: ['gift'],
+    });
+    expect(result.reasons).toContain('paid_support_cta');
+    expect(result.text).not.toContain('关注');
+  });
+
   it('fails closed on a malformed structured JSON fragment', () => {
     const result = guardViewerResponse('{"text":"会下雨","emotion":"neutral"');
     expect(result.unsafeArtifacts).toBe(true);
@@ -49,7 +66,8 @@ describe('guardViewerResponse', () => {
   });
 
   it('unwraps a fenced speech plan instead of speaking its JSON envelope', () => {
-    const spoken = '\u5317\u4eac\u73b0\u5728\u662f\u4e8c\u7ea7\u897f\u5357\u98ce\u3002';
+    const spoken =
+      '\u5317\u4eac\u73b0\u5728\u662f\u4e8c\u7ea7\u897f\u5357\u98ce\u3002';
     const result = guardViewerResponse(
       `\`\`\`json\n${JSON.stringify({ version: 2, beats: [{ text: spoken }] })}\n\`\`\``,
     );
@@ -65,10 +83,10 @@ describe('guardViewerResponse', () => {
     const result = guardViewerResponse(
       '{"text":"\\u4f1a\\u4e0b\\u96e8","emotion":"neutral"',
       {
-      isWeather: true,
-      viewerText: '\u5317\u4eac\u5929\u6c14\u600e\u4e48\u6837',
-      requiredAnswer,
-      claims: [{ text: requiredAnswer }],
+        isWeather: true,
+        viewerText: '\u5317\u4eac\u5929\u6c14\u600e\u4e48\u6837',
+        requiredAnswer,
+        claims: [{ text: requiredAnswer }],
       },
     );
 
@@ -100,7 +118,8 @@ describe('guardViewerResponse', () => {
       '\u60e0\u5dde\u4eca\u665a\u6ca1\u6709\u96e8\u707e\uff0c\u5c40\u90e8\u53ea\u4f1a\u6709\u9635\u96e8\u3002',
       {
         isWeather: true,
-        viewerText: '\u6211\u5728\u60e0\u5dde\uff0c\u6709\u6ca1\u6709\u96e8\u707e',
+        viewerText:
+          '\u6211\u5728\u60e0\u5dde\uff0c\u6709\u6ca1\u6709\u96e8\u707e',
         requiredAnswer:
           '\u5f53\u524d\u6280\u80fd\u6ca1\u6709\u53d6\u5f97\u60e0\u5dde\u5e02\u53ef\u6838\u5b9e\u7684\u96e8\u707e\u3001\u6d2a\u6c34\u3001\u5185\u6d9d\u6216\u5b98\u65b9\u9884\u8b66\u8d44\u6599\uff0c\u6240\u4ee5\u4e0d\u80fd\u5224\u65ad\u73b0\u5728\u6709\u6ca1\u6709\u96e8\u707e\u3002',
         claims: [],
@@ -108,7 +127,9 @@ describe('guardViewerResponse', () => {
     );
 
     expect(result.text).toContain('\u4e0d\u80fd\u5224\u65ad');
-    expect(result.text).not.toContain('\u60e0\u5dde\u4eca\u665a\u6ca1\u6709\u96e8\u707e');
+    expect(result.text).not.toContain(
+      '\u60e0\u5dde\u4eca\u665a\u6ca1\u6709\u96e8\u707e',
+    );
     expect(result.reasons).toContain('no_fact_claims');
   });
 
@@ -172,6 +193,73 @@ describe('guardViewerResponse', () => {
 
     expect(result.text).toBe('刚才答偏了，你可以再问我一次。');
     expect(result.reasons).toContain('off_topic');
+  });
+
+  it('accepts an evidence-backed city temperature answer as weather', () => {
+    const result = guardViewerResponse(
+      '南京现在30.8度，体感36度，晴间多云。今天预计28.3到34.4度，最高降水概率49%。',
+      {
+        isWeather: true,
+        viewerText: '001号人类 的弹幕：南京气温',
+        requiredAnswer:
+          '南京当前气温30.8℃，体感36℃。今天预计28.3到34.4℃，最高降水概率49%。',
+        claims: [
+          { text: '南京当前气温30.8℃，体感36℃，晴间多云' },
+          { text: '今天预计28.3到34.4℃，最高降水概率49%' },
+        ],
+      },
+    );
+
+    expect(result.rewritten).toBe(false);
+    expect(result.reasons).toEqual([]);
+    expect(result.text).toContain('南京现在30.8度');
+  });
+
+  it('does not reinterpret a viewer rain report as window condensation', () => {
+    const requiredAnswer =
+      '四平市，吉林省城市代表点当前雾，气温 20℃，当前降水 0 毫米。未来两小时无降水。城市代表点资料不代表全市每个位置。';
+    const result = guardViewerResponse(
+      '四平城市代表点当前没有降水——你看到的可能是雾气沾在窗户上，显得像在下雨。',
+      {
+        isWeather: true,
+        viewerText: '我真服了，怎么还下雨啊？',
+        requiredAnswer,
+        claims: [
+          {
+            type: 'representative_point_observation',
+            text: '四平市城市代表点当前雾，当前降水 0 毫米',
+          },
+          { type: 'minutely_forecast', text: '未来两小时无降水' },
+        ],
+      },
+    );
+
+    expect(result.reasons).toContain('unsupported_viewer_observation_rewrite');
+    expect(result.text).toContain('不代表全市每个位置');
+    expect(result.text).not.toContain('窗户');
+  });
+
+  it('replaces unsupported naming lore when the viewer asked for a storm lifecycle', () => {
+    const requiredAnswer =
+      '海神不是凭空出现的。它是2026年第11号台风，确实在7月期间存在过；它只是现在已经不再活动。';
+    const result = guardViewerResponse(
+      '海神是台风命名表上的名字，由中国提交。',
+      {
+        isWeather: true,
+        viewerText: '海神哪来的？',
+        requiredAnswer,
+        claims: [
+          {
+            type: 'official_observation',
+            text: requiredAnswer,
+          },
+        ],
+      },
+    );
+
+    expect(result.reasons).toContain('unanswered_intent');
+    expect(result.text).toContain('2026年第11号台风');
+    expect(result.text).not.toContain('命名表');
   });
 
   it('caps ordinary live replies without cutting in the middle of a later sentence', () => {

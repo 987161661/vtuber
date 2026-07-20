@@ -409,10 +409,13 @@ function reduceAffect(
     'selfDirectedEngagement',
   );
   const focusBuffer = selfDirectedEngagement ? 0.2 : 1;
-  const boredomGain = isSilence
+  const boredomTarget = isSilence
     ? Math.min(durationMs / 60_000, 10) * 0.025 * (1 - positive) * focusBuffer
     : 0;
   const socialRelief = isSilence ? 0 : appraisal.novelty * 0.3;
+  const boredomDelta = isSilence
+    ? (boredomTarget - state.affect.boredom) * 0.5
+    : -socialRelief;
   const jealousyGain =
     appraisal.attentionCompetition *
     profile.temperament.socialSensitivity *
@@ -445,7 +448,10 @@ function reduceAffect(
     ),
     joy: clamp(state.affect.joy * retain + joyGain),
     anger: clamp(state.affect.anger * retain + angerGain),
-    boredom: clamp(state.affect.boredom * retain + boredomGain - socialRelief),
+    // `durationMs` is cumulative quiet time, not a new dose. Move toward a
+    // duration-derived target so repeated awareness polls converge instead of
+    // adding the same silence over and over.
+    boredom: clamp(state.affect.boredom + boredomDelta),
     jealousy: clamp(state.affect.jealousy * retain + jealousyGain),
     causes: [],
   };
@@ -454,7 +460,7 @@ function reduceAffect(
     ...createAffectCauses(event.id, event.occurredAt, {
       joy: joyGain,
       anger: angerGain,
-      boredom: boredomGain - socialRelief,
+      boredom: boredomDelta,
       jealousy: jealousyGain,
       valence: joyGain - angerGain - negativeSocial * 0.2,
     }),

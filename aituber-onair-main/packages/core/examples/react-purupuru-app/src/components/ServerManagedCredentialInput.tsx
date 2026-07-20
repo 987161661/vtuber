@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { useState } from 'react';
 import { getCredentialInputPresentation } from '../lib/credentialInputPresentation';
 
 interface ServerManagedCredentialInputProps {
@@ -24,16 +24,6 @@ export function ServerManagedCredentialInput({
   onChange,
 }: ServerManagedCredentialInputProps) {
   const [isReplacing, setIsReplacing] = useState(false);
-  const wasServerManagedRef = useRef(isServerManaged);
-
-  useEffect(() => {
-    const handoffCompleted =
-      isReplacing && !wasServerManagedRef.current && isServerManaged;
-    wasServerManagedRef.current = isServerManaged;
-    if (handoffCompleted) {
-      setIsReplacing(false);
-    }
-  }, [isReplacing, isServerManaged]);
 
   const presentation = getCredentialInputPresentation(
     value,

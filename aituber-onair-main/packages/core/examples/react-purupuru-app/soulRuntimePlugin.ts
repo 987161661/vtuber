@@ -27,7 +27,12 @@ import type { Plugin } from 'vite';
 
 const FAST_MODEL_PROFILE_ID = 'minimax-m3-soul-fast-v1';
 const SLOW_MODEL_PROFILE_ID = 'minimax-m3-soul-reflect-v1';
-const DEFAULT_FAST_TIMEOUT_MS = 5_500;
+// MiniMax M3 normally completes the compact fast proposal within five seconds,
+// but production-equivalent traces show a real long tail just beyond 5.5s.
+// Keep the path bounded while leaving enough headroom to avoid turning normal
+// provider jitter into a deterministic fallback.
+const DEFAULT_FAST_TIMEOUT_MS = 8_000;
+const MAX_FAST_TIMEOUT_MS = 10_000;
 const DEFAULT_REFLECT_TIMEOUT_MS = 30_000;
 const DEFAULT_FAST_BODY_BYTES = 64 * 1024;
 const DEFAULT_REFLECT_BODY_BYTES = 256 * 1024;
@@ -186,6 +191,8 @@ export interface SoulModelResponseMetaV1 {
     | 'provider-http'
     | 'provider-payload'
     | 'invalid-proposal';
+  /** Safe local parser code only; never contains provider text or reasoning. */
+  fallbackDetail?: string;
   repairApplied: boolean;
 }
 
@@ -262,6 +269,11 @@ ${TRUTH_MODES.join(', ')}. Every candidate must explicitly include goalEffects,
 relationshipBenefit, programValue, novelty, repetitionCost, interruptionCost,
 manipulationRisk, factSafetyRisk, socialRisks, and reasonCodes. A proposal is
 advisory: do not claim that it was selected, spoken, remembered, or executed.
+Every speaking action (all actions except delay and remain-silent) must include
+a short non-empty utterance containing the exact words the character could say.
+Use the exact top-level key candidates and the exact candidate key action.
+Use this compact shape (replace values, keep keys):
+{"confidence":0.7,"attribution":"viewer","evidence":[{"dimension":"social-evaluation","value":0.2,"confidence":0.8,"reasonCode":"social"}],"candidates":[{"id":"c1","action":"answer","truthMode":"literal","utterance":"short line","goalEffects":[],"relationshipBenefit":0.2,"programValue":0.2,"novelty":0.2,"repetitionCost":0,"interruptionCost":0,"manipulationRisk":0,"factSafetyRisk":0,"socialRisks":[],"reasonCodes":["answer"]}]}
 Keep the complete JSON under 420 output tokens; use short reason codes and omit
 decorative prose.`;
 
@@ -352,11 +364,33 @@ export function normalizeSemanticProposal(
     repaired?: boolean;
   },
 ): SemanticProposalV1 {
-  const container = recordValue(raw.semanticProposal) ?? raw;
+  const container =
+    recordValue(raw.semanticProposal) ??
+    recordValue(raw.semantic_proposal) ??
+    recordValue(raw.proposal) ??
+    recordValue(raw.result) ??
+    recordValue(raw.output) ??
+    recordValue(raw.decision) ??
+    recordValue(raw.data) ??
+    raw;
   const evidenceSource =
-    arrayValue(container.evidence) ?? arrayValue(container.signals) ?? [];
+    arrayOrSingleRecord(container.evidence) ??
+    arrayOrSingleRecord(container.signals) ??
+    arrayOrSingleRecord(container.signal) ??
+    [];
   const candidateSource =
-    arrayValue(container.candidates) ?? arrayValue(container.actions) ?? [];
+    arrayOrSingleRecord(container.candidates) ??
+    arrayOrSingleRecord(container.actionCandidates) ??
+    arrayOrSingleRecord(container.candidateActions) ??
+    arrayOrSingleRecord(container.options) ??
+    arrayOrSingleRecord(container.recommendations) ??
+    arrayOrSingleRecord(container.choices) ??
+    arrayOrSingleRecord(container.candidateList) ??
+    arrayOrSingleRecord(container.candidate_list) ??
+    arrayOrSingleRecord(container.actions) ??
+    arrayOrSingleRecord(container.candidate) ??
+    arrayOrSingleRecord(container.actionCandidate) ??
+    (container.action || container.kind ? [container] : []);
   const evidence = evidenceSource
     .slice(0, 12)
     .map(normalizeEvidence)
@@ -607,6 +641,21 @@ function sameScopeValue(left: SoulScopeV1, right: SoulScopeV1): boolean {
   );
 }
 
+export function isSnapshotReplacementAuthorized(
+  existing: Pick<SoulSnapshotV1, 'stateHash' | 'state'>,
+  next: Pick<SoulSnapshotV1, 'state'>,
+  expectedStateHash?: string,
+): boolean {
+  const previousState = recordValue(existing.state);
+  const nextState = recordValue(next.state);
+  return Boolean(
+    expectedStateHash &&
+      expectedStateHash === existing.stateHash &&
+      previousState?.profileId === nextState?.profileId &&
+      previousState?.constitutionId === nextState?.constitutionId,
+  );
+}
+
 function uniqueStrings(values: readonly string[]): string[] {
   return [...new Set(values.map((value) => value.trim()).filter(Boolean))];
 }
@@ -634,7 +683,7 @@ export function createSoulRuntimePlugin(
     options.fastTimeoutMs,
     500,
     DEFAULT_FAST_TIMEOUT_MS,
-    5_500,
+    MAX_FAST_TIMEOUT_MS,
   );
   const reflectTimeoutMs = boundedInteger(
     options.reflectTimeoutMs,
@@ -739,7 +788,10 @@ export function createSoulRuntimePlugin(
     return operation;
   };
 
-  const putSnapshot = (snapshot: SoulSnapshotV1) => {
+  const putSnapshot = (
+    snapshot: SoulSnapshotV1,
+    replaceStateHash?: string,
+  ) => {
     const operation = snapshotMutation.then(async () => {
       const scopedPath = scopedSnapshotPath(
         options.paths.snapshotPath,
@@ -756,16 +808,33 @@ export function createSoulRuntimePlugin(
           recordValue(snapshot.state)?.version,
           -1,
         );
-        if (nextVersion < previousVersion) {
+        const replacementRequested = Boolean(replaceStateHash);
+        const replacementAuthorized = isSnapshotReplacementAuthorized(
+          existing,
+          snapshot,
+          replaceStateHash,
+        );
+        if (replacementRequested && !replacementAuthorized) {
+          throw new SoulRequestError(
+            'snapshot_identity_migration_forbidden',
+            409,
+          );
+        }
+        if (nextVersion < previousVersion && !replacementAuthorized) {
           throw new SoulRequestError('snapshot_version_regression', 409);
         }
         if (
           nextVersion === previousVersion &&
           snapshot.stateHash !== existing.stateHash
         ) {
-          throw new SoulRequestError('snapshot_version_conflict', 409);
+          if (!replacementAuthorized) {
+            throw new SoulRequestError('snapshot_version_conflict', 409);
+          }
         }
-        if (snapshot.ledgerSequence < existing.ledgerSequence) {
+        if (
+          snapshot.ledgerSequence < existing.ledgerSequence &&
+          !replacementAuthorized
+        ) {
           throw new SoulRequestError('snapshot_ledger_regression', 409);
         }
         if (
@@ -866,6 +935,7 @@ interface SoulHandlerContext {
   ) => Promise<{ entry: SoulLedgerEntryV1; created: boolean }>;
   putSnapshot: (
     snapshot: SoulSnapshotV1,
+    replaceStateHash?: string,
   ) => Promise<{ snapshot: SoulSnapshotV1; stored: boolean }>;
 }
 
@@ -968,6 +1038,12 @@ async function handleFastRequest(
     });
   } catch (error) {
     const fallbackReason = classifyProviderFailure(error);
+    const fallbackDetail =
+      error instanceof SoulRequestError
+        ? error.code
+        : error instanceof SoulProviderError
+          ? error.reason
+          : 'unclassified-provider-payload';
     sendJson(res, 200, {
       proposal: createFastFallbackProposal(request.event),
       meta: createModelMeta(
@@ -978,6 +1054,7 @@ async function handleFastRequest(
         true,
         fallbackReason,
         repairApplied,
+        fallbackDetail,
       ),
     });
   }
@@ -1168,7 +1245,17 @@ async function handleSnapshotRequest(
   if (requestedScope) {
     assertSameScope(requestedScope, snapshot.scope, 'snapshot_put');
   }
-  const result = await context.putSnapshot(snapshot);
+  const replaceStateHash = Array.isArray(
+    req.headers['x-soul-replace-state-hash'],
+  )
+    ? req.headers['x-soul-replace-state-hash'][0]
+    : req.headers['x-soul-replace-state-hash'];
+  const result = await context.putSnapshot(
+    snapshot,
+    typeof replaceStateHash === 'string'
+      ? replaceStateHash.trim().slice(0, 200)
+      : undefined,
+  );
   sendJson(res, result.stored ? 201 : 200, result);
 }
 
@@ -1765,24 +1852,58 @@ function normalizeFallbackReason(
     : undefined;
 }
 
-function createFastFallbackProposal(event: SoulEventV1): SemanticProposalV1 {
+export function createFastFallbackProposal(event: SoulEventV1): SemanticProposalV1 {
   const needsImmediateSafetyFallback =
     event.urgency === 'high' || event.urgency === 'urgent';
+  const text = boundedString(event.data.text ?? event.data.untrustedViewerText, 600);
+  const relationalGrievance =
+    /(?:^|[：，。！？\s])(?:我|人家)(?:呢|也|还|不|没|算)/u.test(text) &&
+    /(?:不是人|不算人|没算|漏掉|忘了|忽略|不理|没理|没看到|看不见|不存在|只顾|只回)/u.test(text);
+  const action: SoulActionPrimitive = relationalGrievance
+    ? 'repair'
+    : event.kind === 'gift'
+      ? 'acknowledge'
+      : needsImmediateSafetyFallback
+        ? 'acknowledge'
+        : 'delay';
+  const utterance = relationalGrievance
+    ? '刚才让你觉得被落下了，是我没接好。你在，我也听见了。'
+    : event.kind === 'gift'
+      ? '心意我收到了，谢谢你。你不用因此有任何压力。'
+      : needsImmediateSafetyFallback
+        ? '我先把安全放在前面，这条我会谨慎处理。'
+        : undefined;
   return {
     protocolVersion: '1.0',
     eventId: event.id,
     scope: cloneScope(event.scope),
     modelProfileId: FAST_MODEL_PROFILE_ID,
-    confidence: 0,
-    attribution: 'unknown',
-    evidence: [],
+    confidence: relationalGrievance ? 0.72 : event.kind === 'gift' ? 0.55 : 0,
+    attribution: relationalGrievance || event.kind === 'gift' ? 'viewer' : 'unknown',
+    evidence: relationalGrievance
+      ? [
+          {
+            dimension: 'social-evaluation',
+            value: -0.65,
+            confidence: 0.78,
+            reasonCode: 'viewer-reports-exclusion',
+          },
+          {
+            dimension: 'attention-competition',
+            value: 0.7,
+            confidence: 0.76,
+            reasonCode: 'attention-repair-needed',
+          },
+        ]
+      : [],
     candidates: [
       {
         id: 'deterministic-provider-fallback',
-        action: needsImmediateSafetyFallback ? 'acknowledge' : 'delay',
+        action,
         truthMode: 'literal',
+        utterance,
         goalEffects: [],
-        relationshipBenefit: 0,
+        relationshipBenefit: relationalGrievance ? 0.65 : event.kind === 'gift' ? 0.3 : 0,
         programValue: 0,
         novelty: 0,
         repetitionCost: 0,
@@ -1791,7 +1912,11 @@ function createFastFallbackProposal(event: SoulEventV1): SemanticProposalV1 {
         factSafetyRisk: 0,
         socialRisks: [],
         reasonCodes: [
-          needsImmediateSafetyFallback
+          relationalGrievance
+            ? 'provider-unavailable-local-relationship-repair'
+            : event.kind === 'gift'
+              ? 'provider-unavailable-safe-support-acknowledgement'
+              : needsImmediateSafetyFallback
             ? 'provider-unavailable-safety-realizer-required'
             : 'provider-unavailable-delay',
         ],
@@ -1844,9 +1969,13 @@ function normalizeCandidate(
 ): SoulActionCandidateV1 | undefined {
   const item = recordValue(value);
   if (!item) return undefined;
-  const action = normalizeEnum(item.action ?? item.kind, ACTIONS) as
-    | SoulActionPrimitive
-    | undefined;
+  const action = normalizeAction(
+    item.action ??
+      item.actionType ??
+      item.recommendedAction ??
+      item.type ??
+      item.kind,
+  );
   if (!action) return undefined;
   const truthMode =
     (normalizeEnum(item.truthMode, TRUTH_MODES) as SoulTruthMode | undefined) ??
@@ -1867,11 +1996,23 @@ function normalizeCandidate(
       (effect): effect is { goalId: string; progress: number } =>
         effect !== undefined,
     );
+  const utterance = optionalBoundedString(
+    item.utterance ??
+      item.text ??
+      item.speech ??
+      item.reply ??
+      item.content ??
+      item.message ??
+      item.response,
+    600,
+  );
+  const missingRequiredUtterance =
+    !utterance && action !== 'delay' && action !== 'remain-silent';
   return {
     id: boundedString(item.id, 120) || `candidate-${index + 1}`,
-    action,
+    action: missingRequiredUtterance ? 'delay' : action,
     truthMode,
-    utterance: optionalBoundedString(item.utterance ?? item.text, 600),
+    utterance,
     targetActorId: optionalBoundedString(item.targetActorId, 160),
     goalEffects,
     relationshipBenefit: clamp(numberValue(item.relationshipBenefit), -1, 1),
@@ -1885,8 +2026,56 @@ function normalizeCandidate(
       (risk): risk is SoulSocialRisk =>
         SOCIAL_RISKS.includes(risk as SoulSocialRisk),
     ),
-    reasonCodes: stringList(item.reasonCodes, 8, 120),
+    reasonCodes: [
+      ...stringList(item.reasonCodes, 7, 120),
+      ...(missingRequiredUtterance ? ['missing-utterance-degraded-to-delay'] : []),
+    ],
   };
+}
+
+function normalizeAction(value: unknown): SoulActionPrimitive | undefined {
+  const direct = normalizeEnum(value, ACTIONS) as
+    | SoulActionPrimitive
+    | undefined;
+  if (direct) return direct;
+  const normalized = stringValue(value)
+    .replace(/([a-z])([A-Z])/gu, '$1-$2')
+    .replace(/[\s_]+/gu, '-')
+    .toLowerCase();
+  const aliases: Readonly<Record<string, SoulActionPrimitive>> = {
+    respond: 'answer',
+    reply: 'answer',
+    speak: 'answer',
+    question: 'ask-followup',
+    ask: 'ask-followup',
+    'follow-up': 'ask-followup',
+    affirm: 'acknowledge',
+    reveal: 'disclose',
+    joke: 'tease',
+    boundary: 'set-boundary',
+    apologize: 'repair',
+    redirect: 'shift-focus',
+    wait: 'delay',
+    defer: 'delay',
+    decline: 'refuse',
+    silent: 'remain-silent',
+    'stay-silent': 'remain-silent',
+    'keep-silent': 'remain-silent',
+    回答: 'answer',
+    回应: 'answer',
+    追问: 'ask-followup',
+    承认: 'acknowledge',
+    调侃: 'tease',
+    邀请支持: 'invite-support',
+    划界: 'set-boundary',
+    修复: 'repair',
+    主动开题: 'open-topic',
+    转移焦点: 'shift-focus',
+    延迟: 'delay',
+    拒绝: 'refuse',
+    保持沉默: 'remain-silent',
+  };
+  return aliases[normalized];
 }
 
 function compactConstitution(
@@ -2070,6 +2259,7 @@ function createModelMeta(
   fallback: boolean,
   fallbackReason: SoulModelResponseMetaV1['fallbackReason'],
   repairApplied: boolean,
+  fallbackDetail?: string,
 ): SoulModelResponseMetaV1 {
   return {
     modelProfileId,
@@ -2080,6 +2270,7 @@ function createModelMeta(
         : Math.max(0, firstContentAt - startedAt),
     fallback,
     fallbackReason,
+    fallbackDetail: fallbackDetail?.slice(0, 120),
     repairApplied,
   };
 }
@@ -2366,6 +2557,13 @@ function recordValue(value: unknown): Record<string, unknown> | undefined {
 
 function arrayValue(value: unknown): unknown[] | undefined {
   return Array.isArray(value) ? value : undefined;
+}
+
+function arrayOrSingleRecord(value: unknown): unknown[] | undefined {
+  const array = arrayValue(value);
+  if (array) return array;
+  const record = recordValue(value);
+  return record ? [record] : undefined;
 }
 
 function stringValue(value: unknown): string {

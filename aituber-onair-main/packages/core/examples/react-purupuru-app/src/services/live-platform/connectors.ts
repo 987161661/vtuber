@@ -60,7 +60,15 @@ export const ORDINARYROAD_PLATFORMS: ConnectorPlatformManifest[] = [
       inbound: true,
       outbound: true,
       credential: true,
-      events: ['comment', 'gift', 'superchat', 'entry', 'like', 'status', 'stats'],
+      events: [
+        'comment',
+        'gift',
+        'superchat',
+        'entry',
+        'like',
+        'status',
+        'stats',
+      ],
     },
   },
   {
@@ -128,7 +136,16 @@ export function createPlatformConnection(
   return {
     enabled,
     roomId,
-    outbound: { ...DEFAULT_OUTBOUND_POLICY, ...outbound },
+    outbound: {
+      ...DEFAULT_OUTBOUND_POLICY,
+      ...outbound,
+      // Automated replies are part of the live-room contract, not an optional
+      // per-browser preference. They still return only to the source platform.
+      viewerReplies: true,
+      // Idle/proactive speech remains audible in the stream, but is never
+      // mirrored as an automated platform comment.
+      proactiveSpeech: false,
+    },
   };
 }
 
@@ -155,9 +172,38 @@ function policyAllows(
   connection: PlatformConnectionSettings,
   kind: SpeechDeliveryKind,
 ) {
-  if (kind === 'viewer-reply') return connection.outbound.viewerReplies;
-  if (kind === 'proactive-speech') return connection.outbound.proactiveSpeech;
+  if (kind === 'viewer-reply') return true;
+  if (kind === 'proactive-speech') return false;
   return connection.outbound.operatorBroadcasts;
+}
+
+function resolveViewerReplySource(
+  settings: LiveConnectorSettings,
+  context: SpeechDeliveryContext,
+) {
+  if (
+    context.sourcePlatformId &&
+    platformOwner(settings, context.sourcePlatformId)
+  ) {
+    return {
+      connectorId: platformOwner(settings, context.sourcePlatformId),
+      platformId: context.sourcePlatformId,
+    };
+  }
+
+  // The radar bridge is an intermediate display. City-result callbacks retain
+  // the original live platform in their durable event id even when the legacy
+  // callback reports `typhoon-radar` as its immediate source.
+  const cityPlatform = /^city-engagement:([^:]+):/u.exec(context.eventId)?.[1];
+  const connectorId = cityPlatform
+    ? platformOwner(settings, cityPlatform)
+    : undefined;
+  return cityPlatform && connectorId
+    ? { connectorId, platformId: cityPlatform }
+    : {
+        connectorId: context.sourceConnectorId,
+        platformId: context.sourcePlatformId,
+      };
 }
 
 export function resolveSpeechDeliveryTargets(
@@ -165,12 +211,21 @@ export function resolveSpeechDeliveryTargets(
   context: SpeechDeliveryContext,
 ): SpeechDeliveryTarget[] {
   const targets: SpeechDeliveryTarget[] = [];
-  const entries: Array<[
-    LiveConnectorId,
-    boolean,
-    Record<string, PlatformConnectionSettings>,
-  ]> = [
-    ['ordinaryroad', settings.ordinaryRoad.enabled, settings.ordinaryRoad.platforms],
+  const viewerReplySource =
+    context.kind === 'viewer-reply'
+      ? resolveViewerReplySource(settings, context)
+      : {
+          connectorId: context.sourceConnectorId,
+          platformId: context.sourcePlatformId,
+        };
+  const entries: Array<
+    [LiveConnectorId, boolean, Record<string, PlatformConnectionSettings>]
+  > = [
+    [
+      'ordinaryroad',
+      settings.ordinaryRoad.enabled,
+      settings.ordinaryRoad.platforms,
+    ],
     [
       'social-stream-ninja',
       settings.socialStreamNinja.enabled,
@@ -181,12 +236,13 @@ export function resolveSpeechDeliveryTargets(
   for (const [connectorId, connectorEnabled, platforms] of entries) {
     if (!connectorEnabled) continue;
     for (const [platformId, connection] of Object.entries(platforms)) {
-      if (!connection.enabled || !policyAllows(connection, context.kind)) continue;
+      if (!connection.enabled || !policyAllows(connection, context.kind))
+        continue;
       if (platformOwner(settings, platformId) !== connectorId) continue;
       if (
         context.kind === 'viewer-reply' &&
-        (context.sourceConnectorId !== connectorId ||
-          context.sourcePlatformId !== platformId)
+        (viewerReplySource.connectorId !== connectorId ||
+          viewerReplySource.platformId !== platformId)
       ) {
         continue;
       }

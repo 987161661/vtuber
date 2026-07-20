@@ -510,13 +510,13 @@ describe('MinimaxEngine', () => {
       const serious = JSON.parse(fetchMock.mock.calls[1][1].body).voice_setting;
       expect(warm).toMatchObject({
         emotion: 'neutral',
-        speed: 0.96,
-        vol: 0.96,
+        speed: 0.98,
+        vol: 0.98,
         pitch: 0,
       });
-      expect(serious).toMatchObject({ emotion: 'neutral', pitch: -3 });
-      expect(serious.speed).toBeCloseTo(0.85825, 5);
-      expect(serious.vol).toBeCloseTo(0.8899, 5);
+      expect(serious).toMatchObject({ emotion: 'neutral', pitch: 0 });
+      expect(serious.speed).toBe(0.94);
+      expect(serious.vol).toBeCloseTo(0.9299, 5);
       expect(warm).not.toEqual(serious);
     });
 
@@ -565,12 +565,12 @@ describe('MinimaxEngine', () => {
       const [bored, impatient, awkward] = fetchMock.mock.calls.map((call) =>
         JSON.parse(call[1].body).voice_setting,
       );
-      expect(bored).toMatchObject({ emotion: 'neutral', pitch: -2 });
-      expect(bored.speed).toBeCloseTo(0.90595, 5);
-      expect(impatient).toMatchObject({ emotion: 'angry', pitch: -2 });
-      expect(impatient.speed).toBeCloseTo(0.937625, 5);
-      expect(awkward).toMatchObject({ emotion: 'surprised', pitch: -2 });
-      expect(awkward.speed).toBeCloseTo(0.90364, 5);
+      expect(bored).toMatchObject({ emotion: 'neutral', pitch: 0 });
+      expect(bored.speed).toBe(0.94);
+      expect(impatient).toMatchObject({ emotion: 'angry', pitch: 0 });
+      expect(impatient.speed).toBeCloseTo(1.007625, 5);
+      expect(awkward).toMatchObject({ emotion: 'surprised', pitch: 0 });
+      expect(awkward.speed).toBe(0.94);
       expect(bored).not.toEqual(impatient);
       expect(impatient).not.toEqual(awkward);
     });
@@ -607,9 +607,9 @@ describe('MinimaxEngine', () => {
       const setting = JSON.parse(fetchMock.mock.calls[0][1].body).voice_setting;
       expect(setting.voice_id).toBe('voice-id');
       expect(setting.emotion).toBe('surprised');
-      expect(setting.speed).toBeLessThan(0.9);
-      expect(setting.vol).toBeLessThan(0.9);
-      expect(setting.pitch).toBeLessThan(-1);
+      expect(setting.speed).toBe(0.94);
+      expect(setting.vol).toBe(0.9);
+      expect(setting.pitch).toBe(0);
     });
 
     it('should validate production synthesis inputs', async () => {

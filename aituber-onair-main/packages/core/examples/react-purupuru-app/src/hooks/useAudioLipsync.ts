@@ -32,6 +32,10 @@ export function useAudioLipsync() {
   const [mouthLevel, setMouthLevel] = useState(0);
   const [isSpeaking, setIsSpeaking] = useState(false);
   const [smoothedValue, setSmoothedValue] = useState(0);
+  // Embedded WebAudio requires one gesture inside the iframe after reload.
+  // Keep this explicit instead of misreporting a browser policy lock as a TTS
+  // provider failure.
+  const [audioUnlockRequired, setAudioUnlockRequired] = useState(true);
 
   const ctxRef = useRef<AudioContext | null>(null);
   const analyserRef = useRef<AnalyserNode | null>(null);
@@ -56,7 +60,10 @@ export function useAudioLipsync() {
   }, []);
 
   const resumeAudioContext = useCallback(async (ctx: AudioContext) => {
-    if (ctx.state === 'running') return;
+    if (ctx.state === 'running') {
+      setAudioUnlockRequired(false);
+      return;
+    }
     let timer: number | null = null;
     try {
       await Promise.race([
@@ -68,11 +75,17 @@ export function useAudioLipsync() {
           );
         }),
       ]);
+    } catch (error) {
+      setAudioUnlockRequired(true);
+      throw error;
     } finally {
       if (timer !== null) window.clearTimeout(timer);
     }
-    if ((ctx.state as string) !== 'running')
+    if ((ctx.state as string) !== 'running') {
+      setAudioUnlockRequired(true);
       throw new Error('audio_context_locked');
+    }
+    setAudioUnlockRequired(false);
   }, []);
 
   // Must be called directly from a user gesture. Creating/resuming Web Audio
@@ -335,6 +348,7 @@ export function useAudioLipsync() {
     mouthLevel,
     isSpeaking,
     smoothedValue,
+    audioUnlockRequired,
     play,
     beginQueue,
     enqueue,

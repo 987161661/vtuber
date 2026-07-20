@@ -272,7 +272,11 @@ export function AvatarBackground({
             className="personalive-avatar-video personalive-avatar-idle-layer"
             src={getPersonaLiveClipUrl(avatarMotion)}
             autoPlay
-            loop={avatarMotion === 'idle_cold'}
+            // Every production motion label currently resolves to the same
+            // canonical idle clip. Keep it looping for all labels; otherwise
+            // a non-idle label plays the clip once and leaves its black final
+            // frame visible, making the digital human appear to disappear.
+            loop
             muted
             playsInline
             aria-label={`PersonaLive avatar motion: ${avatarMotion}`}

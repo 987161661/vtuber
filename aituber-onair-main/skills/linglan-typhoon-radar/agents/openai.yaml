@@ -1,4 +1,4 @@
 interface:
   display_name: "凌岚台风雷达"
-  short_description: "连接实时台风雷达，准确回答城市风力、影响、登陆时间和来源"
-  default_prompt: "使用 $linglan-typhoon-radar 查询指定地区的实时台风影响并给出有时次和来源的直接回答。"
+  short_description: "连接实时台风雷达，回答台风胚胎概率、风力、影响与来源"
+  default_prompt: "使用 $linglan-typhoon-radar 查询当前台风、台风胚胎或指定地区影响，并给出有时次和来源的直接回答。"

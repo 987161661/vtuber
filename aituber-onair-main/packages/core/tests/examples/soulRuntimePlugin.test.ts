@@ -5,8 +5,10 @@ import {
   type SoulReflectRequestV1,
   type SoulReflectionProposalV1,
   buildSoulFastMessages,
+  createFastFallbackProposal,
   createReflectionLedgerInput,
   normalizeSemanticProposal,
+  isSnapshotReplacementAuthorized,
   parseSoulModelJson,
   resolveMiniMaxCredentials,
   scopeFromSearch,
@@ -191,6 +193,115 @@ describe('soul runtime server protocol helpers', () => {
     expect(proposal.repairNotes).toEqual(['json-envelope-repaired']);
   });
 
+  it('repairs a singular candidate envelope without inventing an action', () => {
+    const proposal = normalizeSemanticProposal(
+      {
+        confidence: 0.7,
+        attribution: 'self',
+        signal: {
+          dimension: 'novelty',
+          value: -0.4,
+          confidence: 0.8,
+          reasonCode: 'quiet-room',
+        },
+        candidate: {
+          id: 'open-topic-1',
+          action: 'open_topic',
+          truthMode: 'literal',
+          utterance: '换个轻松的话题吧。',
+          goalEffects: [],
+          relationshipBenefit: 0.2,
+          programValue: 0.4,
+          novelty: 0.6,
+          repetitionCost: 0,
+          interruptionCost: 0,
+          manipulationRisk: 0,
+          factSafetyRisk: 0,
+          socialRisks: [],
+          reasonCodes: ['quiet-room'],
+        },
+      },
+      { eventId: 'event-1', scope },
+    );
+
+    expect(proposal.evidence).toHaveLength(1);
+    expect(proposal.candidates).toHaveLength(1);
+    expect(proposal.candidates[0]).toMatchObject({
+      id: 'open-topic-1',
+      action: 'open-topic',
+    });
+  });
+
+  it('normalizes bounded M3 proposal and action field drift', () => {
+    const proposal = normalizeSemanticProposal(
+      {
+        proposal: {
+          confidence: 0.6,
+          attribution: 'viewer',
+          actionCandidates: {
+            actionType: 'respond',
+            speech: '我先直接回答你。',
+            goalEffects: [],
+            relationshipBenefit: 0.2,
+            programValue: 0.3,
+            novelty: 0.1,
+            repetitionCost: 0,
+            interruptionCost: 0,
+            manipulationRisk: 0,
+            factSafetyRisk: 0,
+            socialRisks: [],
+            reasonCodes: ['direct-answer'],
+          },
+        },
+      },
+      { eventId: 'event-1', scope },
+    );
+
+    expect(proposal.candidates).toHaveLength(1);
+    expect(proposal.candidates[0]).toMatchObject({
+      action: 'answer',
+      utterance: '我先直接回答你。',
+    });
+  });
+
+  it('normalizes nested Chinese action drift and degrades missing speech safely', () => {
+    const proposal = normalizeSemanticProposal(
+      {
+        output: {
+          candidate_list: [
+            { type: '修复', message: '刚才是我没接好。', reasonCodes: ['repair'] },
+            { type: '回应', reasonCodes: ['missing-speech'] },
+          ],
+        },
+      },
+      { eventId: 'event-1', scope },
+    );
+
+    expect(proposal.candidates[0]).toMatchObject({
+      action: 'repair',
+      utterance: '刚才是我没接好。',
+    });
+    expect(proposal.candidates[1]).toMatchObject({ action: 'delay' });
+    expect(proposal.candidates[1]?.reasonCodes).toContain(
+      'missing-utterance-degraded-to-delay',
+    );
+  });
+
+  it('uses a non-defensive local repair when the provider fails on exclusion', () => {
+    const request = fastRequest();
+    const proposal = createFastFallbackProposal({
+      ...request.event,
+      data: { text: '小雨 的弹幕：我呢？我不是人？' },
+    });
+
+    expect(proposal.candidates[0]).toMatchObject({ action: 'repair' });
+    expect(proposal.candidates[0]?.utterance).toContain('被落下');
+    expect(proposal.evidence.map((item) => item.dimension)).toEqual([
+      'social-evaluation',
+      'attention-competition',
+    ]);
+  });
+
   it('builds a causal, non-scenario prompt and keeps credentials out', () => {
     const messages = buildSoulFastMessages(fastRequest());
     const system = SOUL_FAST_SYSTEM_PROMPT.replace(/\s+/gu, ' ');
@@ -362,5 +473,41 @@ describe('soul runtime server protocol helpers', () => {
         }),
       ),
     ).toThrow('snapshot_query_scope_incomplete');
+  });
+
+  it('allows snapshot rebuild replacement only with an exact state-hash CAS', () => {
+    const existing = {
+      stateHash: 'old-state-hash',
+      state: { profileId: 'linglan-v1', constitutionId: 'constitution-v1' },
+    };
+    const rebuilt = {
+      state: { profileId: 'linglan-v1', constitutionId: 'constitution-v1' },
+    };
+    expect(
+      isSnapshotReplacementAuthorized(
+        existing as never,
+        rebuilt as never,
+        'old-state-hash',
+      ),
+    ).toBe(true);
+    expect(
+      isSnapshotReplacementAuthorized(
+        existing as never,
+        rebuilt as never,
+        'stale-state-hash',
+      ),
+    ).toBe(false);
+    expect(
+      isSnapshotReplacementAuthorized(
+        existing as never,
+        {
+          state: {
+            profileId: 'another-persona',
+            constitutionId: 'constitution-v1',
+          },
+        } as never,
+        'old-state-hash',
+      ),
+    ).toBe(false);
   });
 });
