@@ -10,6 +10,7 @@ $appPath = Join-Path $PSScriptRoot 'packages\core\examples\react-purupuru-app'
 $logPath = Join-Path $PSScriptRoot 'logs'
 $flashHeadLauncher = Join-Path (Split-Path $PSScriptRoot -Parent) 'FlashHead-bridge\Start-FlashHead-Service.ps1'
 $gatewayLauncher = Join-Path $PSScriptRoot 'Ensure-Live-Platform-Gateway.ps1'
+$qrAuthScript = Join-Path $PSScriptRoot 'scripts\bilibili-qr-auth-server.mjs'
 $controlRoomUrl = if ($UseMuseTalkFallback) {
   'http://127.0.0.1:5173/?listener=1&speakEngine=musetalk'
 } else {
@@ -74,6 +75,21 @@ if (Test-Path -LiteralPath $baseLauncher -PathType Leaf) {
       -RedirectStandardOutput (Join-Path $logPath 'vite.out.log') `
       -RedirectStandardError (Join-Path $logPath 'vite.err.log')
   }
+}
+
+# The QR authorization companion stays outside the live gateway so credential
+# refresh never requires interrupting an active stream.
+if (
+  (Test-Path -LiteralPath $qrAuthScript -PathType Leaf) -and
+  -not (Get-NetTCPConnection -LocalPort 8198 -State Listen -ErrorAction SilentlyContinue)
+) {
+  New-Item -ItemType Directory -Path $logPath -Force | Out-Null
+  Start-Process -FilePath 'node.exe' `
+    -ArgumentList @($qrAuthScript) `
+    -WorkingDirectory $PSScriptRoot `
+    -WindowStyle Hidden `
+    -RedirectStandardOutput (Join-Path $logPath 'bilibili-qr-auth.out.log') `
+    -RedirectStandardError (Join-Path $logPath 'bilibili-qr-auth.err.log')
 }
 
 $response = $null

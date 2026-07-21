@@ -34,6 +34,11 @@ const SEMANTIC_FAMILIES: Array<[string, RegExp]> = [
   ['weather', /天气|台风|下雨|雷达|气温|风雨/u],
   ['hazards', /洪灾|洪水|雨灾|水灾|内涝|积水|山洪|泥石流|灾情|预警/u],
 ];
+const SINGLE_LANE_PROACTIVE_SOURCES = new Set([
+  'self_goal',
+  'room',
+  'audience',
+]);
 
 function semanticFamilies(text: string) {
   return SEMANTIC_FAMILIES.flatMap(([family, pattern]) =>
@@ -151,6 +156,8 @@ export class PersonaTopicLedger {
       (entry) =>
         at - entry.spokenAt < this.cooldownMs &&
         (entry.topicFamily === candidate.topicFamily ||
+          (entry.source === candidate.source &&
+            SINGLE_LANE_PROACTIVE_SOURCES.has(candidate.source)) ||
           entry.entities.some((entity) => candidate.entities.includes(entity))),
     );
   }

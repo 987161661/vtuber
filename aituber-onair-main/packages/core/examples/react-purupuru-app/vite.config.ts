@@ -232,6 +232,8 @@ const APP_ROOT =
   process.env.AITUBER_RUNTIME_ROOT ||
   'D:/LocalToolset/vtuber/aituber-onair-main';
 const WORKSPACE_ROOT = dirname(APP_ROOT);
+const workspaceSourceEntry = (packageDirectory: string) =>
+  join(APP_ROOT, 'packages', packageDirectory, 'src', 'index.ts');
 const RUNTIME_SETTINGS_SECRET_PATH = join(
   APP_ROOT,
   '.runtime',
@@ -431,6 +433,12 @@ const pendingTtsUpdates = new Map<
     partialTextVerified?: boolean;
     ttsStartAt?: number;
     ttsEndAt?: number;
+    engagementDecisionId?: string;
+    engagementAction?:
+      | 'none'
+      | 'invite-paid-support'
+      | 'invite-free-engagement';
+    engagementDeliveryStatus?: Exclude<ConversationDeliveryStatus, 'generated'>;
   }
 >();
 let historyMutationQueue: Promise<void> = Promise.resolve();
@@ -1491,6 +1499,9 @@ function conversationHistoryPlugin(): Plugin {
                 reasonCode?: unknown;
                 ttsStartAt?: unknown;
                 ttsEndAt?: unknown;
+                engagementDecisionId?: unknown;
+                engagementAction?: unknown;
+                engagementDeliveryStatus?: unknown;
               };
               const updateScope = normalizeConversationHistoryScope(
                 update.scope,
@@ -1552,6 +1563,25 @@ function conversationHistoryPlugin(): Plugin {
                         partialTextVerified,
                         ttsStartAt: finiteTimestamp(update.ttsStartAt),
                         ttsEndAt: finiteTimestamp(update.ttsEndAt),
+                        engagementDecisionId:
+                          typeof update.engagementDecisionId === 'string'
+                            ? update.engagementDecisionId.slice(0, 500)
+                            : undefined,
+                        engagementAction: [
+                          'none',
+                          'invite-paid-support',
+                          'invite-free-engagement',
+                        ].includes(String(update.engagementAction))
+                          ? (update.engagementAction as
+                              | 'none'
+                              | 'invite-paid-support'
+                              | 'invite-free-engagement')
+                          : undefined,
+                        engagementDeliveryStatus: isConversationDeliveryOutcome(
+                          update.engagementDeliveryStatus,
+                        )
+                          ? update.engagementDeliveryStatus
+                          : undefined,
                       },
                     );
                     if (!patched) return line;
@@ -1596,6 +1626,25 @@ function conversationHistoryPlugin(): Plugin {
                     partialTextVerified,
                     ttsStartAt: finiteTimestamp(update.ttsStartAt),
                     ttsEndAt: finiteTimestamp(update.ttsEndAt),
+                    engagementDecisionId:
+                      typeof update.engagementDecisionId === 'string'
+                        ? update.engagementDecisionId.slice(0, 500)
+                        : undefined,
+                    engagementAction: [
+                      'none',
+                      'invite-paid-support',
+                      'invite-free-engagement',
+                    ].includes(String(update.engagementAction))
+                      ? (update.engagementAction as
+                          | 'none'
+                          | 'invite-paid-support'
+                          | 'invite-free-engagement')
+                      : undefined,
+                    engagementDeliveryStatus: isConversationDeliveryOutcome(
+                      update.engagementDeliveryStatus,
+                    )
+                      ? update.engagementDeliveryStatus
+                      : undefined,
                   },
                 );
                 res.statusCode = 202;
@@ -1652,6 +1701,9 @@ function conversationHistoryPlugin(): Plugin {
               scenarioId?: unknown;
               scope?: unknown;
               deliveryStatus?: unknown;
+              engagementDecisionId?: unknown;
+              engagementAction?: unknown;
+              engagementDeliveryStatus?: unknown;
             };
             if (
               typeof value.input !== 'string' ||
@@ -1703,6 +1755,21 @@ function conversationHistoryPlugin(): Plugin {
               deliveryUpdatedAt: pendingTts?.deliveryUpdatedAt ?? Date.now(),
               deliveredFraction: pendingTts?.deliveredFraction,
               deliveryReason: pendingTts?.deliveryReason,
+              engagementDecisionId:
+                typeof value.engagementDecisionId === 'string'
+                  ? value.engagementDecisionId.slice(0, 500)
+                  : pendingTts?.engagementDecisionId,
+              engagementAction: [
+                'none',
+                'invite-paid-support',
+                'invite-free-engagement',
+              ].includes(String(value.engagementAction))
+                ? value.engagementAction
+                : pendingTts?.engagementAction,
+              engagementDeliveryStatus:
+                value.engagementDeliveryStatus === 'generated'
+                  ? 'generated'
+                  : pendingTts?.engagementDeliveryStatus,
               partialTextVerified: pendingTts?.partialTextVerified,
               eventId:
                 typeof value.eventId === 'string'
@@ -4618,6 +4685,14 @@ function replyLatencyPlugin(): Plugin {
 
 // https://vite.dev/config/
 export default defineConfig({
+  resolve: {
+    alias: {
+      // This app runs inside the monorepo. Resolve the workspace source
+      // directly so a clean checkout does not depend on a prebuilt dist.
+      '@aituber-onair/live-companion': workspaceSourceEntry('live-companion'),
+      '@aituber-onair/soul': workspaceSourceEntry('soul'),
+    },
+  },
   build: {
     rollupOptions: {
       output: {
@@ -4756,6 +4831,13 @@ export default defineConfig({
         target: 'http://127.0.0.1:8196',
         changeOrigin: true,
         rewrite: (path) => path.replace(/^\/api\/flashhead/, ''),
+      },
+      '/api/live-connectors/platform-auth': {
+        target:
+          process.env.PLATFORM_QR_AUTH_URL || 'http://127.0.0.1:8198',
+        changeOrigin: true,
+        rewrite: (path) =>
+          path.replace(/^\/api\/live-connectors\/platform-auth/, ''),
       },
       '/api/live-connectors/ordinaryroad': {
         target: process.env.BILIBILI_SUPERVISOR_URL || 'http://127.0.0.1:8197',

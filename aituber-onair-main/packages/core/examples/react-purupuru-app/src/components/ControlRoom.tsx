@@ -92,6 +92,10 @@ interface ControlRoomProps {
     staleCallbacks: number;
     proactiveRepeatSuppressions: number;
     coordinatorRecoveries: number;
+    paidInvitationsLastHour: number;
+    freeInvitationsLastHour: number;
+    associatedSupportCount: number;
+    associatedSupportAmount: number;
   };
   autoBroadcastEnabled: boolean;
   onToggleAutoBroadcast: () => void;
@@ -1086,6 +1090,30 @@ export function ControlRoom(props: ControlRoomProps) {
                   {props.reliabilityMetrics.coordinatorRecoveries}
                 </strong>
                 <span>协调器卡死恢复</span>
+              </article>
+              <article>
+                <strong>
+                  {props.reliabilityMetrics.paidInvitationsLastHour}
+                </strong>
+                <span>近一小时付费引导</span>
+              </article>
+              <article>
+                <strong>
+                  {props.reliabilityMetrics.freeInvitationsLastHour}
+                </strong>
+                <span>近一小时免费引导</span>
+              </article>
+              <article>
+                <strong>
+                  {props.reliabilityMetrics.associatedSupportCount}
+                </strong>
+                <span>十分钟内支持关联</span>
+              </article>
+              <article>
+                <strong>
+                  ¥{props.reliabilityMetrics.associatedSupportAmount.toFixed(2)}
+                </strong>
+                <span>关联金额（非因果）</span>
               </article>
             </div>
             <small className="queue-age">

@@ -47,16 +47,246 @@ describe('guardViewerResponse', () => {
       isWeather: false,
     });
     expect(result.reasons).toContain('gift_retention_pressure');
-    expect(result.text).toBe('心意我收到了，谢谢你；来去都由你，别有压力。');
+    expect(result.text).toContain('投个蕉');
+    expect(result.text).toContain('上舰支持岚台');
+    expect(result.text).not.toContain('跑不了');
   });
 
-  it('does not turn paid support into a follow CTA', () => {
-    const result = guardViewerResponse('谢谢礼物，赶紧点个关注吧。', {
+  it('allows a concise support CTA after verified paid support', () => {
+    const text = '谢谢礼物，喜欢这段就点个关注，想支持岚台也可以上舰。';
+    const result = guardViewerResponse(text, {
       isWeather: false,
       engagementSignals: ['gift'],
     });
-    expect(result.reasons).toContain('paid_support_cta');
-    expect(result.text).not.toContain('关注');
+    expect(result.reasons).toEqual([]);
+    expect(result.rewritten).toBe(false);
+    expect(result.text).toBe(text);
+  });
+
+  it('does not claim background music changed without an execution receipt', () => {
+    for (const reply of [
+      '换了，这歌我还有点跟不上拍。',
+      '换上了，你慢慢听。',
+      '小半啊，找到了一首，我换上了。',
+      '收到，岚台瑞摇版这就上。',
+    ]) {
+      const result = guardViewerResponse(reply, {
+        isWeather: false,
+        viewerText: '把背景音乐换成军中绿花',
+        actionCapabilities: [],
+        actionReceipts: [],
+      });
+
+      expect(result.reasons).toContain('unsupported_action_claim');
+      expect(result.text).toContain('控制不了播放器');
+      expect(result.text).not.toBe(reply);
+    }
+  });
+
+  it('blocks an unsupported promise to change the music', () => {
+    const result = guardViewerResponse('好，那我给你换段雨打树叶的轻一点。', {
+      isWeather: false,
+      viewerText: '换首适合睡觉的音乐',
+      actionCapabilities: [],
+      actionReceipts: [],
+    });
+
+    expect(result.reasons).toContain('unsupported_action_claim');
+    expect(result.text).toContain('控制不了播放器');
+    expect(result.text).not.toContain('给你换段');
+  });
+
+  it('applies the same receipt rule to visual background changes', () => {
+    const result = guardViewerResponse('换成美国背景了。', {
+      isWeather: false,
+      viewerText: '把背景换成美国',
+      actionCapabilities: [],
+      actionReceipts: [],
+    });
+
+    expect(result.reasons).toContain('unsupported_action_claim');
+    expect(result.text).toContain('控制不了直播画面背景');
+  });
+
+  it('allows an action completion claim only after a successful receipt', () => {
+    const result = guardViewerResponse('换上了，你慢慢听。', {
+      isWeather: false,
+      viewerText: '把背景音乐换成军中绿花',
+      actionCapabilities: ['background-audio-control'],
+      actionReceipts: [
+        {
+          capability: 'background-audio-control',
+          status: 'succeeded',
+        },
+      ],
+    });
+
+    expect(result.reasons).not.toContain('unsupported_action_claim');
+    expect(result.reasons).not.toContain('unconfirmed_action_claim');
+    expect(result.text).toBe('换上了，你慢慢听。');
+  });
+
+  it('does not pretend to sing when no vocal performance capability exists', () => {
+    for (const reply of [
+      '唱是会唱，你想听什么？',
+      '那我献丑两句，给你清唱一段。',
+    ]) {
+      const result = guardViewerResponse(reply, {
+        isWeather: false,
+        viewerText: '唱一首海阔天空',
+        actionCapabilities: [],
+        actionReceipts: [],
+      });
+
+      expect(result.reasons).toContain('unsupported_action_claim');
+      expect(result.text).toContain('只能正常说话，不能真的唱歌');
+    }
+  });
+
+  it('catches visual background claims expressed as roleplay', () => {
+    for (const [viewerText, reply] of [
+      ['把背景换成世界地图', '岚台变地球仪了。'],
+      ['把背景换成太平洋', '岚台直接漂到太平洋了，这背景一换就像海况台。'],
+    ]) {
+      const result = guardViewerResponse(reply, {
+        isWeather: false,
+        viewerText,
+        actionCapabilities: [],
+        actionReceipts: [],
+      });
+
+      expect(result.reasons).toContain('unsupported_action_claim');
+      expect(result.text).toContain('控制不了直播画面背景');
+    }
+  });
+
+  it('does not infer a viewer emotion or its cause from an ambiguous signal', () => {
+    for (const [viewerText, reply] of [
+      ['[委屈]', '怎么啦，谁惹你不开心了？'],
+      ['ᗜ֊ᗜ', '你这会儿是心情刚好转，还是纯粹卖个萌？'],
+      ['^⎚‸⎚^', '这表情看得我都有点心疼了，谁惹你不高兴了？'],
+    ]) {
+      const result = guardViewerResponse(reply, {
+        isWeather: false,
+        viewerText,
+      });
+
+      expect(result.reasons).toContain('unsupported_emotion_inference');
+      expect(result.text).toContain('你愿意说我再接着听');
+    }
+  });
+
+  it('keeps neutral handling of an ambiguous signal', () => {
+    const result = guardViewerResponse('这个表情我收到了，你想说什么都行。', {
+      isWeather: false,
+      viewerText: '[委屈]',
+    });
+
+    expect(result.reasons).not.toContain('unsupported_emotion_inference');
+    expect(result.rewritten).toBe(false);
+  });
+
+  it('does not pressure or psychologize an unverified passive audience', () => {
+    for (const reply of [
+      '屋里就这么一个人陪着我转地球仪，挺好的。',
+      '有人挂在这儿却不说话，是在想事情，还是找不到一个能接住话的人？',
+    ]) {
+      const result = guardViewerResponse(reply, {
+        isWeather: false,
+        viewerText: '空场主动搭话（有在场观众）',
+        audienceAddressability: 'unverified',
+      });
+
+      expect(result.reasons).toContain('passive_audience_assumption');
+      expect(result.text).toContain('我先按自己的节奏');
+    }
+  });
+
+  it('allows playful monetization language from real chat samples', () => {
+    const paidCta = guardViewerResponse(
+      'CPU直接转不过弯，要不你顺手投个蕉，让我重启一下？',
+      {
+        isWeather: false,
+        viewerText: '我这个一会给他看崩了吧',
+      },
+    );
+    const dependency = guardViewerResponse('又来一个赞，今晚就靠你们养着了～', {
+      isWeather: false,
+      viewerText: '点赞',
+      engagementSignals: ['like'],
+    });
+
+    expect(paidCta.rewritten).toBe(false);
+    expect(dependency.rewritten).toBe(false);
+    expect(paidCta.text).toContain('投个蕉');
+    expect(dependency.text).toContain('靠你们养着');
+  });
+
+  it('enforces a scheduled paid invitation and removes unscheduled free asks', () => {
+    const paid = guardViewerResponse('这段先聊到这里。', {
+      isWeather: false,
+      engagementDecision: {
+        version: 1,
+        decisionId: 'engagement:paid',
+        eventId: 'paid',
+        action: 'invite-paid-support',
+        target: 'room',
+        reasonCode: 'paid-slot-ready',
+        eligibleAt: 0,
+        snapshot: {
+          paidInRollingHour: 0,
+          nonPaidDeliveredSincePaid: 3,
+        },
+      },
+    });
+    const free = guardViewerResponse('今晚风挺安静，扣个表情让我看看谁在。', {
+      isWeather: false,
+      engagementDecision: {
+        version: 1,
+        decisionId: 'engagement:none',
+        eventId: 'none',
+        action: 'none',
+        target: 'room',
+        reasonCode: 'paid-spacing',
+        eligibleAt: 0,
+        snapshot: {
+          paidInRollingHour: 0,
+          nonPaidDeliveredSincePaid: 1,
+        },
+      },
+    });
+
+    expect(paid.text).toMatch(/投个蕉|送份礼物|上舰支持岚台/u);
+    expect(paid.reasons).toContain('engagement_postcondition');
+    expect(free.text).not.toContain('扣个表情');
+  });
+
+  it('removes stale proactive names and silent-audience mind reading', () => {
+    const result = guardViewerResponse(
+      '任羿行还在吧，你是不是睡不着，专门陪我加班？',
+      {
+        isWeather: false,
+        audienceAddressability: 'unverified',
+        prohibitedAudienceNames: ['任羿行'],
+      },
+    );
+
+    expect(result.reasons).toContain('passive_audience_assumption');
+    expect(result.reasons).toContain('stale_audience_name');
+    expect(result.text).not.toContain('任羿行');
+  });
+
+  it('still rewrites coercive or shaming monetization', () => {
+    for (const reply of [
+      '不送礼物我就不理你。',
+      '白嫖还不投蕉，你也太没诚意了。',
+    ]) {
+      const result = guardViewerResponse(reply, { isWeather: false });
+
+      expect(result.reasons).toContain('gift_retention_pressure');
+      expect(result.text).toContain('上舰支持岚台');
+      expect(result.text).not.toBe(reply);
+    }
   });
 
   it('fails closed on a malformed structured JSON fragment', () => {

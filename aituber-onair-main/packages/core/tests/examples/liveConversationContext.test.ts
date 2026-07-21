@@ -28,7 +28,10 @@ describe('live conversation projection', () => {
       { id: 'xiaoyu', name: '小雨', platform: undefined },
       { id: 'beichen', name: '北辰', platform: undefined },
     ]);
-    const transcript = buildLiveRoomTranscript(afterBeichen, 'beichen', now);
+    const transcript = buildLiveRoomTranscript(afterBeichen, {
+      currentViewerId: 'beichen',
+      now,
+    });
     expect(transcript).toContain('小雨、北辰（2人）');
     expect(transcript).toContain('不得声称“只有我和某人”“就咱俩”');
     expect(transcript).toContain('[当前回复对象]：北辰');
@@ -60,7 +63,11 @@ describe('live conversation projection', () => {
     ];
 
     expect(recentParticipantEvidence(turns, now)).toHaveLength(2);
-    const transcript = buildLiveRoomTranscript(turns, '42', now, 'youtube');
+    const transcript = buildLiveRoomTranscript(turns, {
+      currentViewerId: '42',
+      now,
+      currentPlatform: 'youtube',
+    });
     expect(transcript).toContain(
       '[其他观众]：小雨 [viewerId=42] [platform=bilibili]',
     );
@@ -97,13 +104,70 @@ describe('live conversation projection', () => {
       ],
       'simulator:bilibili',
     );
-    const transcript = buildLiveRoomTranscript(
-      turns,
-      'bob',
+    const transcript = buildLiveRoomTranscript(turns, {
+      currentViewerId: 'bob',
       now,
-      'simulator:bilibili',
-    );
+      currentPlatform: 'simulator:bilibili',
+    });
     expect(transcript).toContain('[其他观众]：小雨 [viewerId=alice]');
     expect(transcript).toContain('[当前回复对象]：北辰 [viewerId=bob]');
+  });
+
+  it('does not feed an unrelated old topic into a standalone current question', () => {
+    const now = 100_000;
+    const turns = [
+      {
+        eventId: 'old-cat',
+        at: now - 60_000,
+        input: '我的猫在床上捣乱了',
+        reply: '这只猫真会挑地方。',
+        viewerId: 'viewer',
+      },
+      {
+        eventId: 'current-question',
+        at: now - 1,
+        input: '这是机器人还是真人',
+        viewerId: 'viewer',
+      },
+    ];
+
+    const transcript = buildLiveRoomTranscript(turns, {
+      currentViewerId: 'viewer',
+      currentEventId: 'current-question',
+      currentInput: '这是机器人还是真人',
+      now,
+    });
+
+    expect(transcript).toContain('这是机器人还是真人');
+    expect(transcript).not.toContain('猫');
+    expect(transcript).not.toContain('床上');
+  });
+
+  it('keeps the immediate room exchange for a context-dependent interjection', () => {
+    const now = 200_000;
+    const turns = [
+      {
+        eventId: 'first',
+        at: now - 2_000,
+        input: '主播为什么不回我',
+        viewerId: 'alice',
+      },
+      {
+        eventId: 'second',
+        at: now - 1_000,
+        input: '因为他不想',
+        viewerId: 'bob',
+      },
+    ];
+
+    const transcript = buildLiveRoomTranscript(turns, {
+      currentViewerId: 'bob',
+      currentEventId: 'second',
+      currentInput: '因为他不想',
+      now,
+    });
+
+    expect(transcript).toContain('主播为什么不回我');
+    expect(transcript).toContain('因为他不想');
   });
 });

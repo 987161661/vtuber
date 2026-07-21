@@ -1,4 +1,5 @@
 import type { OperatorQueueStatus } from './operatorQueue';
+import { classifyConversationRelevance } from './conversationRelevance';
 
 export type RecentLiveTurn = {
   eventId?: string;
@@ -126,27 +127,62 @@ export function recentParticipantEvidence(
   return [...participants.values()];
 }
 
+export interface LiveRoomTranscriptOptions {
+  currentViewerId?: string;
+  currentEventId?: string;
+  currentInput?: string;
+  currentPlatform?: string;
+  now?: number;
+}
+
 export function buildLiveRoomTranscript(
   turns: RecentLiveTurn[],
-  currentViewerId?: string,
-  now = Date.now(),
-  currentPlatform?: string,
+  options: LiveRoomTranscriptOptions = {},
 ) {
   if (!turns.length) return '';
+  const {
+    currentViewerId,
+    currentEventId,
+    currentInput,
+    currentPlatform,
+    now = Date.now(),
+  } = options;
   const recent = turns.filter((turn) => now - turn.at <= 90_000);
-  const currentViewerTurns = currentViewerId
-    ? recent
-        .filter((turn) => {
-          const platform = turn.sourcesSeen?.[0] || turn.sourceLabel;
-          return (
-            turn.viewerId === currentViewerId &&
-            (!currentPlatform || !platform || platform === currentPlatform)
-          );
-        })
-        .slice(-2)
+  const sameCurrentActor = (turn: RecentLiveTurn) => {
+    const platform = turn.sourcesSeen?.[0] || turn.sourceLabel;
+    return Boolean(
+      currentViewerId &&
+        turn.viewerId === currentViewerId &&
+        (!currentPlatform || !platform || platform === currentPlatform),
+    );
+  };
+  const currentTurns = currentEventId
+    ? recent.filter((turn) => turn.eventId === currentEventId)
     : [];
+  const currentViewerTurns = currentViewerId
+    ? recent.filter(sameCurrentActor).slice(-2)
+    : [];
+  const contextualTurns = currentInput
+    ? recent.filter((turn) => {
+        if (turn.eventId === currentEventId) return true;
+        const relevance = classifyConversationRelevance(
+          currentInput,
+          `${turn.input} ${turn.reply ?? ''}`,
+        );
+        return relevance === 'semantic';
+      })
+    : recent.slice(-8);
+  const needsImmediateContext = Boolean(
+    currentInput &&
+      classifyConversationRelevance(currentInput, '') === 'continuation',
+  );
   const selected = [...new Map(
-    [...recent.slice(-8), ...currentViewerTurns].map((turn) => [
+    [
+      ...contextualTurns.slice(-6),
+      ...(needsImmediateContext ? recent.slice(-3) : []),
+      ...currentTurns,
+      ...(!currentInput ? currentViewerTurns : []),
+    ].map((turn) => [
       turn.eventId || `${turn.at}:${turn.input}`,
       turn,
     ]),
@@ -159,17 +195,13 @@ export function buildLiveRoomTranscript(
   const transcript = selected
     .map((turn) => {
       const platform = turn.sourcesSeen?.[0] || turn.sourceLabel;
-      const isCurrentViewer = Boolean(
-        currentViewerId &&
-          turn.viewerId === currentViewerId &&
-          (!currentPlatform || !platform || platform === currentPlatform),
-      );
+      const isCurrentViewer = sameCurrentActor(turn);
       return `独立观众事件${isCurrentViewer ? ' [当前回复对象]' : ' [其他观众]'}${turn.viewerName ? `：${turn.viewerName}` : ''}${turn.viewerId ? ` [viewerId=${turn.viewerId}]` : ''}${platform ? ` [platform=${platform}]` : ''}${turn.eventId ? ` [eventId=${turn.eventId}]` : ''}：${turn.input}${
         turn.reply ? `\n凌岚：${turn.reply}` : '\n（该条未播出回复）'
       }${turn.skills?.length ? `\n已用技能：${turn.skills.join('、')}` : ''}`;
     })
     .join('\n\n');
-  return `\n\n<live_room_transcript>\n这是最近90秒、最多8个有效回合的短期上下文；只用于理解追问和多人插话，绝不是节目主题。不得把旧话题带回当前回答，也不得向观众提及内部记录。\n每条都是带 platform + viewerId 的独立 actor 事件。只能把当前回复对象自己的话、偏好、地点、关系和承诺归给当前对象；其他观众的话只能用于理解房间气氛与插话，禁止合并、移植或张冠李戴。同名但 platform/viewerId 不同仍是不同观众。\n近期实际发言或互动过的观众证据：${participantEvidence}（${participants.length}人）。这只是互动下限，不是房间总人数；除非平台提供精确在场证据，不得声称“只有我和某人”“就咱俩”或忽略名单里的其他观众。\n${transcript}\n</live_room_transcript>`;
+  return `\n\n<live_room_transcript>\n这是最近90秒、按当前输入相关性筛选后的短期上下文；只用于理解追问和多人插话，绝不是节目主题。未被选中的旧话题视为与本轮无关，不得自行带回，也不得向观众提及内部记录。\n每条都是带 platform + viewerId 的独立 actor 事件。只能把当前回复对象自己的话、偏好、地点、关系和承诺归给当前对象；其他观众的话只能用于理解房间气氛与插话，禁止合并、移植或张冠李戴。同名但 platform/viewerId 不同仍是不同观众。\n近期实际发言或互动过的观众证据：${participantEvidence}（${participants.length}人）。这只是互动下限，不是房间总人数；除非平台提供精确在场证据，不得声称“只有我和某人”“就咱俩”或忽略名单里的其他观众。\n${transcript}\n</live_room_transcript>`;
 }
 
 export function buildLiveResponseContract(

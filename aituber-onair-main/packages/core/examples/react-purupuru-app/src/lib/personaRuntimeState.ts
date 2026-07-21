@@ -196,7 +196,20 @@ export class PersonaRuntimeState {
       candidate.drives.includes(drive.id),
     );
     const preferredSources = strategySources(strategyId);
-    const ranked = (compatible.length ? compatible : allCandidates).sort(
+    const freshCompatible = compatible.filter(
+      (candidate) => !this.topics.isCooling(candidate, at),
+    );
+    const freshCandidates = allCandidates.filter(
+      (candidate) => !this.topics.isCooling(candidate, at),
+    );
+    const candidatePool = freshCompatible.length
+      ? freshCompatible
+      : freshCandidates.length
+        ? freshCandidates
+        : compatible.length
+          ? compatible
+          : allCandidates;
+    const ranked = candidatePool.sort(
       (left, right) =>
         this.topics.score(right, at) +
         (preferredSources.includes(right.source) ? 200 : 0) -

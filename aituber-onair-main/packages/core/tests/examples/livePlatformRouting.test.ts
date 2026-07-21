@@ -8,8 +8,10 @@ import {
 } from '../../examples/react-purupuru-app/src/services/live-platform/connectors';
 import {
   createOrdinaryRoadEventAdapter,
+  fetchPlatformQrAuthStatus,
   saveOrdinaryRoadCredential,
   sendOrdinaryRoadReply,
+  startPlatformQrAuth,
 } from '../../examples/react-purupuru-app/src/services/live-platform/ordinaryRoad';
 
 function settings(): LiveConnectorSettings {
@@ -177,5 +179,38 @@ describe('OrdinaryRoad generic API', () => {
       '/gateway/platforms/bilibili/credential',
     );
     expect(fetchMock.mock.calls[0][1]).toMatchObject({ method: 'PUT' });
+  });
+
+  it('starts platform QR authorization through the local companion', async () => {
+    const session = {
+      id: 'qr-session',
+      state: 'waiting-scan',
+      qrDataUrl: 'data:image/png;base64,qr',
+    };
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => session,
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    await expect(startPlatformQrAuth('douyu')).resolves.toEqual(session);
+    expect(fetchMock).toHaveBeenCalledWith(
+      '/api/live-connectors/platform-auth/platforms/douyu/start',
+      expect.objectContaining({ method: 'POST', cache: 'no-store' }),
+    );
+  });
+
+  it('polls the active platform QR authorization session', async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: 'qr-session', state: 'waiting-confirmation' }),
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    await fetchPlatformQrAuthStatus('huya');
+    expect(fetchMock).toHaveBeenCalledWith(
+      '/api/live-connectors/platform-auth/platforms/huya/status',
+      expect.objectContaining({ cache: 'no-store' }),
+    );
   });
 });

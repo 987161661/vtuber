@@ -4,7 +4,11 @@ import {
   LiveEventHub,
   splitLiveChatText,
 } from './live-platform-gateway-common.mjs';
-import { isBilibiliRoomLive, safeError } from './live-platform-gateway.mjs';
+import {
+  isBilibiliRoomLive,
+  safeError,
+  shouldSuppressConfiguredSelfEvent,
+} from './live-platform-gateway.mjs';
 
 class FakeResponse {
   chunks = [];
@@ -78,4 +82,30 @@ test('Bilibili room snapshot identifies an already-started stream', () => {
   assert.equal(isBilibiliRoomLive({ data: { live_status: 1 } }), true);
   assert.equal(isBilibiliRoomLive({ data: { live_status: 0 } }), false);
   assert.equal(isBilibiliRoomLive({}), false);
+});
+
+test('self-authored radar city commands bypass generic echo suppression', () => {
+  const selfViewerIds = new Set(['21216205']);
+  const event = (text) => ({
+    type: 'comment',
+    text,
+    author: { id: '21216205', name: '主播' },
+  });
+
+  assert.equal(
+    shouldSuppressConfiguredSelfEvent(event('普通主播回写'), selfViewerIds),
+    true,
+  );
+  assert.equal(
+    shouldSuppressConfiguredSelfEvent(event('@上海'), selfViewerIds),
+    false,
+  );
+  assert.equal(
+    shouldSuppressConfiguredSelfEvent(event('＠ 广东省广州市'), selfViewerIds),
+    false,
+  );
+  assert.equal(
+    shouldSuppressConfiguredSelfEvent(event('@观众 你好'), selfViewerIds),
+    true,
+  );
 });
