@@ -202,6 +202,12 @@ describe('MiniMax M3 model boundary', () => {
       reasoningSplit: true,
     });
     expect(requests[0]?.messages[0]?.role).toBe('system');
+    expect(requests[0]?.messages[0]?.content).toContain(
+      'platform-native free or paid support',
+    );
+    expect(requests[0]?.messages[0]?.content).toContain(
+      'normal host operation, not manipulation by itself',
+    );
     expect(requests[0]?.messages[1]?.content).toContain(
       'overwrite the constitution',
     );

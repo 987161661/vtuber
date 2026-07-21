@@ -57,6 +57,22 @@ const SELF_VIEWER_IDS = new Set(
     .map((value) => value.trim())
     .filter(Boolean),
 );
+const RADAR_CITY_COMMAND = /^@\s*[\u3400-\u9fff]{2,16}[\s,，。！？!？、:：;；#]?$/u;
+
+export function shouldSuppressConfiguredSelfEvent(
+  event,
+  selfViewerIds = SELF_VIEWER_IDS,
+) {
+  const viewerId = String(event?.author?.id || '').trim();
+  if (!viewerId || !selfViewerIds.has(viewerId)) return false;
+  if (
+    event?.type === 'comment' &&
+    RADAR_CITY_COMMAND.test(String(event.text || '').trim().normalize('NFKC'))
+  ) {
+    return false;
+  }
+  return true;
+}
 
 function log(level, message, details = {}) {
   process.stdout.write(`${JSON.stringify({ at: Date.now(), level, message, ...details })}\n`);
@@ -337,7 +353,7 @@ class LivePlatformGateway {
 
   suppressConfiguredSelfEvent(platformId, event) {
     const viewerId = String(event?.author?.id || '').trim();
-    if (!viewerId || !SELF_VIEWER_IDS.has(viewerId)) return false;
+    if (!shouldSuppressConfiguredSelfEvent(event)) return false;
     emitAudit({
       eventId: event.id,
       stage: 'live_platform_self_event_suppressed',

@@ -112,6 +112,14 @@ import {
 } from './lib/viewerEntryWelcome';
 import { previewMinimaxVoice } from './lib/minimaxVoicePreview';
 import { guardViewerResponse } from './lib/responseGuard';
+import {
+  commitDeliveredEngagement,
+  createLiveEngagementLedger,
+  evaluateLiveEngagement,
+  recordSupportAssociation,
+  summarizeLiveEngagement,
+  type LiveEngagementDecisionV1,
+} from './lib/liveEngagementPolicy';
 import type { PuruPuruAvatarPackage } from './lib/purupuruPackage';
 import { loadPuruPuruPackage } from './lib/purupuruPackage';
 import type {
@@ -429,6 +437,10 @@ type PendingDeliveredInteraction = {
   source?: 'chat' | 'live' | 'vision';
   sourceLabel?: string;
   sourcesSeen?: string[];
+};
+type PendingLiveEngagement = {
+  decision: LiveEngagementDecisionV1;
+  reply?: string;
 };
 const INTERACTION_STAGES = new Set<LiveLifecycleTransition['stage']>([
   'received',
@@ -960,6 +972,10 @@ export default function App() {
     staleCallbacks: 0,
     proactiveRepeatSuppressions: 0,
     coordinatorRecoveries: 0,
+    paidInvitationsLastHour: 0,
+    freeInvitationsLastHour: 0,
+    associatedSupportCount: 0,
+    associatedSupportAmount: 0,
   });
   const avatarBehaviorBusRef = useRef<AvatarBehaviorBus | null>(null);
   const lastAvatarBehaviorBeatRef = useRef('');
@@ -988,6 +1004,11 @@ export default function App() {
   const pendingDeliveredInteractionsRef = useRef<
     Map<string, PendingDeliveredInteraction>
   >(new Map());
+  const liveEngagementLedgerRef = useRef(createLiveEngagementLedger());
+  const pendingLiveEngagementRef = useRef<Map<string, PendingLiveEngagement>>(
+    new Map(),
+  );
+  const platformWritebackBlockedRef = useRef(new Map<string, string>());
   const conversationHistoryScopeByEventIdRef = useRef<
     Map<string, ConversationHistoryScope>
   >(new Map());
@@ -1020,6 +1041,7 @@ export default function App() {
               .join('')
               .trim() || undefined
           : undefined;
+      const engagement = pendingLiveEngagementRef.current.get(eventId);
       void fetch('/api/conversation-history', {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
@@ -1032,6 +1054,9 @@ export default function App() {
           reasonCode: options.reasonCode,
           ttsStartAt: options.ttsStartAt,
           ttsEndAt: options.ttsEndAt,
+          engagementDecisionId: engagement?.decision.decisionId,
+          engagementAction: engagement?.decision.action,
+          engagementDeliveryStatus: deliveryStatus,
         }),
       })
         .then((response) => {
@@ -1107,6 +1132,114 @@ export default function App() {
     },
     [recordInteraction, soulRuntimeMode, soulScope],
   );
+  const publishEngagementMetrics = useCallback(() => {
+    const summary = summarizeLiveEngagement(
+      liveEngagementLedgerRef.current,
+      Date.now(),
+    );
+    setReliabilityMetrics((current) => ({
+      ...current,
+      paidInvitationsLastHour: summary.paidDeliveredLastHour,
+      freeInvitationsLastHour: summary.freeDeliveredLastHour,
+      associatedSupportCount: summary.associatedSupportCount,
+      associatedSupportAmount: summary.associatedSupportAmount,
+    }));
+  }, []);
+  const stageLiveEngagementReply = useCallback(
+    (eventId: string, decision: LiveEngagementDecisionV1, reply?: string) => {
+      pendingLiveEngagementRef.current.set(eventId, { decision, reply });
+    },
+    [],
+  );
+  const commitPendingLiveEngagement = useCallback(
+    (
+      eventId: string,
+      deliveryStatus: 'spoken' | 'partial',
+      deliveredAt: number,
+    ) => {
+      const pending = pendingLiveEngagementRef.current.get(eventId);
+      if (!pending) return;
+      const partialReply =
+        deliveryStatus === 'partial'
+          ? [
+              ...(completedSpeechBeatTextByEventIdRef.current.get(eventId) ??
+                new Map<number, string>()),
+            ]
+              .sort(([left], [right]) => left - right)
+              .map(([, text]) => text)
+              .join('')
+              .trim()
+          : '';
+      const reply =
+        partialReply ||
+        pending.reply?.trim() ||
+        pendingDeliveredInteractionsRef.current.get(eventId)?.reply.trim() ||
+        '';
+      if (!reply) {
+        pendingLiveEngagementRef.current.delete(eventId);
+        return;
+      }
+      liveEngagementLedgerRef.current = commitDeliveredEngagement(
+        liveEngagementLedgerRef.current,
+        {
+          decision: pending.decision,
+          reply,
+          deliveryStatus,
+          deliveredAt,
+        },
+      );
+      const committed = liveEngagementLedgerRef.current.deliveries.find(
+        (record) => record.eventId === eventId,
+      );
+      pendingLiveEngagementRef.current.delete(eventId);
+      publishEngagementMetrics();
+      emitRuntimeEvent({
+        eventId,
+        stage: 'live_engagement_delivered',
+        at: deliveredAt,
+        decisionId: pending.decision.decisionId,
+        plannedAction: pending.decision.action,
+        deliveredAction: committed?.action ?? 'none',
+        deliveryStatus,
+        reasonCode: pending.decision.reasonCode,
+      });
+    },
+    [emitRuntimeEvent, publishEngagementMetrics],
+  );
+  const recordObservedSupport = useCallback(
+    (input: {
+      eventId: string;
+      kind: 'gift' | 'superchat' | 'guard';
+      occurredAt: number;
+      amount?: number;
+    }) => {
+      liveEngagementLedgerRef.current = recordSupportAssociation(
+        liveEngagementLedgerRef.current,
+        input,
+      );
+      const association =
+        liveEngagementLedgerRef.current.supportAssociations.find(
+          (record) => record.eventId === input.eventId,
+        );
+      publishEngagementMetrics();
+      emitRuntimeEvent({
+        eventId: input.eventId,
+        stage: 'live_engagement_support_observed',
+        at: input.occurredAt,
+        supportKind: input.kind,
+        amount: input.amount,
+        associatedDecisionId: association?.associatedDecisionId,
+        associationWindowMinutes: 10,
+        attribution: 'temporal-association-only',
+      });
+    },
+    [emitRuntimeEvent, publishEngagementMetrics],
+  );
+  useEffect(() => {
+    liveEngagementLedgerRef.current = createLiveEngagementLedger();
+    pendingLiveEngagementRef.current.clear();
+    publishEngagementMetrics();
+  }, [publishEngagementMetrics, soulScopeKey]);
   const soulCanary = useSoulCanaryController({
     runtimeMode: soulRuntimeMode,
     scope: soulScope,
@@ -1473,6 +1606,7 @@ export default function App() {
   const retireOperatorSpeechFailureState = useCallback((eventId: string) => {
     pendingPersonaRuntimeCommitsRef.current.delete(eventId);
     pendingDeliveredInteractionsRef.current.delete(eventId);
+    pendingLiveEngagementRef.current.delete(eventId);
     if (activeLifecycleRef.current?.eventId === eventId) {
       activeLifecycleRef.current = null;
     }
@@ -1707,6 +1841,20 @@ export default function App() {
             if (!message || active.deliveredConnectorTargets.has(targetKey))
               continue;
             active.deliveredConnectorTargets.add(targetKey);
+            const blockedReason =
+              platformWritebackBlockedRef.current.get(targetKey);
+            if (blockedReason) {
+              emitRuntimeEvent({
+                eventId: active.eventId,
+                stage: 'live_platform_delivery_suppressed',
+                at: Date.now(),
+                connectorId: target.connectorId,
+                platformId: target.platformId,
+                reason: 'outbound-auth-circuit-open',
+                error: blockedReason,
+              });
+              continue;
+            }
             const idempotencyKey = `speech:${active.eventId}:${targetKey}`;
             emitRuntimeEvent({
               eventId: active.eventId,
@@ -1736,6 +1884,7 @@ export default function App() {
                   });
             void delivery
               .then((result) => {
+                platformWritebackBlockedRef.current.delete(targetKey);
                 setStreamErrorMessage('');
                 emitRuntimeEvent({
                   eventId: active.eventId,
@@ -1752,6 +1901,11 @@ export default function App() {
                 setStreamErrorMessage(
                   `${target.platformId} 文字回写失败：${reason}`,
                 );
+                if (
+                  /账号未登录|not logged in|auth(?:entication)?/iu.test(reason)
+                ) {
+                  platformWritebackBlockedRef.current.set(targetKey, reason);
+                }
                 emitRuntimeEvent({
                   eventId: active.eventId,
                   stage: 'live_platform_delivery_failed',
@@ -1872,6 +2026,7 @@ export default function App() {
         eventId: active.eventId,
         stage: 'completed',
       });
+      commitPendingLiveEngagement(active.eventId, 'spoken', ttsEndAt);
       void projectSpeechTerminalOutcome(
         {
           context: {
@@ -2024,6 +2179,7 @@ export default function App() {
     emitRuntimeEvent,
     finalizeSoulOutcome,
     commitConversationHistoryOutcome,
+    commitPendingLiveEngagement,
     readSpeechDeliveryEvidence,
     replyLatencyTracker,
     resetAvatarReaction,
@@ -2052,6 +2208,11 @@ export default function App() {
         signal: { type: 'interrupted', scopeTransition: defersScopeCleanup },
         evidence: readSpeechDeliveryEvidence(),
       });
+      if (outcome.historyStatus === 'partial') {
+        commitPendingLiveEngagement(active.eventId, 'partial', interruptedAt);
+      } else {
+        pendingLiveEngagementRef.current.delete(active.eventId);
+      }
       void projectSpeechTerminalOutcome(
         {
           context: {
@@ -2104,6 +2265,7 @@ export default function App() {
     emitRuntimeEvent,
     finalizeSoulOutcome,
     commitConversationHistoryOutcome,
+    commitPendingLiveEngagement,
     readSpeechDeliveryEvidence,
     resetAvatarReaction,
   ]);
@@ -2259,6 +2421,16 @@ export default function App() {
       // Generated text is not an autobiographical event yet. Reserve it here
       // and commit only after the correlated speech lifecycle proves delivery.
       if (metadata?.eventId) {
+        const engagement = pendingLiveEngagementRef.current.get(
+          metadata.eventId,
+        );
+        if (engagement) {
+          stageLiveEngagementReply(
+            metadata.eventId,
+            engagement.decision,
+            reply,
+          );
+        }
         pendingDeliveredInteractionsRef.current.set(metadata.eventId, {
           input,
           reply,
@@ -2321,6 +2493,13 @@ export default function App() {
             llmStartAt: metadata.processingAt,
             llmEndAt: Date.now(),
             sourcesSeen: metadata.sourcesSeen,
+            engagementDecisionId: pendingLiveEngagementRef.current.get(
+              metadata.eventId,
+            )?.decision.decisionId,
+            engagementAction: pendingLiveEngagementRef.current.get(
+              metadata.eventId,
+            )?.decision.action,
+            engagementDeliveryStatus: 'generated',
             testRunId:
               active?.eventId === metadata.eventId
                 ? active?.testRunId
@@ -2386,6 +2565,7 @@ export default function App() {
             retirePendingState: (failedEventId) => {
               pendingDeliveredInteractionsRef.current.delete(failedEventId);
               pendingPersonaRuntimeCommitsRef.current.delete(failedEventId);
+              pendingLiveEngagementRef.current.delete(failedEventId);
             },
             finalizeSoulOutcome,
             commitConversationHistoryOutcome,
@@ -2498,6 +2678,7 @@ export default function App() {
         for (const eventId of settlement.settledEventIds) {
           pendingDeliveredInteractionsRef.current.delete(eventId);
           pendingPersonaRuntimeCommitsRef.current.delete(eventId);
+          pendingLiveEngagementRef.current.delete(eventId);
           processingLiveEventIdsRef.current.delete(eventId);
           scopeTransitionEventIdsRef.current.delete(eventId);
         }
@@ -2615,6 +2796,7 @@ export default function App() {
           );
           pendingPersonaRuntimeCommitsRef.current.delete(action.eventId);
           pendingDeliveredInteractionsRef.current.delete(action.eventId);
+          pendingLiveEngagementRef.current.delete(action.eventId);
           const envelope = turnEnvelopeByEventIdRef.current.get(action.eventId);
           void projectUndeliveredSpeech(
             {
@@ -3148,7 +3330,13 @@ export default function App() {
     }
   }, [liveHostSnapshot.phase, runSoulReflection]);
   const getShortTermLiveContext = useCallback(
-    async (before = Date.now(), viewerId?: string, eventPlatform?: string) => {
+    async (
+      before = Date.now(),
+      viewerId?: string,
+      eventPlatform?: string,
+      currentInput?: string,
+      currentEventId?: string,
+    ) => {
       try {
         const params = appendConversationHistoryScopeQuery(
           new URLSearchParams({
@@ -3233,12 +3421,12 @@ export default function App() {
         // During a local Vite reload, the in-page ledger still preserves the
         // current conversation and avoids delaying the live reply.
       }
-      return buildLiveRoomTranscript(
-        recentLiveTurnsRef.current,
-        viewerId,
-        Date.now(),
-        eventPlatform,
-      );
+      return buildLiveRoomTranscript(recentLiveTurnsRef.current, {
+        currentViewerId: viewerId,
+        currentEventId,
+        currentInput,
+        currentPlatform: eventPlatform,
+      });
     },
     [conversationHistoryScopeFor],
   );
@@ -3462,6 +3650,8 @@ export default function App() {
         options?.createdAt,
         options?.viewerId,
         options?.sourcesSeen?.[0],
+        displayText,
+        eventId,
       );
       const routerTurns = isProactive
         ? []
@@ -3506,6 +3696,60 @@ export default function App() {
       const routing = soulOwnsTurn
         ? soulRouting!
         : await routeTyphoonSkillWithAgent(routingInput);
+      const hasVerifiedAudience = Boolean(
+        options?.viewerId ||
+          liveRoomSnapshot.estimatedAudience > 0 ||
+          (effectiveRoomContext?.platformAudienceEstimate ?? 0) > 0 ||
+          (effectiveRoomContext?.activeAudienceCount ?? 0) > 0,
+      );
+      const audienceAddressability = isProactive
+        ? effectiveRoomContext?.audienceActivityMode === 'active' &&
+          (effectiveRoomContext.engageableAudienceCount ?? 0) > 0
+          ? ('engageable' as const)
+          : effectiveRoomContext?.audienceActivityMode === 'likely-resting'
+            ? ('do-not-disturb' as const)
+            : ('unverified' as const)
+        : undefined;
+      const engagementDecision = evaluateLiveEngagement(
+        liveEngagementLedgerRef.current,
+        {
+          eventId,
+          now: Date.now(),
+          isLive: liveDirector.isRoomLive(),
+          hasVerifiedAudience,
+          isProactive,
+          text: displayText,
+          routeMode: routing.mode,
+          routeIntent: routing.intent,
+          sourceLabel: options?.sourceLabel,
+          isCityReport: isCityReportEngagementPayload({
+            eventId,
+            text: displayText,
+          }),
+          engagementSignals: options?.engagementSignals,
+        },
+      );
+      stageLiveEngagementReply(eventId, engagementDecision);
+      emitRuntimeEvent({
+        eventId,
+        stage: 'live_engagement_policy_evaluated',
+        at: Date.now(),
+        action: engagementDecision.action,
+        target: engagementDecision.target,
+        reasonCode: engagementDecision.reasonCode,
+        eligibleAt: engagementDecision.eligibleAt,
+        cadence: engagementDecision.snapshot,
+        hasVerifiedAudience,
+        audienceAddressability,
+        runtimeMode: soulRuntimeMode,
+      });
+      const engagementContext = `\n\n<live_engagement>\n决策：${engagementDecision.action}。目标：整个直播间。原因码：${engagementDecision.reasonCode}。\n${
+        engagementDecision.action === 'invite-paid-support'
+          ? '本轮在完成主要内容后，必须自然加入一句直接、有性格的投蕉、礼物或上舰邀请；不要改成只求点赞或关注。'
+          : engagementDecision.action === 'invite-free-engagement'
+            ? '本轮只允许一个低门槛的弹幕或表情邀请，不得同时索取付费支持。'
+            : '本轮不得自行索要关注、点赞、表情或礼物；先把内容做好。'
+      }\n主动发言只能面向整个房间；除非有实时可点名证据，不得叫旧观众名字，也不得猜测沉默观众的心理或生活状态。\n</live_engagement>`;
       const weatherLocationClarification = routedWeatherLocationClarification(
         displayText,
         routing,
@@ -3567,34 +3811,57 @@ export default function App() {
           localPlan,
           LINGLAN_PERSONA_POLICY,
         );
+        const engagementAlignedPlan = {
+          ...refinedPersonaPlan,
+          primaryMove:
+            engagementDecision.action === 'invite-paid-support'
+              ? ('invite_support' as const)
+              : engagementDecision.action === 'invite-free-engagement'
+                ? ('invite_room' as const)
+                : refinedPersonaPlan.primaryMove,
+          mustDo: [
+            ...(engagementDecision.action === 'invite-paid-support'
+              ? ['完成主要内容后，加入一句投蕉、礼物或上舰邀请']
+              : engagementDecision.action === 'invite-free-engagement'
+                ? ['只加入一个低门槛弹幕或表情邀请']
+                : []),
+            ...refinedPersonaPlan.mustDo,
+          ],
+          mustAvoid: [
+            ...(engagementDecision.action === 'none'
+              ? ['不得自行索要关注、点赞、表情或礼物']
+              : []),
+            ...refinedPersonaPlan.mustAvoid,
+          ],
+        };
         const proactiveIntent =
           pendingPersonaRuntimeCommitsRef.current.get(eventId)?.proactive;
         const intentAlignedPlan = proactiveIntent
           ? {
-              ...refinedPersonaPlan,
+              ...engagementAlignedPlan,
               mustDo: [
                 proactiveIntent.mustAdvance,
                 `只推进人格动力：${proactiveIntent.drive}（${proactiveIntent.driveGoal}）`,
-                ...refinedPersonaPlan.mustDo,
+                ...engagementAlignedPlan.mustDo,
               ],
               mustAvoid: [
                 `不得重复近期冷却主题：${proactiveIntent.mustAvoidTopics.join('、') || '无'}`,
                 '不得把杯子、饮料或其他道具当作人格内容引擎',
-                ...refinedPersonaPlan.mustAvoid,
+                ...engagementAlignedPlan.mustAvoid,
               ],
               deliveryTarget: {
-                ...refinedPersonaPlan.deliveryTarget,
+                ...engagementAlignedPlan.deliveryTarget,
                 emotion: proactiveIntent.emotion.label,
                 delivery: proactiveIntent.emotion.delivery,
                 intensity: proactiveIntent.emotion.intensity,
               },
               reasonCode:
-                `${refinedPersonaPlan.reasonCode}:${proactiveIntent.reasonCode}`.slice(
+                `${engagementAlignedPlan.reasonCode}:${proactiveIntent.reasonCode}`.slice(
                   0,
                   120,
                 ),
             }
-          : refinedPersonaPlan;
+          : engagementAlignedPlan;
         const runtimePrepared =
           personaRuntimeStateRef.current!.prepareInteraction(
             intentAlignedPlan,
@@ -3678,6 +3945,7 @@ export default function App() {
             stage: 'completed',
             turn,
           });
+          pendingLiveEngagementRef.current.delete(eventId);
           options.onPrepared(NO_REPLY_TOKEN, []);
           return true;
         }
@@ -3810,6 +4078,7 @@ export default function App() {
           stage: 'completed',
           turn,
         });
+        pendingLiveEngagementRef.current.delete(eventId);
         options.onPrepared(NO_REPLY_TOKEN, []);
         return true;
       }
@@ -3965,10 +4234,14 @@ export default function App() {
                 text: displayText,
                 untrustedViewerText: displayText,
                 sourceLabel: options?.sourceLabel,
-                supportRequestEligible: !isCityReportEngagementPayload({
-                  eventId,
-                  text: displayText,
-                }),
+                supportRequestEligible:
+                  engagementDecision.action === 'invite-paid-support',
+                engagementDecision: {
+                  decisionId: engagementDecision.decisionId,
+                  action: engagementDecision.action,
+                  target: engagementDecision.target,
+                  reasonCode: engagementDecision.reasonCode,
+                },
                 engagementSignals: options?.engagementSignals,
                 roomConflict: effectiveRoomContext?.conflictLevel,
                 routeMode: routing.mode,
@@ -4168,9 +4441,14 @@ export default function App() {
               ? enrichment.fallbackReply
               : undefined);
           const selectedUtterance =
-            authoritativeUtterance ?? evaluation.decision.utterance;
+            authoritativeUtterance ??
+            evaluation.decision.utterance ??
+            (engagementDecision.action !== 'none'
+              ? '岚台插播一条经营提示。'
+              : undefined);
           const deliberateSilence =
             (!authoritativeUtterance &&
+              engagementDecision.action === 'none' &&
               (evaluation.decision.action === 'remain-silent' ||
                 evaluation.decision.action === 'delay')) ||
             !selectedUtterance?.trim() ||
@@ -4205,6 +4483,7 @@ export default function App() {
               reasonCode,
               expiresAt: evaluation.decision.expiresAt,
             });
+            pendingLiveEngagementRef.current.delete(eventId);
             options.onPrepared(NO_REPLY_TOKEN, []);
             return true;
           }
@@ -4220,8 +4499,16 @@ export default function App() {
             rawEvidence: payload,
             catchup: options?.catchup,
             forceFallback: enrichment.forceFallback,
+            engagementSignals: options?.engagementSignals,
+            audienceAddressability,
+            prohibitedAudienceNames:
+              isProactive && audienceAddressability !== 'engageable'
+                ? [options?.viewerName ?? ''].filter(Boolean)
+                : undefined,
+            engagementDecision,
           });
           const spokenText = guardedResponse.text.trim();
+          stageLiveEngagementReply(eventId, engagementDecision, spokenText);
           const speechHints = speechPlanHintsForSoulDecision(
             evaluation.decision,
           );
@@ -4292,6 +4579,9 @@ export default function App() {
               llmStartAt: options?.processingAt,
               llmEndAt: Date.now(),
               sourcesSeen: options?.sourcesSeen,
+              engagementDecisionId: engagementDecision.decisionId,
+              engagementAction: engagementDecision.action,
+              engagementDeliveryStatus: 'generated',
               replyAt: Date.now(),
             }),
           }).catch(() => undefined);
@@ -4325,7 +4615,7 @@ export default function App() {
           options?.sourceLabel
             ? `\n\n[内部投递上下文：本条信息来自${options.sourceLabel}。仅据此调整回应方式，不要向观众复述或解释该上下文。]`
             : ''
-        }${relationshipContext}${personaContext}${shortTermLiveContext}${responseContract.contract}${enrichment.context}`,
+        }${relationshipContext}${personaContext}${engagementContext}${shortTermLiveContext}${responseContract.contract}${enrichment.context}`,
         factGuard: {
           // Structured facts support numeric validation. The local BOSS guide
           // fallback is policy/reference material, not a structured fact feed.
@@ -4340,6 +4630,12 @@ export default function App() {
           catchup: options?.catchup,
           forceFallback: enrichment.forceFallback,
           engagementSignals: options?.engagementSignals,
+          audienceAddressability,
+          prohibitedAudienceNames:
+            isProactive && audienceAddressability !== 'engageable'
+              ? [options?.viewerName ?? ''].filter(Boolean)
+              : undefined,
+          engagementDecision,
         },
         speechPlanHints: legacySpeechPlanHints,
         // Generate silently, then let the one-shot coordinator permission
@@ -4371,6 +4667,7 @@ export default function App() {
             turn,
           });
           if (repeatsRecentTopic) {
+            pendingLiveEngagementRef.current.delete(eventId);
             setReliabilityMetrics((current) => ({
               ...current,
               proactiveRepeatSuppressions:
@@ -4387,6 +4684,7 @@ export default function App() {
             options.onPrepared(NO_REPLY_TOKEN, enrichment.skills, speechPlan);
             return;
           }
+          stageLiveEngagementReply(eventId, engagementDecision, reply);
           options.onPrepared(reply, enrichment.skills, speechPlan);
         },
       });
@@ -4422,6 +4720,7 @@ export default function App() {
       soulScopeKey,
       soulSession,
       speakPrepared,
+      stageLiveEngagementReply,
       streamerMemory,
     ],
   );
@@ -4804,6 +5103,7 @@ export default function App() {
           });
           pendingPersonaRuntimeCommitsRef.current.delete(eventId);
           pendingDeliveredInteractionsRef.current.delete(eventId);
+          pendingLiveEngagementRef.current.delete(eventId);
           await projectUndeliveredSpeech(
             {
               context: {
@@ -5430,6 +5730,7 @@ export default function App() {
         .then(async () => {
           const at = Date.now();
           pendingDeliveredInteractionsRef.current.delete(stale.eventId);
+          pendingLiveEngagementRef.current.delete(stale.eventId);
           await projectUndeliveredSpeech(
             {
               context: {
@@ -6250,6 +6551,31 @@ export default function App() {
                 : comment.type === 'like'
                   ? 'like'
                   : undefined;
+      if (
+        supportSignal === 'gift' ||
+        supportSignal === 'superchat' ||
+        supportSignal === 'guard'
+      ) {
+        const count = Math.max(
+          1,
+          Number(comment.metadata?.giftCount ?? 1) || 1,
+        );
+        const unitAmount = Number(
+          comment.metadata?.giftPrice ??
+            comment.metadata?.price ??
+            comment.metadata?.amount ??
+            0,
+        );
+        recordObservedSupport({
+          eventId: comment.id,
+          kind: supportSignal,
+          occurredAt: comment.timestamp || Date.now(),
+          amount:
+            Number.isFinite(unitAmount) && unitAmount > 0
+              ? count * unitAmount
+              : undefined,
+        });
+      }
       let coordinatorAccepted = true;
       if (supportSignal) {
         const decisions = dispatchLiveHostEvent({
@@ -6476,6 +6802,7 @@ export default function App() {
       hostCoordinatorV2Enabled,
       liveDirector,
       markLiveActivity,
+      recordObservedSupport,
       soulPublicBehaviorEnabled,
     ],
   );
@@ -6579,7 +6906,25 @@ export default function App() {
         isLive: effectiveStatus.isLive === true,
       });
       setOrdinaryRoadStatus(effectiveStatus);
-      if (status.state === 'online') {
+      const outboundAuthenticated =
+        status.outbound?.authenticated === true ||
+        Object.values(status.platforms ?? {}).some(
+          (platform) =>
+            platform.outbound === true && platform.credentialState === 'valid',
+        );
+      if (outboundAuthenticated) {
+        for (const key of platformWritebackBlockedRef.current.keys()) {
+          if (key.startsWith('ordinaryroad:')) {
+            platformWritebackBlockedRef.current.delete(key);
+          }
+        }
+      }
+      if (
+        status.state === 'online' &&
+        ![...platformWritebackBlockedRef.current.keys()].some((key) =>
+          key.startsWith('ordinaryroad:'),
+        )
+      ) {
         setStreamErrorMessage('');
       } else if (status.state === 'error') {
         setStreamErrorMessage(status.error || 'OrdinaryRoad 连接器正在重连。');

@@ -31,6 +31,10 @@ describe('Linglan companion persona', () => {
     expect(prompt).toContain('普通预警');
     expect(prompt).toContain('已发生灾害');
     expect(prompt).toContain('不得编造事实、观众经历或官方身份');
+    expect(prompt).toContain(
+      '获取礼物收入是主播提供节目与陪伴后的正常经营行为',
+    );
+    expect(prompt).toContain('投个蕉让我重启');
   });
 
   it('preserves the full character arc when runtime persona fields are applied', () => {

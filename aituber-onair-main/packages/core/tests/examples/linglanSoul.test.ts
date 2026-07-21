@@ -26,6 +26,10 @@ describe('Linglan soul pack', () => {
         LINGLAN_SOUL_CONSTITUTION.allowedGoalFamilies.includes(goal.family),
       ),
     ).toBe(true);
+    expect(
+      LINGLAN_SOUL_PROFILE.goals.find((goal) => goal.id === 'be-recognized')
+        ?.label,
+    ).toContain('礼物与上舰收入');
   });
 
   it('records engagement as goal evidence rather than a hard-coded emotion', () => {

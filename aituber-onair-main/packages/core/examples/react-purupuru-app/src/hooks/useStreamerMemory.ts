@@ -10,9 +10,11 @@ import {
 import {
   buildMemoryContext,
   defaultCoreMemories,
+  isViewerMemoryOptOut,
   memoryId,
+  selectRelevantMemories,
+  suppressViewerMemoriesForOptOut,
   streamerMemoryStore,
-  isNonAttributableViewerCommand,
 } from '../lib/streamerMemory';
 import type {
   MemoryInteraction,
@@ -200,52 +202,27 @@ export function useStreamerMemory(
   );
   const signalsFor = useCallback(
     (input: string, viewer?: Viewer): PersonaMemorySignal[] => {
-      const now = Date.now();
-      const terms = input
-        .normalize('NFKC')
-        .toLowerCase()
-        .split(/[\s，。！？、]+/u)
-        .filter((term) => term.length >= 2);
-      return recordsRef.current
-        .filter(
-          (record) =>
-            record.digitalHumanId === profile.id &&
-            record.phase !== 'forgotten' &&
-            !['suppressed', 'archived'].includes(record.status) &&
-            (!record.expiresAt || record.expiresAt > now) &&
-            (!record.subjectId || record.subjectId === viewer?.id) &&
-            !isNonAttributableViewerCommand(record) &&
-            (record.visibility !== 'private' ||
-              Boolean(viewer?.id && record.subjectId === viewer.id)),
-        )
-        .map((record) => ({
-          record,
-          relevance:
-            (record.subjectId === viewer?.id ? 3 : 0) +
-            terms.filter((term) =>
-              `${record.title} ${record.content}`.toLowerCase().includes(term),
-            ).length +
-            record.activation,
-        }))
-        .filter(({ relevance }) => relevance >= 1)
-        .sort((left, right) => right.relevance - left.relevance)
-        .slice(0, 6)
-        .map(({ record }) => ({
-          topic: `${record.title}：${sanitizeSpeechText(record.content)}`.slice(
-            0,
-            120,
-          ),
-          confidence: Math.max(0, Math.min(1, record.confidence)),
-          sourceKind:
-            record.kind === 'commitment'
-              ? 'host_commitment'
-              : record.subjectType === 'viewer' &&
-                  ['user_observation', 'live_event'].includes(record.sourceType)
-                ? 'viewer_claim'
-                : 'verified',
-        }));
+      return selectRelevantMemories(recordsRef.current, input, {
+        viewerId: viewer?.id,
+        activeCoreRecordId: profile.memory.coreRecordId,
+        digitalHumanId: profile.id,
+        maxRecords: 6,
+      }).map((record) => ({
+        topic: `${record.title}：${sanitizeSpeechText(record.content)}`.slice(
+          0,
+          120,
+        ),
+        confidence: Math.max(0, Math.min(1, record.confidence)),
+        sourceKind:
+          record.kind === 'commitment'
+            ? 'host_commitment'
+            : record.subjectType === 'viewer' &&
+                ['user_observation', 'live_event'].includes(record.sourceType)
+              ? 'viewer_claim'
+              : 'verified',
+      }));
     },
-    [profile.id],
+    [profile.id, profile.memory.coreRecordId],
   );
 
   const persist = useCallback(
@@ -336,6 +313,16 @@ export function useStreamerMemory(
       const cleanInput = sanitizeSpeechText(input);
       const cleanReply = sanitizeSpeechText(reply);
       if (!cleanInput || !cleanReply) return;
+      const suppressed = suppressViewerMemoriesForOptOut(
+        recordsRef.current,
+        cleanInput,
+        viewer?.id,
+      );
+      for (const record of suppressed) await persist(record);
+      // The veto is represented by suppressing the matching memories. Storing
+      // the raw complaint as a fresh trace would immediately reintroduce the
+      // exact topic the viewer asked the host to stop recalling.
+      if (isViewerMemoryOptOut(cleanInput)) return;
       const interaction: MemoryInteraction = {
         id: memoryId(),
         at: Date.now(),

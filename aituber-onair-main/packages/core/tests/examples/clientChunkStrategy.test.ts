@@ -7,13 +7,16 @@ describe('client chunk strategy', () => {
     ['D:/repo/node_modules/react/index.js', 'react-runtime'],
     ['D:/repo/node_modules/scheduler/index.js', 'react-runtime'],
     ['D:/repo/packages/chat/dist/esm/index.js', 'chat-runtime'],
+    ['D:/repo/packages/chat/src/index.ts', 'chat-runtime'],
     ['D:/repo/packages/soul/dist/model.js', 'soul-runtime'],
+    ['D:/repo/packages/soul/src/model.ts', 'soul-runtime'],
     ['D:/repo/packages/manneri/dist/index.js', 'host-runtime'],
     [
       'D:/repo/packages/comment-intelligence/dist/createCommentIntelligence.js',
       'host-runtime',
     ],
     ['D:/repo/packages/live-companion/dist/coordinator.js', 'host-runtime'],
+    ['D:/repo/packages/live-companion/src/coordinator.ts', 'host-runtime'],
     [
       'D:/repo/packages/core/examples/react-purupuru-app/src/config/characterProfile.ts',
       'profile-runtime',

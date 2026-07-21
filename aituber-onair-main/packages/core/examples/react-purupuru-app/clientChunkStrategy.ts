@@ -5,11 +5,11 @@ const REACT_RUNTIME_SEGMENTS = [
 ];
 
 const WORKSPACE_RUNTIME_CHUNKS = [
-  ['/packages/chat/dist/', 'chat-runtime'],
-  ['/packages/soul/dist/', 'soul-runtime'],
-  ['/packages/manneri/dist/', 'host-runtime'],
-  ['/packages/comment-intelligence/dist/', 'host-runtime'],
-  ['/packages/live-companion/dist/', 'host-runtime'],
+  ['/packages/chat/', 'chat-runtime'],
+  ['/packages/soul/', 'soul-runtime'],
+  ['/packages/manneri/', 'host-runtime'],
+  ['/packages/comment-intelligence/', 'host-runtime'],
+  ['/packages/live-companion/', 'host-runtime'],
 ] as const;
 
 const APPLICATION_RUNTIME_CHUNKS = [

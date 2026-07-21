@@ -341,6 +341,8 @@ export interface LiveHostPolicy {
   quietThresholdMs: number;
   proactiveCooldownMs: number;
   maxProactiveTurns: number;
+  /** Minimum interval between spoken like acknowledgements across the room. */
+  likeResponseCooldownMs: number;
 }
 
 export type LiveHostEvent = (

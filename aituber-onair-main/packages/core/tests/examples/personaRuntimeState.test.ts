@@ -46,6 +46,19 @@ describe('PersonaRuntimeState', () => {
     expect(next.drive).not.toBe(first.drive);
   });
 
+  it('rotates proactive sources instead of turning every drive into self-analysis', () => {
+    const runtime = new PersonaRuntimeState();
+    const plans = Array.from({ length: 5 }, (_, index) => {
+      const at = 1_000 + index * 1_000;
+      const plan = runtime.planProactive(context, 'present-thought', at);
+      runtime.commitProactive(plan, at);
+      return plan;
+    });
+
+    expect(plans.filter((plan) => plan.source === 'self_goal')).toHaveLength(1);
+    expect(new Set(plans.map((plan) => plan.source)).size).toBeGreaterThan(2);
+  });
+
   it('keeps emotion state separate from the expressed TTS label and commits explicitly', () => {
     const runtime = new PersonaRuntimeState();
     const input = {

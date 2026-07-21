@@ -8,6 +8,11 @@ export type ConversationDeliveryStatus =
   | 'failed'
   | 'skipped';
 
+export type ConversationEngagementAction =
+  | 'none'
+  | 'invite-paid-support'
+  | 'invite-free-engagement';
+
 export type ConversationHistoryScope = {
   personaId: string;
   platform: string;
@@ -150,6 +155,9 @@ export function applyConversationDeliveryOutcome<
     partialTextVerified?: boolean;
     ttsStartAt?: number;
     ttsEndAt?: number;
+    engagementDecisionId?: string;
+    engagementAction?: ConversationEngagementAction;
+    engagementDeliveryStatus?: Exclude<ConversationDeliveryStatus, 'generated'>;
   },
 ): T | undefined {
   if (
@@ -194,8 +202,7 @@ export function isRetrievableConversationHistoryRecord(
     !RETRIEVABLE_DELIVERY.has(
       record.deliveryStatus as ConversationDeliveryStatus,
     ) ||
-    (record.deliveryStatus === 'partial' &&
-      record.partialTextVerified !== true)
+    (record.deliveryStatus === 'partial' && record.partialTextVerified !== true)
   ) {
     // Legacy records have no outcome evidence and therefore cannot be
     // treated as something the host actually said.

@@ -3301,6 +3301,181 @@ body {
   background: rgba(255, 255, 255, 0.06);
 }
 
+.qr-credential-field {
+  grid-column: 1 / -1;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  align-items: end;
+  gap: 7px;
+}
+
+.credential-summary {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 4px 10px;
+  min-height: 38px;
+}
+
+.credential-summary > span {
+  color: rgba(255, 255, 255, 0.68);
+  font-size: 12px;
+}
+
+.credential-summary > strong {
+  align-self: start;
+  padding: 2px 7px;
+  border: 1px solid rgba(85, 221, 210, 0.28);
+  border-radius: 999px;
+  color: #79e7de;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  background: rgba(85, 221, 210, 0.08);
+}
+
+.credential-summary > small {
+  grid-column: 1 / -1;
+  color: rgba(255, 255, 255, 0.42);
+  line-height: 1.35;
+}
+
+.qr-credential-field > button {
+  min-height: 38px;
+}
+
+.qr-credential-field > button.secondary,
+.qr-auth-copy button.secondary {
+  background: rgba(255, 255, 255, 0.06);
+}
+
+.qr-auth-inline {
+  position: relative;
+  grid-column: 1 / -1;
+  display: grid;
+  grid-template-columns: 132px minmax(0, 1fr);
+  gap: 18px;
+  align-items: center;
+  overflow: hidden;
+  margin-top: 6px;
+  padding: 16px;
+  border: 1px solid rgba(85, 221, 210, 0.28);
+  border-radius: 13px;
+  background:
+    linear-gradient(120deg, rgba(85, 221, 210, 0.1), transparent 42%),
+    rgba(4, 14, 20, 0.82);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.05);
+}
+
+.qr-auth-inline::after {
+  position: absolute;
+  inset: 7px;
+  border: 1px solid rgba(85, 221, 210, 0.08);
+  border-radius: 9px;
+  content: '';
+  pointer-events: none;
+}
+
+.qr-auth-visual {
+  position: relative;
+  z-index: 1;
+  display: grid;
+  place-items: center;
+  width: 132px;
+  aspect-ratio: 1;
+  border: 1px solid rgba(85, 221, 210, 0.5);
+  border-radius: 18px;
+  background: #f8ffff;
+  box-shadow:
+    0 0 0 6px rgba(85, 221, 210, 0.05),
+    0 0 30px rgba(85, 221, 210, 0.12);
+}
+
+.qr-auth-visual::before,
+.qr-auth-visual::after {
+  position: absolute;
+  width: 23px;
+  height: 23px;
+  border-color: #55ddd2;
+  content: '';
+}
+
+.qr-auth-visual::before {
+  top: -5px;
+  left: -5px;
+  border-top: 2px solid;
+  border-left: 2px solid;
+  border-radius: 8px 0 0;
+}
+
+.qr-auth-visual::after {
+  right: -5px;
+  bottom: -5px;
+  border-right: 2px solid;
+  border-bottom: 2px solid;
+  border-radius: 0 0 8px;
+}
+
+.qr-auth-visual img {
+  display: block;
+  width: 118px;
+  height: 118px;
+  border-radius: 9px;
+}
+
+.qr-auth-visual > span {
+  color: #123d3a;
+  font-size: 56px;
+  line-height: 1;
+}
+
+.qr-auth-copy {
+  position: relative;
+  z-index: 1;
+  display: grid;
+  justify-items: start;
+  gap: 7px;
+}
+
+.qr-auth-copy > span {
+  color: rgba(85, 221, 210, 0.65);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 10px;
+  letter-spacing: 0.16em;
+}
+
+.qr-auth-copy > strong {
+  color: rgba(255, 255, 255, 0.92);
+  font-size: 15px;
+}
+
+.qr-auth-copy > p {
+  margin: 0;
+  color: rgba(255, 255, 255, 0.5);
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.qr-auth-inline.state-waiting-confirmation {
+  border-color: rgba(170, 145, 255, 0.45);
+}
+
+.qr-auth-inline.state-authenticated {
+  grid-template-columns: 76px minmax(0, 1fr);
+  border-color: rgba(104, 224, 158, 0.42);
+  background: rgba(104, 224, 158, 0.08);
+}
+
+.qr-auth-inline.state-authenticated .qr-auth-visual {
+  width: 68px;
+  border-color: rgba(104, 224, 158, 0.6);
+  background: #c8f6db;
+}
+
+.qr-auth-inline.state-expired,
+.qr-auth-inline.state-error {
+  border-color: rgba(255, 156, 112, 0.38);
+}
+
 .capability-row {
   flex-wrap: wrap;
   gap: 7px;
@@ -3419,6 +3594,21 @@ body {
   }
   .credential-field label {
     grid-column: 1 / -1;
+  }
+  .qr-credential-field {
+    grid-template-columns: 1fr auto;
+  }
+  .credential-summary {
+    grid-column: 1 / -1;
+  }
+  .qr-auth-inline,
+  .qr-auth-inline.state-authenticated {
+    grid-template-columns: 1fr;
+    justify-items: center;
+    text-align: center;
+  }
+  .qr-auth-copy {
+    justify-items: center;
   }
 }
 

@@ -186,10 +186,16 @@ export const DEFAULT_MINIMAX_M3_SOUL_PROFILE: MiniMaxM3ProfileV1 = {
 };
 
 export class MiniMaxM3SoulAdapter implements SoulModelAdapter {
+  private readonly transport: MiniMaxM3Transport;
+  private readonly modelProfile: MiniMaxM3ProfileV1;
+
   constructor(
-    private readonly transport: MiniMaxM3Transport,
-    private readonly modelProfile: MiniMaxM3ProfileV1 = DEFAULT_MINIMAX_M3_SOUL_PROFILE,
-  ) {}
+    transport: MiniMaxM3Transport,
+    modelProfile: MiniMaxM3ProfileV1 = DEFAULT_MINIMAX_M3_SOUL_PROFILE,
+  ) {
+    this.transport = transport;
+    this.modelProfile = modelProfile;
+  }
 
   async proposeFast(
     request: SoulFastModelRequestV1,
@@ -790,7 +796,12 @@ repair, open-topic, shift-focus, delay, refuse, remain-silent. truthMode must
 be one of: literal, uncertain-disclosure, privacy-deflection, playful-fiction,
 character-canon, social-cover. Every candidate must include numeric
 manipulationRisk and factSafetyRisk plus a socialRisks array. Include evidence,
-goalEffects, costs, expected benefits, an optional utterance, and reasonCodes.`;
+goalEffects, costs, expected benefits, an optional utterance, and reasonCodes.
+invite-support means a direct request for platform-native free or paid support.
+It is normal host operation, not manipulation by itself. Propose it when an
+eligible moment and recognition-goal tension justify it; assign manipulation
+risk only for coercion, shame, punishment, exclusivity, or exploiting
+vulnerability.`;
 
 const SLOW_SYSTEM_PROMPT = `You are an asynchronous reflection proposal
 component. Return one JSON object only. You may propose bounded goal-weight
