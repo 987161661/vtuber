@@ -6729,6 +6729,8 @@ export default function App() {
           directReply?: unknown;
           viewerId?: unknown;
           viewerName?: unknown;
+          sourceLabel?: unknown;
+          sourcesSeen?: unknown;
         };
         const text = typeof data.text === 'string' ? data.text.trim() : '';
         const directReply =
@@ -6739,13 +6741,27 @@ export default function App() {
           typeof data.viewerId === 'string' ? data.viewerId : 'external-viewer';
         const viewerName =
           typeof data.viewerName === 'string' ? data.viewerName : '001号人类';
+        const sourceLabel =
+          typeof data.sourceLabel === 'string' && data.sourceLabel.trim()
+            ? data.sourceLabel.trim()
+            : '外部聊天桥接';
+        const sourcesSeen = Array.isArray(data.sourcesSeen)
+          ? data.sourcesSeen
+              .filter(
+                (source): source is string =>
+                  typeof source === 'string' && Boolean(source.trim()),
+              )
+              .map((source) => source.trim())
+              .slice(0, 8)
+          : [];
         markLiveActivity('external-chat-bridge');
         if (!interruptProactiveSpeech(eventId, viewerId)) return;
         void enqueueOperatorMessage({
           eventId,
           text,
           source: 'external-chat-bridge',
-          sourceLabel: '外部聊天桥接',
+          sourceLabel,
+          sourcesSeen,
           viewerId:
             typeof data.viewerId === 'string' ? data.viewerId : '001号人类',
           viewerName,

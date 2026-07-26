@@ -209,17 +209,7 @@ describe('routeTyphoonSkillWithAgent', () => {
   });
 
   it('keeps specialist routing for explicit weather questions', async () => {
-    const fetchMock = vi.fn().mockResolvedValue(
-      new Response(
-        JSON.stringify({
-          mode: 'weather',
-          intent: 'weather_query',
-          direction: '查询天气事实',
-          reason: 'explicit_weather',
-        }),
-        { status: 200 },
-      ),
-    );
+    const fetchMock = vi.fn();
     vi.stubGlobal('fetch', fetchMock);
 
     const decision = await routeTyphoonSkillWithAgent({
@@ -227,8 +217,31 @@ describe('routeTyphoonSkillWithAgent', () => {
       turns: [],
     });
 
-    expect(decision.mode).toBe('weather');
-    expect(fetchMock).toHaveBeenCalledOnce();
+    expect(decision).toMatchObject({
+      reason: 'explicit_typhoon_fact_route',
+      mode: 'weather',
+      inheritTyphoon: true,
+    });
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('routes a follow-up asking whether another typhoon exists to verified typhoon facts', async () => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal('fetch', fetchMock);
+
+    const decision = await routeTyphoonSkillWithAgent({
+      text: '后面是不是还有一个台风',
+      sourceLabel: '外部聊天桥接',
+      turns: [],
+    });
+
+    expect(decision).toMatchObject({
+      reason: 'explicit_typhoon_fact_route',
+      mode: 'weather',
+      intent: 'typhoon_status_query',
+      inheritTyphoon: true,
+    });
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 
   it('clarifies a weather question without a location without calling the router', async () => {
@@ -270,6 +283,27 @@ describe('routeTyphoonSkillWithAgent', () => {
       inheritTyphoon: false,
       skillIds: ['city-weather'],
       skillQuery: '北京',
+    });
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('routes a bare city status question from the radar bridge to city weather facts', async () => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal('fetch', fetchMock);
+
+    const decision = await routeTyphoonSkillWithAgent({
+      text: '惠州怎么样了',
+      sourceLabel: '台风雷达对话',
+      turns: [],
+    });
+
+    expect(decision).toMatchObject({
+      reason: 'radar_city_status_fact_route',
+      mode: 'weather',
+      intent: 'city_weather_query',
+      inheritTyphoon: false,
+      skillIds: ['city-weather'],
+      skillQuery: '惠州',
     });
     expect(fetchMock).not.toHaveBeenCalled();
   });

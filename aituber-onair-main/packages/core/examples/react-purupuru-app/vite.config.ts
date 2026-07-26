@@ -664,6 +664,8 @@ const externalChatQueue = new Map<
     requestedAt: number;
     viewerId?: string;
     viewerName?: string;
+    sourceLabel?: string;
+    sourcesSeen?: string[];
   }
 >();
 
@@ -4316,6 +4318,8 @@ function liveRuntimeMonitorPlugin(): Plugin {
               requestedAt?: unknown;
               viewerId?: unknown;
               viewerName?: unknown;
+              sourceLabel?: unknown;
+              sourcesSeen?: unknown;
             };
             const requestId = String(value.requestId || '').trim();
             const text =
@@ -4339,6 +4343,19 @@ function liveRuntimeMonitorPlugin(): Plugin {
                   typeof value.viewerName === 'string'
                     ? value.viewerName
                     : undefined,
+                sourceLabel:
+                  typeof value.sourceLabel === 'string'
+                    ? value.sourceLabel.trim()
+                    : undefined,
+                sourcesSeen: Array.isArray(value.sourcesSeen)
+                  ? value.sourcesSeen
+                      .filter(
+                        (source): source is string =>
+                          typeof source === 'string' && Boolean(source.trim()),
+                      )
+                      .map((source) => source.trim())
+                      .slice(0, 8)
+                  : undefined,
               });
             }
             res.statusCode = 202;
