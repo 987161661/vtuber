@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { type ChangeEvent, useEffect, useMemo, useRef, useState } from 'react';
 import {
   getDefaultXaiReasoningEffort,
   isGPT5Model,
@@ -18,6 +18,10 @@ import type { useStreamerMemory } from '../hooks/useStreamerMemory';
 import { fetchMinimaxVoiceOptions } from '../lib/minimaxVoicePreview';
 import { isServerManagedCredential } from '../lib/runtimeSettingsSecurity';
 import { ServerManagedCredentialInput } from './ServerManagedCredentialInput';
+import type {
+  OperatorPreflightCheck,
+  OperatorPreflightRemediationAction,
+} from '../lib/operatorPreflight';
 
 type SettingsHook = ReturnType<typeof useSettings>;
 type ScreenVisionController = ReturnType<typeof useScreenVisionController>;
@@ -252,6 +256,11 @@ type SectionKey =
 
 export function SettingsPanel({
   settings,
+  operatorSetupAssessment,
+  operatorPreflightSession,
+  runOperatorPreflight,
+  exportConfigurationProfile,
+  importConfigurationProfile,
   availableModels,
   updateLLMProvider,
   updateLLMModel,
@@ -341,6 +350,9 @@ export function SettingsPanel({
   onAvatarPackageChange,
   memory,
 }: SettingsPanelProps) {
+  const operatorPreflightReport = operatorPreflightSession.report;
+  const isOperatorPreflightRunning =
+    operatorPreflightSession.state === 'running';
   const disabled = isProcessing;
   const isOpenAIGPT5Model =
     settings.llm.provider === 'openai' && isGPT5Model(settings.llm.model);
@@ -387,6 +399,13 @@ export function SettingsPanel({
   );
   const [inworldVoices, setInworldVoices] = useState<InworldVoice[]>([]);
   const [fetchError, setFetchError] = useState('');
+  const [configurationFeedback, setConfigurationFeedback] = useState<{
+    tone: 'success' | 'error';
+    message: string;
+  } | null>(null);
+  const [isImportingConfiguration, setIsImportingConfiguration] =
+    useState(false);
+  const configurationFileInputRef = useRef<HTMLInputElement>(null);
   const [isFetchingMinimaxVoices, setIsFetchingMinimaxVoices] = useState(false);
   const [isFetchingElevenLabsVoices, setIsFetchingElevenLabsVoices] =
     useState(false);
@@ -693,10 +712,262 @@ export function SettingsPanel({
     }));
   };
 
+  const openPreflightSettings = (
+    action: OperatorPreflightRemediationAction,
+  ) => {
+    const sectionByAction: Partial<
+      Record<OperatorPreflightRemediationAction, SectionKey>
+    > = {
+      'open-model-settings': 'llm',
+      'open-voice-settings': 'tts',
+      'open-character-settings': 'visual',
+      'open-platform-settings': 'stream',
+    };
+    const section = sectionByAction[action];
+    if (!section) return;
+    setExpandedSections((previous) => ({ ...previous, [section]: true }));
+    window.requestAnimationFrame(() => {
+      document
+        .getElementById(`settings-section-${section}`)
+        ?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    });
+  };
+
+  const runPreflightRemediation = (check: OperatorPreflightCheck) => {
+    if (!check.remediation) return;
+    if (check.remediation.action === 'retry-check') {
+      void runOperatorPreflight(check.id);
+      return;
+    }
+    openPreflightSettings(check.remediation.action);
+  };
+
+  const downloadConfigurationProfile = () => {
+    try {
+      const serialized = exportConfigurationProfile();
+      const blob = new Blob([serialized], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const anchor = document.createElement('a');
+      const date = new Date().toISOString().slice(0, 10);
+      anchor.href = url;
+      anchor.download = `aituber-configuration-${date}.json`;
+      anchor.click();
+      URL.revokeObjectURL(url);
+      setConfigurationFeedback({
+        tone: 'success',
+        message: '配置档案已导出。密钥和访问令牌未写入文件。',
+      });
+    } catch (error) {
+      setConfigurationFeedback({
+        tone: 'error',
+        message: error instanceof Error ? error.message : '配置档案导出失败。',
+      });
+    }
+  };
+
+  const importConfigurationFile = async (
+    event: ChangeEvent<HTMLInputElement>,
+  ) => {
+    const file = event.target.files?.[0];
+    event.target.value = '';
+    if (!file) return;
+    setIsImportingConfiguration(true);
+    setConfigurationFeedback(null);
+    try {
+      const result = importConfigurationProfile(await file.text());
+      if (!result.ok) {
+        setConfigurationFeedback({ tone: 'error', message: result.error });
+        return;
+      }
+      setConfigurationFeedback({
+        tone: 'success',
+        message: result.warnings.length
+          ? `已导入“${result.name}”，并保留本机密钥；另有 ${result.warnings.length} 个不兼容字段被安全忽略。`
+          : `已导入“${result.name}”，本机密钥保持不变。`,
+      });
+    } catch (error) {
+      setConfigurationFeedback({
+        tone: 'error',
+        message: error instanceof Error ? error.message : '配置档案导入失败。',
+      });
+    } finally {
+      setIsImportingConfiguration(false);
+    }
+  };
+
   return (
     <div className="settings-panel">
+      <section
+        className={`operator-setup-card is-${operatorSetupAssessment.status}`}
+        aria-label="首次使用与配置档案"
+      >
+        <div className="operator-setup-header">
+          <div>
+            <span className="operator-setup-kicker">配置概览</span>
+            <strong>
+              {operatorSetupAssessment.status === 'ready'
+                ? '核心配置已就绪'
+                : `还需完成 ${operatorSetupAssessment.requiredSteps - operatorSetupAssessment.readyRequiredSteps} 项核心配置`}
+            </strong>
+            <small>模型、语音和角色是开播核心项；直播平台可以稍后连接。</small>
+          </div>
+          <span className="operator-setup-progress">
+            {operatorSetupAssessment.readyRequiredSteps}/
+            {operatorSetupAssessment.requiredSteps}
+          </span>
+        </div>
+        <div className="operator-setup-steps">
+          {operatorSetupAssessment.steps.map((step) => (
+            <div
+              className={`operator-setup-step is-${step.status}`}
+              key={step.id}
+            >
+              <span aria-hidden="true">
+                {step.status === 'ready' ? '✓' : '!'}
+              </span>
+              <div>
+                <strong>
+                  {step.label}
+                  {!step.required ? '（可选）' : ''}
+                </strong>
+                <small>{step.detail}</small>
+              </div>
+            </div>
+          ))}
+        </div>
+        <div className="operator-configuration-actions">
+          <button
+            type="button"
+            onClick={() => void runOperatorPreflight()}
+            disabled={disabled || isOperatorPreflightRunning}
+          >
+            {isOperatorPreflightRunning ? '正在检测链路…' : '运行开播前诊断'}
+          </button>
+          <button
+            type="button"
+            className="secondary"
+            onClick={downloadConfigurationProfile}
+            disabled={disabled}
+          >
+            导出无密钥档案
+          </button>
+          <button
+            type="button"
+            className="secondary"
+            onClick={() => configurationFileInputRef.current?.click()}
+            disabled={disabled || isImportingConfiguration}
+          >
+            {isImportingConfiguration ? '正在导入…' : '导入配置档案'}
+          </button>
+          <input
+            ref={configurationFileInputRef}
+            className="operator-configuration-file"
+            type="file"
+            accept="application/json,.json"
+            onChange={importConfigurationFile}
+            tabIndex={-1}
+          />
+        </div>
+        <small className="operator-configuration-security">
+          档案只携带模型选择、语音参数、角色与平台结构；导入不会覆盖本机密钥。
+        </small>
+        {configurationFeedback ? (
+          <div
+            className={`operator-configuration-feedback is-${configurationFeedback.tone}`}
+            role="status"
+          >
+            {configurationFeedback.message}
+          </div>
+        ) : null}
+        {operatorPreflightSession.state === 'stale' ? (
+          <div
+            className="operator-configuration-feedback is-error"
+            role="status"
+          >
+            配置已发生变化，之前的诊断结果已失效。请重新运行开播前诊断。
+          </div>
+        ) : null}
+        {operatorPreflightReport ? (
+          <div
+            className={`operator-preflight-report is-${operatorPreflightReport.status}`}
+            role="status"
+          >
+            <div className="operator-preflight-summary">
+              <strong>
+                {operatorPreflightReport.status === 'ready'
+                  ? '实时检测通过'
+                  : operatorPreflightReport.status === 'blocked'
+                    ? '检测发现阻断项'
+                    : '检测完成，仍有未实时验证项'}
+              </strong>
+              <small>
+                {operatorPreflightReport.summary} · 用时{' '}
+                {operatorPreflightReport.durationMs} ms
+              </small>
+            </div>
+            <div className="operator-preflight-checks">
+              {operatorPreflightReport.checks.map((check) => (
+                <div
+                  key={check.id}
+                  className={`operator-preflight-check is-${check.status}`}
+                >
+                  <span aria-hidden="true">
+                    {check.status === 'pass'
+                      ? '✓'
+                      : check.status === 'fail'
+                        ? '×'
+                        : check.status === 'warning'
+                          ? '!'
+                          : '–'}
+                  </span>
+                  <div>
+                    <strong>{check.label}</strong>
+                    <small>
+                      {check.detail}
+                      {typeof check.latencyMs === 'number'
+                        ? ` · ${check.latencyMs} ms`
+                        : ''}
+                    </small>
+                    {check.remediation ? (
+                      <div className="operator-preflight-remediation">
+                        <small>{check.remediation.hint}</small>
+                        <button
+                          type="button"
+                          className="secondary"
+                          onClick={() => runPreflightRemediation(check)}
+                          disabled={disabled || isOperatorPreflightRunning}
+                        >
+                          {check.remediation.label}
+                        </button>
+                        {check.remediation.retryable &&
+                        check.remediation.action !== 'retry-check' ? (
+                          <button
+                            type="button"
+                            onClick={() => void runOperatorPreflight(check.id)}
+                            disabled={disabled || isOperatorPreflightRunning}
+                          >
+                            重新检测
+                          </button>
+                        ) : null}
+                      </div>
+                    ) : null}
+                  </div>
+                  <em>
+                    {check.evidence === 'live'
+                      ? '实时'
+                      : check.evidence === 'configuration'
+                        ? '配置'
+                        : '跳过'}
+                  </em>
+                </div>
+              ))}
+            </div>
+          </div>
+        ) : null}
+      </section>
+
       {/* LLM Section */}
-      <div className="settings-section">
+      <div id="settings-section-llm" className="settings-section">
         <button
           type="button"
           className="settings-section-toggle"
@@ -929,7 +1200,7 @@ export function SettingsPanel({
                       : ''}
                   </label>
                   <ServerManagedCredentialInput
-                    key={`${settings.llm.provider}:${llmCredentialIsServerManaged ? 'managed' : 'local'}`}
+                    key={settings.llm.provider}
                     id="llm-apikey"
                     value={getApiKeyForProvider(settings.llm.provider)}
                     isServerManaged={llmCredentialIsServerManaged}
@@ -962,7 +1233,7 @@ export function SettingsPanel({
       </div>
 
       {/* TTS Section */}
-      <div className="settings-section">
+      <div id="settings-section-tts" className="settings-section">
         <button
           type="button"
           className="settings-section-toggle"
@@ -2132,7 +2403,7 @@ export function SettingsPanel({
                 <div className="settings-field">
                   <label htmlFor="tts-minimax-apikey">API 密钥</label>
                   <ServerManagedCredentialInput
-                    key={`minimax:${minimaxCredentialIsServerManaged ? 'managed' : 'local'}`}
+                    key="minimax"
                     id="tts-minimax-apikey"
                     value={settings.tts.minimaxApiKey || ''}
                     isServerManaged={minimaxCredentialIsServerManaged}
@@ -2250,7 +2521,7 @@ export function SettingsPanel({
         )}
       </div>
 
-      <div className="settings-section">
+      <div id="settings-section-visual" className="settings-section">
         <button
           type="button"
           className="settings-section-toggle"
@@ -2446,67 +2717,71 @@ export function SettingsPanel({
         />
       </div>
 
-      <StreamSettings
-        stream={settings.stream}
-        commentIntelligence={settings.commentIntelligence}
-        manneri={settings.manneri}
-        disabled={disabled}
-        isExpanded={expandedSections.stream}
-        isCommentIntelligenceExpanded={expandedSections.commentIntelligence}
-        isManneriExpanded={expandedSections.manneri}
-        onToggleExpand={() => toggleSection('stream')}
-        onToggleCommentIntelligence={() => toggleSection('commentIntelligence')}
-        onToggleManneri={() => toggleSection('manneri')}
-        streamErrorMessage={streamErrorMessage}
-        updateStreamPlatform={updateStreamPlatform}
-        updateYoutubeApiKey={updateYoutubeApiKey}
-        updateYoutubeLiveId={updateYoutubeLiveId}
-        updateYoutubeEnabled={updateYoutubeEnabled}
-        updateYoutubeCommentIntervalMs={updateYoutubeCommentIntervalMs}
-        updateTwitchClientId={updateTwitchClientId}
-        updateTwitchAccessToken={updateTwitchAccessToken}
-        updateTwitchChannel={updateTwitchChannel}
-        updateTwitchEnabled={updateTwitchEnabled}
-        updateTwitchCommentIntervalMs={updateTwitchCommentIntervalMs}
-        updateBilibiliEnabled={updateBilibiliEnabled}
-        updateBilibiliReplyEnabled={updateBilibiliReplyEnabled}
-        updateBilibiliGatewayUrl={updateBilibiliGatewayUrl}
-        updateCustomSseEndpoint={updateCustomSseEndpoint}
-        updateCustomSseEnabled={updateCustomSseEnabled}
-        updateCommentIntelligenceEnabled={updateCommentIntelligenceEnabled}
-        updateCommentIntelligenceMode={updateCommentIntelligenceMode}
-        updateCommentIntelligenceStreamTopic={
-          updateCommentIntelligenceStreamTopic
-        }
-        updateCommentIntelligenceStreamTitle={
-          updateCommentIntelligenceStreamTitle
-        }
-        updateCommentIntelligenceTopicFilter={
-          updateCommentIntelligenceTopicFilter
-        }
-        updateCommentIntelligenceAnalysisIntervalMs={
-          updateCommentIntelligenceAnalysisIntervalMs
-        }
-        updateCommentIntelligenceMaxCommentsPerBatch={
-          updateCommentIntelligenceMaxCommentsPerBatch
-        }
-        updateCommentIntelligenceMinCommentsForLLMAnalysis={
-          updateCommentIntelligenceMinCommentsForLLMAnalysis
-        }
-        updateCommentIntelligenceBlockHighRiskViewers={
-          updateCommentIntelligenceBlockHighRiskViewers
-        }
-        updateCommentIntelligenceViewerBlockDurationMs={
-          updateCommentIntelligenceViewerBlockDurationMs
-        }
-        updateManneriEnabled={updateManneriEnabled}
-        updateManneriSimilarityThreshold={updateManneriSimilarityThreshold}
-        updateManneriLookbackWindow={updateManneriLookbackWindow}
-        updateManneriInterventionCooldownMs={
-          updateManneriInterventionCooldownMs
-        }
-        updateManneriMinMessageLength={updateManneriMinMessageLength}
-      />
+      <div id="settings-section-stream">
+        <StreamSettings
+          stream={settings.stream}
+          commentIntelligence={settings.commentIntelligence}
+          manneri={settings.manneri}
+          disabled={disabled}
+          isExpanded={expandedSections.stream}
+          isCommentIntelligenceExpanded={expandedSections.commentIntelligence}
+          isManneriExpanded={expandedSections.manneri}
+          onToggleExpand={() => toggleSection('stream')}
+          onToggleCommentIntelligence={() =>
+            toggleSection('commentIntelligence')
+          }
+          onToggleManneri={() => toggleSection('manneri')}
+          streamErrorMessage={streamErrorMessage}
+          updateStreamPlatform={updateStreamPlatform}
+          updateYoutubeApiKey={updateYoutubeApiKey}
+          updateYoutubeLiveId={updateYoutubeLiveId}
+          updateYoutubeEnabled={updateYoutubeEnabled}
+          updateYoutubeCommentIntervalMs={updateYoutubeCommentIntervalMs}
+          updateTwitchClientId={updateTwitchClientId}
+          updateTwitchAccessToken={updateTwitchAccessToken}
+          updateTwitchChannel={updateTwitchChannel}
+          updateTwitchEnabled={updateTwitchEnabled}
+          updateTwitchCommentIntervalMs={updateTwitchCommentIntervalMs}
+          updateBilibiliEnabled={updateBilibiliEnabled}
+          updateBilibiliReplyEnabled={updateBilibiliReplyEnabled}
+          updateBilibiliGatewayUrl={updateBilibiliGatewayUrl}
+          updateCustomSseEndpoint={updateCustomSseEndpoint}
+          updateCustomSseEnabled={updateCustomSseEnabled}
+          updateCommentIntelligenceEnabled={updateCommentIntelligenceEnabled}
+          updateCommentIntelligenceMode={updateCommentIntelligenceMode}
+          updateCommentIntelligenceStreamTopic={
+            updateCommentIntelligenceStreamTopic
+          }
+          updateCommentIntelligenceStreamTitle={
+            updateCommentIntelligenceStreamTitle
+          }
+          updateCommentIntelligenceTopicFilter={
+            updateCommentIntelligenceTopicFilter
+          }
+          updateCommentIntelligenceAnalysisIntervalMs={
+            updateCommentIntelligenceAnalysisIntervalMs
+          }
+          updateCommentIntelligenceMaxCommentsPerBatch={
+            updateCommentIntelligenceMaxCommentsPerBatch
+          }
+          updateCommentIntelligenceMinCommentsForLLMAnalysis={
+            updateCommentIntelligenceMinCommentsForLLMAnalysis
+          }
+          updateCommentIntelligenceBlockHighRiskViewers={
+            updateCommentIntelligenceBlockHighRiskViewers
+          }
+          updateCommentIntelligenceViewerBlockDurationMs={
+            updateCommentIntelligenceViewerBlockDurationMs
+          }
+          updateManneriEnabled={updateManneriEnabled}
+          updateManneriSimilarityThreshold={updateManneriSimilarityThreshold}
+          updateManneriLookbackWindow={updateManneriLookbackWindow}
+          updateManneriInterventionCooldownMs={
+            updateManneriInterventionCooldownMs
+          }
+          updateManneriMinMessageLength={updateManneriMinMessageLength}
+        />
+      </div>
       <MemoryCenter memory={memory} />
     </div>
   );

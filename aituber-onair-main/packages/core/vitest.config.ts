@@ -21,6 +21,7 @@ export default defineConfig({
   },
   resolve: {
     alias: {
+      '@aituber-onair/chat': resolve(__dirname, '../chat/src/index.ts'),
       '@core': resolve(__dirname, './core'),
       '@services': resolve(__dirname, './services'),
       '@utils': resolve(__dirname, './utils'),

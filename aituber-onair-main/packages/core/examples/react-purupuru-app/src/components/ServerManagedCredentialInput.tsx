@@ -24,11 +24,18 @@ export function ServerManagedCredentialInput({
   onChange,
 }: ServerManagedCredentialInputProps) {
   const [isReplacing, setIsReplacing] = useState(false);
+  const [draft, setDraft] = useState<string | null>(null);
+
+  // A producer sanitizes browser settings shortly after each edit. Keep the
+  // draft locally until the field loses focus so that sanitizing the first
+  // character never replaces the input with a mask mid-entry.
+  const isEditing = draft !== null;
+  const isEditable = isReplacing || isEditing;
 
   const presentation = getCredentialInputPresentation(
     value,
     isServerManaged,
-    isReplacing,
+    isEditable,
   );
   const statusId = `${id}-status`;
 
@@ -38,14 +45,17 @@ export function ServerManagedCredentialInput({
         <input
           id={id}
           type="password"
-          value={presentation.inputValue}
+          value={isEditing ? draft : presentation.inputValue}
           readOnly={presentation.readOnly}
           aria-describedby={presentation.showSavedStatus ? statusId : undefined}
           autoComplete="new-password"
           spellCheck={false}
           onChange={(event) => {
-            onChange(event.target.value);
+            const nextValue = event.target.value;
+            setDraft(nextValue);
+            onChange(nextValue);
           }}
+          onBlur={() => setDraft(null)}
           placeholder={placeholder}
           disabled={disabled}
         />
@@ -53,7 +63,10 @@ export function ServerManagedCredentialInput({
           <button
             type="button"
             className="settings-credential-replace"
-            onClick={() => setIsReplacing(true)}
+            onClick={() => {
+              setIsReplacing(true);
+              setDraft('');
+            }}
             disabled={disabled}
           >
             更换密钥

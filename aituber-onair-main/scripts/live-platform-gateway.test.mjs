@@ -5,8 +5,14 @@ import {
   splitLiveChatText,
 } from './live-platform-gateway-common.mjs';
 import {
+  forwardCityCommentToRadar,
+  forwardLiveCommentToHost,
   isBilibiliRoomLive,
+  normalizeBilibiliHistoryComment,
   safeError,
+  selectNewBilibiliHistoryEvents,
+  shouldRetryFailedPlatformConnection,
+  shouldRetryStartupConnections,
   shouldSuppressConfiguredSelfEvent,
 } from './live-platform-gateway.mjs';
 
@@ -84,6 +90,80 @@ test('Bilibili room snapshot identifies an already-started stream', () => {
   assert.equal(isBilibiliRoomLive({}), false);
 });
 
+test('Bilibili history polling seeds existing comments and emits only later messages', () => {
+  const seenIds = new Set();
+  const existing = normalizeBilibiliHistoryComment({
+    id_str: 'existing-1',
+    text: '开播前消息',
+    uid: 10,
+    nickname: '观众甲',
+    timeline: '2026-07-26 10:30:00',
+  });
+  const later = normalizeBilibiliHistoryComment({
+    id_str: 'later-1',
+    text: '@广州',
+    uid: 20,
+    nickname: '观众乙',
+    timeline: '2026-07-26 10:31:00',
+  });
+
+  assert.deepEqual(
+    selectNewBilibiliHistoryEvents([existing], seenIds, true),
+    [],
+  );
+  assert.deepEqual(
+    selectNewBilibiliHistoryEvents([existing, later], seenIds, false),
+    [later],
+  );
+  assert.equal(later.id, 'history:later-1');
+  assert.equal(later.author.name, '观众乙');
+  assert.equal(later.metadata.platformId, 'bilibili');
+});
+
+test('startup recovery does not destroy a connection that is still connecting', () => {
+  const config = {
+    platforms: {
+      bilibili: { enabled: true },
+    },
+  };
+  assert.equal(
+    shouldRetryStartupConnections(config, {
+      bilibili: { state: 'connecting' },
+    }),
+    false,
+  );
+  assert.equal(
+    shouldRetryStartupConnections(config, {
+      bilibili: { state: 'disabled' },
+    }),
+    true,
+  );
+});
+
+test('failed enabled platform connections are retried but disabled ones are not', () => {
+  assert.equal(
+    shouldRetryFailedPlatformConnection(
+      { enabled: true },
+      { state: 'error' },
+    ),
+    true,
+  );
+  assert.equal(
+    shouldRetryFailedPlatformConnection(
+      { enabled: false },
+      { state: 'error' },
+    ),
+    false,
+  );
+  assert.equal(
+    shouldRetryFailedPlatformConnection(
+      { enabled: true },
+      { state: 'connecting' },
+    ),
+    false,
+  );
+});
+
 test('self-authored radar city commands bypass generic echo suppression', () => {
   const selfViewerIds = new Set(['21216205']);
   const event = (text) => ({
@@ -108,4 +188,63 @@ test('self-authored radar city commands bypass generic echo suppression', () => 
     shouldSuppressConfiguredSelfEvent(event('@观众 你好'), selfViewerIds),
     true,
   );
+});
+
+test('radar city forwarding retries a transient timeout without changing the event id', async () => {
+  const requests = [];
+  const fetcher = async (_url, options) => {
+    requests.push(JSON.parse(options.body));
+    if (requests.length === 1) throw new DOMException('timed out', 'TimeoutError');
+    return new Response('{}', { status: 200 });
+  };
+  const event = {
+    id: 'bilibili-city-shenzhen',
+    type: 'comment',
+    text: '@深圳',
+    author: { id: 'viewer-1', name: '观众' },
+    timestamp: 1_785_021_786_217,
+    metadata: {},
+  };
+
+  assert.equal(
+    await forwardCityCommentToRadar(event, 'bilibili', {
+      fetcher,
+      retryDelaysMs: [0],
+      timeoutMs: 10,
+    }),
+    true,
+  );
+  assert.equal(requests.length, 2);
+  assert.equal(requests[0].id, event.id);
+  assert.equal(requests[1].id, event.id);
+});
+
+test('live comments reach the host bridge even when no SSE client is connected', async () => {
+  const requests = [];
+  const event = {
+    id: 'history:viewer-question-1',
+    type: 'comment',
+    text: '主播能看到吗',
+    author: { id: 'viewer-1', name: '观众' },
+    timestamp: 1_785_034_500_000,
+    metadata: { platformId: 'bilibili', source: 'history-poll' },
+  };
+
+  assert.equal(
+    await forwardLiveCommentToHost(event, 'bilibili', {
+      fetcher: async (_url, options) => {
+        requests.push(JSON.parse(options.body));
+        return new Response('{}', { status: 202 });
+      },
+      retryDelaysMs: [],
+    }),
+    true,
+  );
+  assert.deepEqual(requests, [{
+    requestId: event.id,
+    text: event.text,
+    viewerId: event.author.id,
+    viewerName: event.author.name,
+    requestedAt: event.timestamp,
+  }]);
 });

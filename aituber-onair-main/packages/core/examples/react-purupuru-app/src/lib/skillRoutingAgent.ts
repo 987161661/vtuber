@@ -248,10 +248,17 @@ export function routeSoulSkillDeterministically(input: {
 
 export async function routeTyphoonSkillWithAgent(input: {
   text: string;
+  eventId?: string;
   viewerId?: string;
   viewerName?: string;
   sourceLabel?: string;
   turns: RecentLiveTurn[];
+  host?: {
+    speaking: boolean;
+    interruptible: boolean;
+    currentMode?: 'companion' | 'weather' | 'urgent' | 'variety';
+    currentTopic?: string;
+  };
 }): Promise<SkillRoutingDecision> {
   if (input.text.includes('<viewer_entry_welcome>')) {
     return {
@@ -309,6 +316,7 @@ export async function routeTyphoonSkillWithAgent(input: {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
+        eventId: input.eventId,
         text: input.text,
         speaker: {
           id: input.viewerId,
@@ -316,6 +324,7 @@ export async function routeTyphoonSkillWithAgent(input: {
           source: input.sourceLabel,
         },
         turns: input.turns.slice(-16),
+        host: input.host,
       }),
     });
     if (!response.ok) throw new Error(`skill_router_http_${response.status}`);

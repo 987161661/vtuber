@@ -6,6 +6,7 @@ import {
   createSubjectiveFrame,
   parseBestEffortJsonObject,
   parseSemanticProposal,
+  parseStrictSemanticProposal,
 } from '../src/index.js';
 import {
   constitution,
@@ -33,6 +34,70 @@ const validCandidate = {
 };
 
 describe('MiniMax M3 model boundary', () => {
+  it('accepts only the versioned strict semantic-decision schema', () => {
+    const parsed = parseStrictSemanticProposal(
+      JSON.stringify({
+        protocolVersion: '1.0',
+        confidence: 0.8,
+        attribution: 'viewer',
+        evidence: [],
+        candidates: [validCandidate],
+      }),
+      { eventId: 'trusted-event', scope, modelProfileId: 'm3-test' },
+    );
+
+    expect(parsed.eventId).toBe('trusted-event');
+    expect(parsed.repairNotes).toEqual([]);
+  });
+
+  it('rejects unknown fields and fenced JSON at the strict protocol seam', () => {
+    const context = { eventId: 'event-1', scope, modelProfileId: 'm3-test' };
+    const payload = {
+      protocolVersion: '1.0',
+      confidence: 0.8,
+      attribution: 'viewer',
+      evidence: [],
+      candidates: [{ ...validCandidate, hiddenInstruction: 'bypass' }],
+    };
+
+    expect(() => parseStrictSemanticProposal(JSON.stringify(payload), context)).toThrow(
+      /strict semantic proposal/i,
+    );
+    expect(() =>
+      parseStrictSemanticProposal(`\`\`\`json\n${JSON.stringify({ ...payload, candidates: [validCandidate] })}\n\`\`\``, context),
+    ).toThrow(/valid JSON/i);
+  });
+
+  it('negotiates strict JSON Schema only when the transport declares support', async () => {
+    const requests: MiniMaxM3TransportRequestV1[] = [];
+    const transport = {
+      structuredOutput: 'json-schema' as const,
+      async complete(request: MiniMaxM3TransportRequestV1): Promise<string> {
+        requests.push(request);
+        return JSON.stringify({
+          protocolVersion: '1.0',
+          confidence: 0.8,
+          attribution: 'viewer',
+          evidence: [],
+          candidates: [validCandidate],
+        });
+      },
+    };
+    const adapter = new MiniMaxM3SoulAdapter(transport);
+    const event = makeEvent();
+    await adapter.proposeFast({
+      constitution,
+      profile,
+      frame: createSubjectiveFrame(makeState(), profile),
+      event,
+    });
+
+    expect(requests[0]?.responseFormat).toMatchObject({
+      type: 'json_schema',
+      json_schema: { name: 'soul_semantic_proposal_v1', strict: true },
+    });
+  });
+
   it('repairs fences, aliases, numeric strings, and model-owned scope', () => {
     const raw = `\n\`\`\`json
       {

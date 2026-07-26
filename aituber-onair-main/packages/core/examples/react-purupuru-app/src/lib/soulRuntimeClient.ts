@@ -23,6 +23,11 @@ import {
   type SubjectiveFrameV1,
   type SubjectiveMemoryRefV1,
 } from '@aituber-onair/soul';
+import { resolveSoulAvailabilityFallback } from './soulAvailabilityFallback';
+import {
+  soulMutationHeaders,
+  type SoulMutationFence,
+} from './soulMutationFence';
 
 export interface SoulModelResponseMetaV1 {
   modelProfileId: string;
@@ -70,6 +75,7 @@ export interface BrowserSoulRuntimeOptions {
   scope: SoulScopeV1;
   fetchImpl?: typeof fetch;
   now?: () => number;
+  mutationFence?: SoulMutationFence;
 }
 
 /**
@@ -85,6 +91,10 @@ export class BrowserSoulRuntimeSession {
   private runtime;
   private readonly fetchImpl: typeof fetch;
   private readonly now: () => number;
+  private readonly mutationFence?: Readonly<{
+    ownerId: string;
+    leaseToken: string;
+  }>;
   private readonly evaluations = new Map<string, SoulTurnEvaluationV1>();
   private readonly decisionsByEventId = new Map<string, SoulDecisionV1>();
   private lastSyncedLocalSequence = 0;
@@ -99,9 +109,14 @@ export class BrowserSoulRuntimeSession {
     // which Chromium rejects with "Illegal invocation". Bind the native
     // implementation once at the adapter boundary; injected test transports
     // remain untouched.
-    this.fetchImpl =
-      options.fetchImpl ?? globalThis.fetch.bind(globalThis);
+    this.fetchImpl = options.fetchImpl ?? globalThis.fetch.bind(globalThis);
     this.now = options.now ?? Date.now;
+    this.mutationFence = options.mutationFence
+      ? Object.freeze({
+          ownerId: options.mutationFence.ownerId.trim(),
+          leaseToken: options.mutationFence.leaseToken.trim(),
+        })
+      : undefined;
     this.runtime = createSoulRuntime({
       constitution: this.constitution,
       profile: this.profile,
@@ -113,8 +128,7 @@ export class BrowserSoulRuntimeSession {
   static async recover(
     options: BrowserSoulRuntimeOptions,
   ): Promise<BrowserSoulRuntimeSession> {
-    const fetchImpl =
-      options.fetchImpl ?? globalThis.fetch.bind(globalThis);
+    const fetchImpl = options.fetchImpl ?? globalThis.fetch.bind(globalThis);
     const scopeQuery = new URLSearchParams({
       personaId: options.scope.personaId,
       platform: options.scope.platform,
@@ -196,9 +210,7 @@ export class BrowserSoulRuntimeSession {
       { quarantineInvalidReflectionReviews: true },
     );
     if (inspection.quarantinedReflectionEntryIds.length > 0) {
-      const quarantined = new Set(
-        inspection.quarantinedReflectionEntryIds,
-      );
+      const quarantined = new Set(inspection.quarantinedReflectionEntryIds);
       const validatedLedger = new InMemorySoulLedger();
       for (const entry of loadedEntries) {
         if (quarantined.has(entry.id)) continue;
@@ -258,7 +270,10 @@ export class BrowserSoulRuntimeSession {
     for (const entry of restoredEntries) {
       if (entry.kind !== 'decision') continue;
       const decision = entry.payload as SoulDecisionV1;
-      session.decisionsByEventId.set(decision.eventId, structuredClone(decision));
+      session.decisionsByEventId.set(
+        decision.eventId,
+        structuredClone(decision),
+      );
     }
     if (
       rebuiltFromLedger &&
@@ -395,9 +410,7 @@ export class BrowserSoulRuntimeSession {
     };
   }
 
-  private async requestFast(
-    request: SoulFastModelRequestV1,
-  ): Promise<{
+  private async requestFast(request: SoulFastModelRequestV1): Promise<{
     proposal: SemanticProposalV1;
     meta: SoulModelResponseMetaV1;
   }> {
@@ -446,9 +459,7 @@ export class BrowserSoulRuntimeSession {
     }
   }
 
-  private async persistProjection(
-    replaceStateHash?: string,
-  ): Promise<boolean> {
+  private async persistProjection(replaceStateHash?: string): Promise<boolean> {
     this.lastPersistenceError = undefined;
     try {
       const entries = await this.runtime.getLedger().list({
@@ -457,7 +468,7 @@ export class BrowserSoulRuntimeSession {
       for (const entry of entries) {
         const response = await this.fetchImpl('/api/soul/ledger', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: this.persistenceHeaders(),
           body: JSON.stringify({
             id: entry.id,
             kind: entry.kind,
@@ -479,7 +490,7 @@ export class BrowserSoulRuntimeSession {
       const snapshotResponse = await this.fetchImpl('/api/soul/snapshot', {
         method: 'PUT',
         headers: {
-          'Content-Type': 'application/json',
+          ...this.persistenceHeaders(),
           ...(replaceStateHash
             ? { 'X-Soul-Replace-State-Hash': replaceStateHash }
             : {}),
@@ -501,6 +512,10 @@ export class BrowserSoulRuntimeSession {
           : 'soul_persistence_network_error';
       return false;
     }
+  }
+
+  private persistenceHeaders(): Record<string, string> {
+    return soulMutationHeaders(this.mutationFence);
   }
 }
 
@@ -528,14 +543,17 @@ function isRebuildableSnapshotRestoreError(
     error instanceof SoulSnapshotRestoreError &&
     (error.message ===
       'Snapshot ledger checkpoint is missing from the supplied ledger' ||
-      error.message === 'Snapshot ledger head does not match the supplied ledger' ||
-      error.message === 'Snapshot profile hash does not match the active profile' ||
+      error.message ===
+        'Snapshot ledger head does not match the supplied ledger' ||
+      error.message ===
+        'Snapshot profile hash does not match the active profile' ||
       error.message ===
         'Snapshot constitution hash does not match the active constitution')
   );
 }
 
 function createLocalFallbackProposal(event: SoulEventV1): SemanticProposalV1 {
+  const availabilityFallback = resolveSoulAvailabilityFallback(event);
   const requiresImmediateResponse =
     event.urgency === 'urgent' || event.urgency === 'high';
   return {
@@ -543,17 +561,19 @@ function createLocalFallbackProposal(event: SoulEventV1): SemanticProposalV1 {
     eventId: event.id,
     scope: structuredClone(event.scope),
     modelProfileId: 'local-soul-fallback-v1',
-    confidence: 0,
-    attribution: 'unknown',
+    confidence: availabilityFallback.confidence,
+    attribution: availabilityFallback.attribution,
     evidence: [],
     candidates: [
       {
         id: 'local-deterministic-fallback',
-        action: requiresImmediateResponse ? 'acknowledge' : 'delay',
+        action: availabilityFallback.action,
         truthMode: 'literal',
-        utterance: requiresImmediateResponse
-          ? '先按已经确认的安全信息行动，我只补充核实过的部分。'
-          : undefined,
+        utterance:
+          availabilityFallback.utterance ??
+          (requiresImmediateResponse
+            ? '先按已经确认的安全信息行动，我只补充核实过的部分。'
+            : undefined),
         goalEffects: [],
         relationshipBenefit: 0,
         programValue: 0,
@@ -563,7 +583,7 @@ function createLocalFallbackProposal(event: SoulEventV1): SemanticProposalV1 {
         manipulationRisk: 0,
         factSafetyRisk: 0,
         socialRisks: [],
-        reasonCodes: ['local-provider-fallback'],
+        reasonCodes: [availabilityFallback.reasonCode],
       },
     ],
     repairNotes: ['local-provider-fallback'],

@@ -16,12 +16,14 @@ import type {
 import { execFile } from 'node:child_process';
 import { Readable } from 'node:stream';
 import { dirname, join } from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { createHash, createHmac, randomBytes, randomUUID } from 'node:crypto';
 import { defineConfig, type Plugin } from 'vite';
 import react from '@vitejs/plugin-react';
 import {
   createStressTestController,
   type StressIngestMessage,
+  type StressRuntimeQueueItem,
 } from './stressTestRuntime';
 import { createSoulRuntimePlugin } from './soulRuntimePlugin';
 import {
@@ -30,9 +32,26 @@ import {
 } from './server/serializedJsonStore';
 import { createOperatorQueueRuntime } from './server/operatorQueueRuntime';
 import { createOperatorQueueHttpRequestHandler } from './server/operatorQueueHttpRequest';
+import { decodeOperatorQueueSnapshotQuery } from './server/operatorQueueHttpAdapter';
 import { createLiveRuntimeMonitor } from './server/liveRuntimeMonitor';
 import { createLiveRuntimeEventRequestHandler } from './server/liveRuntimeEventRequest';
+import { readLiveRuntimeEventHistory } from './server/liveRuntimeEventHistory';
+import { createRuntimeOwnerLeaseRegistry } from './server/runtimeOwnerLease';
+import { resolveMinimaxUpstreamEndpoint } from './server/minimaxGatewayRouting';
+import {
+  LOCAL_LIVE_CHAT_TIMEOUT_MS,
+  requestLocalLiveChat,
+} from './server/localLiveChat';
+import { fetchMinimaxWithRetry } from './server/minimaxGatewayFetch';
+import {
+  createLiveSessionRegistry,
+  isPersistedLiveSessionRegistry,
+} from './server/liveSessionRegistry';
 import { fetchRadarCityWeather } from './server/cityWeatherRadarAdapter';
+import {
+  createTyphoonRadarQueryAdapter,
+  type TyphoonRadarQueryModule,
+} from './server/typhoonRadarQueryAdapter';
 import { forwardRadarCityEvent } from './server/radarCityEventForwarder';
 import { resolveClientChunk } from './clientChunkStrategy';
 import {
@@ -47,6 +66,14 @@ import {
   LiveSafetyGateway,
   type SafetyDecisionInput,
 } from './src/lib/liveSafetyGateway';
+import {
+  buildShowSnapshot,
+  ContextualShowDirector,
+  ContextualShowDirectorWindow,
+  OpenAICompatibleDirectorModel,
+  type ShowProgramMode,
+  type ShowThread,
+} from './src/lib/contextualShowDirector';
 import {
   isServerManagedCredential,
   sanitizeRuntimeSettingsForBrowser,
@@ -133,14 +160,17 @@ async function forwardMinimaxRequest(
     chunks.push(buffer);
   }
   try {
-    const upstream = await fetch(endpoint, {
-      method: req.method || 'POST',
-      headers: {
-        Authorization: `Bearer ${key}`,
-        'Content-Type': req.headers['content-type'] || 'application/json',
+    const upstream = await fetchMinimaxWithRetry({
+      endpoint,
+      timeoutMs: 30_000,
+      init: {
+        method: req.method || 'POST',
+        headers: {
+          Authorization: `Bearer ${key}`,
+          'Content-Type': req.headers['content-type'] || 'application/json',
+        },
+        body: chunks.length ? Buffer.concat(chunks) : undefined,
       },
-      body: chunks.length ? Buffer.concat(chunks) : undefined,
-      signal: AbortSignal.timeout(60_000),
     });
     res.statusCode = upstream.status;
     const contentType = upstream.headers.get('content-type');
@@ -159,6 +189,11 @@ async function forwardMinimaxRequest(
     res.end(JSON.stringify({ error: 'minimax_upstream_unreachable' }));
   }
 }
+
+// MiniMax documents api-bj as the China-region backup endpoint. In this
+// runtime the generic hostname intermittently stalls during connection setup,
+// so the explicit Beijing endpoint avoids a 10–15 second retry penalty.
+const MINIMAX_TTS_UPSTREAM_URL = 'https://api-bj.minimaxi.com/v1/t2a_v2';
 
 function runtimeModelHealth(serialized = runtimeSettings) {
   try {
@@ -392,6 +427,12 @@ const OPERATOR_QUEUE_PATH = join(
   APP_ROOT,
   'logs',
   'linglan-operator-queue.json',
+);
+const LIVE_SESSION_REGISTRY_PATH = join(
+  APP_ROOT,
+  '.runtime',
+  // This server-owned file unifies localhost and 127.0.0.1 tabs.
+  'live-sessions.json',
 );
 const ACCEPTANCE_LEDGER_PATH = join(
   APP_ROOT,
@@ -677,7 +718,21 @@ const handleLiveRuntimeEventRequest = createLiveRuntimeEventRequestHandler({
 // owner to become ready before treating a no-draft completion as terminal.
 // This remains bounded so a genuine provider failure is still observable.
 const RUNTIME_OWNER_LEASE_MS = 10_000;
-let runtimeOwnerLease: { ownerId: string; expiresAt: number } | undefined;
+const runtimeOwnerLeaseRegistry = createRuntimeOwnerLeaseRegistry({
+  ttlMs: RUNTIME_OWNER_LEASE_MS,
+});
+const liveSessionRegistry = createLiveSessionRegistry({
+  store: createSerializedJsonStore({
+    adapter: createAtomicJsonFileAdapter(LIVE_SESSION_REGISTRY_PATH),
+    validate: isPersistedLiveSessionRegistry,
+  }),
+  onRestoreError: (error) => {
+    console.error('Live session registry restore failed.', error);
+  },
+  onPersistenceError: (error) => {
+    console.error('Live session registry persistence failed.', error);
+  },
+});
 type LiveProgramMode = 'companion' | 'weather' | 'urgent' | 'variety';
 const liveProgramState: {
   mode: LiveProgramMode;
@@ -709,6 +764,10 @@ function runtimeOwnerLeasePlugin(): Plugin {
       server.middlewares.use('/api/live-runtime-owner', (req, res) => {
         res.setHeader('Content-Type', 'application/json; charset=utf-8');
         res.setHeader('Cache-Control', 'no-store');
+        if (req.method === 'GET') {
+          res.end(JSON.stringify(runtimeOwnerLeaseRegistry.snapshot()));
+          return;
+        }
         if (!['POST', 'DELETE'].includes(req.method || '')) {
           res.statusCode = 405;
           res.end(JSON.stringify({ error: 'method not allowed' }));
@@ -720,32 +779,155 @@ function runtimeOwnerLeasePlugin(): Plugin {
           try {
             const body = JSON.parse(
               Buffer.concat(chunks).toString('utf8') || '{}',
-            ) as { ownerId?: unknown };
+            ) as {
+              ownerId?: unknown;
+              leaseToken?: unknown;
+              label?: unknown;
+              role?: unknown;
+            };
             const ownerId = String(body.ownerId || '').trim();
             if (!ownerId) throw new Error('owner id is required');
             const now = Date.now();
-            if (runtimeOwnerLease && runtimeOwnerLease.expiresAt <= now) {
-              runtimeOwnerLease = undefined;
-            }
             if (req.method === 'DELETE') {
-              if (runtimeOwnerLease?.ownerId === ownerId) {
-                runtimeOwnerLease = undefined;
-              }
-              res.end(JSON.stringify({ owns: false }));
+              res.end(
+                JSON.stringify({
+                  owns: false,
+                  lease: runtimeOwnerLeaseRegistry.release(
+                    ownerId,
+                    String(body.leaseToken || ''),
+                    now,
+                  ),
+                }),
+              );
               return;
             }
-            if (!runtimeOwnerLease || runtimeOwnerLease.ownerId === ownerId) {
-              runtimeOwnerLease = {
-                ownerId,
-                expiresAt: now + RUNTIME_OWNER_LEASE_MS,
-              };
-              res.end(JSON.stringify({ owns: true }));
-              return;
-            }
-            res.end(JSON.stringify({ owns: false }));
+            res.end(
+              JSON.stringify(
+                runtimeOwnerLeaseRegistry.claim(
+                  {
+                    ownerId,
+                    label:
+                      typeof body.label === 'string' ? body.label : undefined,
+                    role:
+                      body.role === 'control-room' ||
+                      body.role === 'obs-overlay' ||
+                      body.role === 'stress-runner' ||
+                      body.role === 'unknown'
+                        ? body.role
+                        : 'unknown',
+                  },
+                  now,
+                ),
+              ),
+            );
           } catch {
             res.statusCode = 400;
             res.end(JSON.stringify({ error: 'invalid runtime owner request' }));
+          }
+        });
+      });
+    },
+  };
+}
+
+function liveSessionRegistryPlugin(): Plugin {
+  return {
+    name: 'live-session-registry',
+    configureServer(server) {
+      server.middlewares.use('/api/live-sessions', (req, res) => {
+        const requestUrl = new URL(req.url || '/', 'http://localhost');
+        if (req.method === 'GET' && requestUrl.pathname === '/events') {
+          const scope = {
+            personaId: requestUrl.searchParams.get('personaId') || '',
+            platform: requestUrl.searchParams.get('platform') || '',
+            roomId: requestUrl.searchParams.get('roomId') || '',
+          };
+          if (!scope.personaId || !scope.platform || !scope.roomId) {
+            res.statusCode = 400;
+            res.end('invalid live session scope');
+            return;
+          }
+          res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
+          res.setHeader('Cache-Control', 'no-cache, no-transform');
+          res.setHeader('Connection', 'keep-alive');
+          res.write(': connected\n\n');
+          const unsubscribe = liveSessionRegistry.subscribe(scope, (state) => {
+            res.write(`data: ${JSON.stringify(state)}\n\n`);
+          });
+          const keepAlive = setInterval(() => {
+            res.write(': keep-alive\n\n');
+          }, 20_000);
+          req.on('close', () => {
+            clearInterval(keepAlive);
+            unsubscribe();
+          });
+          return;
+        }
+        res.setHeader('Content-Type', 'application/json; charset=utf-8');
+        res.setHeader('Cache-Control', 'no-store');
+        if (req.method !== 'POST') {
+          res.statusCode = 405;
+          res.end(JSON.stringify({ error: 'method not allowed' }));
+          return;
+        }
+        const chunks: Buffer[] = [];
+        req.on('data', (chunk: Buffer) => chunks.push(chunk));
+        req.on('end', async () => {
+          try {
+            const body = JSON.parse(
+              Buffer.concat(chunks).toString('utf8') || '{}',
+            ) as {
+              action?: unknown;
+              scope?: {
+                personaId?: unknown;
+                platform?: unknown;
+                roomId?: unknown;
+              };
+              candidate?: unknown;
+              expectedSessionId?: unknown;
+            };
+            if (
+              !body.scope ||
+              typeof body.scope.personaId !== 'string' ||
+              typeof body.scope.platform !== 'string' ||
+              typeof body.scope.roomId !== 'string'
+            ) {
+              throw new Error('invalid live session scope');
+            }
+            const scope = {
+              personaId: body.scope.personaId,
+              platform: body.scope.platform,
+              roomId: body.scope.roomId,
+            };
+            if (body.action === 'resolve') {
+              const state = await liveSessionRegistry.resolve(
+                scope,
+                body.candidate,
+              );
+              res.end(JSON.stringify({ state }));
+              return;
+            }
+            if (body.action === 'rotate') {
+              const result = await liveSessionRegistry.rotate(
+                scope,
+                typeof body.expectedSessionId === 'string'
+                  ? body.expectedSessionId
+                  : undefined,
+              );
+              res.end(JSON.stringify(result));
+              return;
+            }
+            throw new Error('invalid live session action');
+          } catch (error) {
+            res.statusCode = 400;
+            res.end(
+              JSON.stringify({
+                error:
+                  error instanceof Error
+                    ? error.message
+                    : 'invalid live session request',
+              }),
+            );
           }
         });
       });
@@ -1038,7 +1220,9 @@ async function collectStressDiagnostics(): Promise<StressDiagnosticSnapshot> {
       id: 'tts-provider',
       level: 'warning',
       code: 'tts_provider_not_probed',
-      summary: `TTS engine is ${tts.engine || 'unset'}; MiniMax credential probing was skipped.`,
+      summary: `TTS engine is ${
+        tts.engine || 'unset'
+      }; MiniMax credential probing was skipped.`,
     });
   } else if (!tts.hasMiniMaxKey) {
     checks.push({
@@ -1251,7 +1435,13 @@ function ingestStressQueueItem(message: StressIngestMessage) {
 const stressTestController = createStressTestController(
   {
     ingest: (message) => ingestStressQueueItem(message),
-    snapshot: () => operatorQueueRuntime.snapshot(),
+    snapshot: () =>
+      operatorQueueRuntime
+        .snapshot()
+        .filter(
+          (item): item is OperatorQueueItem & StressRuntimeQueueItem =>
+            item.status !== 'archived' && item.status !== 'deleted',
+        ),
     update: () => undefined,
     remove: async (testRunId) => {
       const removed = await operatorQueueRuntime.removeTestRun(testRunId);
@@ -1357,7 +1547,9 @@ async function recentAcceptanceMetrics(now: number) {
     const replyFingerprints = new Set<string>();
     let duplicateReplyCount = 0;
     for (const record of records) {
-      const fingerprint = `${String(record.viewerName || '')}:${String(record.input || '')}:${String(record.reply || '')}`;
+      const fingerprint = `${String(record.viewerName || '')}:${String(
+        record.input || '',
+      )}:${String(record.reply || '')}`;
       if (replyFingerprints.has(fingerprint)) duplicateReplyCount += 1;
       else replyFingerprints.add(fingerprint);
     }
@@ -1729,7 +1921,9 @@ function conversationHistoryPlugin(): Plugin {
             const pendingTts =
               typeof value.eventId === 'string'
                 ? pendingTtsUpdates.get(
-                    `${conversationHistoryScopeKey(scope)}\u0000${value.eventId}`,
+                    `${conversationHistoryScopeKey(scope)}\u0000${
+                      value.eventId
+                    }`,
                   )
                 : undefined;
             const record = {
@@ -1844,7 +2038,7 @@ function runtimeSettingsPlugin(): Plugin {
           await forwardMinimaxRequest(
             req,
             res,
-            'https://api.minimaxi.com/v1/chat/completions',
+            resolveMinimaxUpstreamEndpoint(req.method, req.url),
           );
           return;
         }
@@ -1867,11 +2061,7 @@ function runtimeSettingsPlugin(): Plugin {
       });
       server.middlewares.use('/api/minimax-tts', async (req, res) => {
         await ensureRuntimeSettingsHydrated();
-        await forwardMinimaxRequest(
-          req,
-          res,
-          'https://api.minimaxi.com/v1/t2a_v2',
-        );
+        await forwardMinimaxRequest(req, res, MINIMAX_TTS_UPSTREAM_URL);
       });
       server.middlewares.use('/api/runtime-settings', (req, res) => {
         res.setHeader('Cache-Control', 'no-store');
@@ -2108,6 +2298,86 @@ function runtimeSettingsPlugin(): Plugin {
   };
 }
 
+function localLiveChatPlugin(): Plugin {
+  return {
+    name: 'local-live-chat',
+    configureServer(server) {
+      server.middlewares.use('/api/local-live-chat', (req, res) => {
+        if (req.method !== 'POST') {
+          res.statusCode = 405;
+          res.end();
+          return;
+        }
+        const chunks: Buffer[] = [];
+        let byteLength = 0;
+        req.on('data', (chunk: Buffer) => {
+          byteLength += chunk.byteLength;
+          if (byteLength <= 8_192) chunks.push(chunk);
+        });
+        req.on('end', () => {
+          if (byteLength > 8_192) {
+            res.statusCode = 413;
+            res.end(
+              JSON.stringify({ error: 'local_live_chat_body_too_large' }),
+            );
+            return;
+          }
+          let input: {
+            text?: unknown;
+            viewerName?: unknown;
+            recentContext?: unknown;
+          };
+          try {
+            input = JSON.parse(Buffer.concat(chunks).toString('utf8')) as {
+              text?: unknown;
+              viewerName?: unknown;
+              recentContext?: unknown;
+            };
+          } catch {
+            res.statusCode = 400;
+            res.end(JSON.stringify({ error: 'local_live_chat_invalid_json' }));
+            return;
+          }
+          const controller = new AbortController();
+          const timer = setTimeout(
+            () => controller.abort(),
+            LOCAL_LIVE_CHAT_TIMEOUT_MS,
+          );
+          void requestLocalLiveChat(
+            {
+              text: typeof input.text === 'string' ? input.text : '',
+              viewerName:
+                typeof input.viewerName === 'string'
+                  ? input.viewerName
+                  : undefined,
+              recentContext:
+                typeof input.recentContext === 'string'
+                  ? input.recentContext
+                  : undefined,
+            },
+            { signal: controller.signal },
+          )
+            .then((reply) => {
+              res.statusCode = 200;
+              res.setHeader('Content-Type', 'application/json; charset=utf-8');
+              res.setHeader('Cache-Control', 'no-store');
+              res.end(JSON.stringify({ reply }));
+            })
+            .catch((error) => {
+              res.statusCode =
+                error instanceof Error && error.name === 'AbortError'
+                  ? 504
+                  : 503;
+              res.setHeader('Content-Type', 'application/json; charset=utf-8');
+              res.end(JSON.stringify({ error: 'local_live_chat_unavailable' }));
+            })
+            .finally(() => clearTimeout(timer));
+        });
+      });
+    },
+  };
+}
+
 /**
  * Browser-safe MiniMax playback bridge.  The generic provider endpoint returns
  * a large JSON/hex body which can remain open in Chromium even after the
@@ -2155,7 +2425,7 @@ function minimaxAudioBridgePlugin(): Plugin {
                 ? settings.tts.speaker.trim()
                 : 'Chinese (Mandarin)_Wise_Women';
             if (!apiKey) throw new Error('minimax_key_missing');
-            const upstream = await fetch('https://api.minimaxi.com/v1/t2a_v2', {
+            const upstream = await fetch(MINIMAX_TTS_UPSTREAM_URL, {
               method: 'POST',
               headers: {
                 'Content-Type': 'application/json',
@@ -2191,7 +2461,9 @@ function minimaxAudioBridgePlugin(): Plugin {
               !payload.data?.audio
             ) {
               throw new Error(
-                `minimax_synthesis_failed:${payload.base_resp?.status_code ?? upstream.status}`,
+                `minimax_synthesis_failed:${
+                  payload.base_resp?.status_code ?? upstream.status
+                }`,
               );
             }
             const audio = Buffer.from(payload.data.audio, 'hex');
@@ -2251,6 +2523,8 @@ function minimaxAudioBridgePlugin(): Plugin {
 
 /** A small semantic routing turn keeps domain tools out of ordinary chat. */
 function skillRoutingAgentPlugin(): Plugin {
+  let contextualWindow: ContextualShowDirectorWindow | undefined;
+  let contextualWindowConfiguration = '';
   return {
     name: 'skill-routing-agent',
     configureServer(server) {
@@ -2270,6 +2544,9 @@ function skillRoutingAgentPlugin(): Plugin {
               text?: unknown;
               speaker?: unknown;
               turns?: unknown;
+              eventId?: unknown;
+              host?: unknown;
+              threads?: unknown;
             };
             const settings = JSON.parse(runtimeSettings || '{}') as {
               llm?: {
@@ -2294,17 +2571,122 @@ function skillRoutingAgentPlugin(): Plugin {
             ) {
               throw new Error('semantic_router_not_configured');
             }
+            // The full contextual schema is an offline experiment: MiniMax-M3
+            // can spend tens of seconds filling it. Production uses the
+            // compact contextual route below unless explicitly opted in.
+            if (process.env.CONTEXTUAL_SHOW_DIRECTOR === '1') {
+              const speaker =
+                body.speaker && typeof body.speaker === 'object'
+                  ? (body.speaker as {
+                      id?: string;
+                      name?: string;
+                      source?: string;
+                    })
+                  : undefined;
+              const host =
+                body.host && typeof body.host === 'object'
+                  ? (body.host as {
+                      speaking?: boolean;
+                      interruptible?: boolean;
+                      currentMode?: ShowProgramMode;
+                      currentTopic?: string;
+                    })
+                  : undefined;
+              const snapshot = buildShowSnapshot({
+                eventId:
+                  typeof body.eventId === 'string' ? body.eventId : undefined,
+                text: typeof body.text === 'string' ? body.text : '',
+                speaker,
+                turns: Array.isArray(body.turns)
+                  ? (body.turns as Parameters<
+                      typeof buildShowSnapshot
+                    >[0]['turns'])
+                  : [],
+                threads: Array.isArray(body.threads)
+                  ? (body.threads as ShowThread[])
+                  : [],
+                host,
+              });
+              const configuredModel =
+                typeof settings.llm.model === 'string'
+                  ? settings.llm.model
+                  : 'MiniMax-M3';
+              const minimumConfidence = Number(
+                process.env.OLLAMA_DIRECTOR_MIN_CONFIDENCE || 0.78,
+              );
+              const windowMs = Number(
+                process.env.CONTEXTUAL_DIRECTOR_WINDOW_MS || 200,
+              );
+              const configuration = JSON.stringify({
+                endpoint,
+                configuredModel,
+                keyFingerprint: createHash('sha256')
+                  .update(key)
+                  .digest('hex')
+                  .slice(0, 12),
+                minimumConfidence,
+                windowMs,
+              });
+              if (
+                !contextualWindow ||
+                contextualWindowConfiguration !== configuration
+              ) {
+                contextualWindow = new ContextualShowDirectorWindow({
+                  director: new ContextualShowDirector({
+                    primary: new OpenAICompatibleDirectorModel({
+                      endpoint,
+                      apiKey: key,
+                      model: configuredModel,
+                      timeoutMs: 15_000,
+                    }),
+                    minimumPrimaryConfidence: minimumConfidence,
+                  }),
+                  windowMs,
+                });
+                contextualWindowConfiguration = configuration;
+              }
+              const directorDecision = await contextualWindow.submit(snapshot);
+              const routedMode = directorDecision.programMode;
+              const mode = liveProgramState.locked
+                ? liveProgramState.mode
+                : routedMode;
+              const needsTyphoonFacts =
+                directorDecision.needsTool === 'typhoon-boss-radar' ||
+                directorDecision.needsTool === 'typhoon' ||
+                (mode === 'weather' &&
+                  directorDecision.topicRelation === 'continues_thread');
+              res.end(
+                JSON.stringify({
+                  inheritTyphoon:
+                    mode === 'weather' &&
+                    (liveProgramState.locked || needsTyphoonFacts),
+                  reason: liveProgramState.locked
+                    ? `operator_locked_${mode}`
+                    : `contextual_director_${directorDecision.model.tier}_${directorDecision.confidence.toFixed(2)}`,
+                  mode,
+                  intent: directorDecision.speechAct.slice(0, 60),
+                  direction: [
+                    directorDecision.recommendedAction,
+                    directorDecision.tone,
+                    directorDecision.addressedTo.kind,
+                  ].join(':'),
+                  shouldSpeak: directorDecision.shouldSpeak,
+                  moderation: directorDecision.moderation,
+                  director: directorDecision,
+                }),
+              );
+              return;
+            }
             const request = {
               model:
                 typeof settings.llm.model === 'string'
                   ? settings.llm.model
                   : 'MiniMax-M3',
               temperature: 0,
-              // MiniMax-M3 reasons by default. The director needs the final
-              // schema, not a partial chain-of-thought consuming its short
-              // routing budget, so use the provider's documented switch.
-              thinking: { type: 'disabled' },
-              max_completion_tokens: 260,
+              // Keep M3 reasoning out of message.content so the compact JSON
+              // can be parsed without stripping or truncating a think block.
+              reasoning_split: true,
+              max_completion_tokens: 512,
               response_format: { type: 'json_object' },
               messages: [
                 {
@@ -3239,8 +3621,7 @@ async function attestSoulCanaryRuntimeEvent(
     !run ||
     run.status !== 'active' ||
     run.runtimeOwnerId !== ownerId ||
-    runtimeOwnerLease?.ownerId !== ownerId ||
-    (runtimeOwnerLease?.expiresAt ?? 0) < receivedAt ||
+    !runtimeOwnerLeaseRegistry.isOwner(ownerId, receivedAt) ||
     sha256Text(eventToken) !== run.runtimeEventTokenHash ||
     !sameCanaryScope(event.scope, run.scope) ||
     event.runtimeMode !== 'canary' ||
@@ -3480,11 +3861,7 @@ function acceptanceLedgerPlugin(): Plugin {
                 const ownerId = Array.isArray(ownerHeader)
                   ? ownerHeader[0]
                   : ownerHeader;
-                if (
-                  !ownerId ||
-                  runtimeOwnerLease?.ownerId !== ownerId ||
-                  (runtimeOwnerLease?.expiresAt ?? 0) < Date.now()
-                ) {
+                if (!ownerId || !runtimeOwnerLeaseRegistry.isOwner(ownerId)) {
                   throw new Error('runtime_owner_lease_required');
                 }
                 const scope = parseSoulCanaryScope(body.scope);
@@ -3768,9 +4145,14 @@ function liveRuntimeMonitorPlugin(): Plugin {
     name: 'live-runtime-monitor',
     configureServer(server) {
       void operatorQueueRuntime.restore();
-      const sendHealth = async (res: ServerResponse) => {
+      const sendHealth = async (req: IncomingMessage, res: ServerResponse) => {
         const now = Date.now();
         const monitorHealth = liveRuntimeMonitor.healthSnapshot(now);
+        const runtimeLease = runtimeOwnerLeaseRegistry.snapshot(now);
+        const leasedOwnerId = runtimeOwnerLeaseRegistry.currentOwnerId(now);
+        const runtimeOwner = leasedOwnerId
+          ? liveRuntimeMonitor.ownerAvailability(now, leasedOwnerId)
+          : { active: false, available: false, ttsConfigured: false };
         const oldestQueuedAt =
           monitorHealth.oldestQueuedAt ?? Number.POSITIVE_INFINITY;
         const [supervisor, obs] = (await Promise.all([
@@ -3793,8 +4175,20 @@ function liveRuntimeMonitorPlugin(): Plugin {
         const measuredOldestAge = Number.isFinite(oldestQueuedAt)
           ? Math.max(0, now - oldestQueuedAt)
           : 0;
+        const requestUrl = new URL(req.url || '/', 'http://localhost');
+        const queueQuery = decodeOperatorQueueSnapshotQuery(
+          requestUrl.searchParams,
+        );
         const authoritativeQueue = operatorQueueRuntime
-          .snapshot()
+          .snapshot(
+            queueQuery.scope
+              ? {
+                  ...queueQuery,
+                  view: 'session',
+                  includeTestRuns: true,
+                }
+              : undefined,
+          )
           .filter((item) =>
             ['pending', 'preparing', 'ready', 'speaking'].includes(item.status),
           );
@@ -3810,7 +4204,9 @@ function liveRuntimeMonitorPlugin(): Plugin {
         // keep a completed queue non-empty after a reload or a missed event.
         const hasAuthoritativeQueue = authoritativeQueue.length > 0;
         const oldestQueueAgeMs = hasAuthoritativeQueue
-          ? Math.max(authoritativeOldestAge, measuredOldestAge)
+          ? queueQuery.scope
+            ? authoritativeOldestAge
+            : Math.max(authoritativeOldestAge, measuredOldestAge)
           : 0;
         const queueDepth = hasAuthoritativeQueue
           ? Math.max(authoritativeQueue.length, externalChatQueue.size)
@@ -3825,9 +4221,7 @@ function liveRuntimeMonitorPlugin(): Plugin {
               ? 'queue_active'
               : 'idle';
         const alerts = [
-          ...(monitorHealth.runtimeOwner.active
-            ? []
-            : ['runtime_owner_missing']),
+          ...(runtimeOwner.active ? [] : ['runtime_owner_missing']),
           ...(oldestQueueAgeMs > 15_000 ? ['queue_wait_over_15s'] : []),
           ...(directorStatus === 'stream_offline'
             ? ['director_stream_offline']
@@ -3859,7 +4253,8 @@ function liveRuntimeMonitorPlugin(): Plugin {
             lastEventAt: monitorHealth.lastEventAt || null,
             isSpeaking: monitorHealth.isSpeaking,
             model: runtimeModelHealth(),
-            runtimeOwner: monitorHealth.runtimeOwner,
+            runtimeOwner,
+            runtimeLease,
             obs,
             host: monitorHealth.hostTelemetry,
             directorStatus,
@@ -3887,7 +4282,7 @@ function liveRuntimeMonitorPlugin(): Plugin {
           res.end(JSON.stringify({ error: 'method not allowed' }));
           return;
         }
-        void sendHealth(res);
+        void sendHealth(req, res);
       });
       server.middlewares.use('/api/external-chat', (req, res) => {
         res.setHeader('Content-Type', 'application/json; charset=utf-8');
@@ -3959,6 +4354,9 @@ function liveRuntimeMonitorPlugin(): Plugin {
         res.setHeader('Cache-Control', 'no-store');
         if (req.method === 'GET') {
           const requestUrl = new URL(req.url || '/', 'http://localhost');
+          const query = decodeOperatorQueueSnapshotQuery(
+            requestUrl.searchParams,
+          );
           if (requestUrl.searchParams.get('observer') === 'control-panel') {
             void operatorQueueRuntime.observeControlPanel().catch((error) => {
               console.error(
@@ -3967,7 +4365,25 @@ function liveRuntimeMonitorPlugin(): Plugin {
               );
             });
           }
-          res.end(JSON.stringify({ items: operatorQueueRuntime.snapshot() }));
+          const respond = async () => {
+            if (query.view === 'session' && query.scope) {
+              await operatorQueueRuntime.activateScope(query.scope);
+            } else {
+              await operatorQueueRuntime.compact();
+            }
+            res.end(
+              JSON.stringify({
+                items: operatorQueueRuntime.snapshot(query),
+                summary: operatorQueueRuntime.summarize(query),
+                view: query.view ?? 'all',
+              }),
+            );
+          };
+          void respond().catch((error) => {
+            console.error('Queue projection failed.', error);
+            res.statusCode = 500;
+            res.end(JSON.stringify({ error: 'queue projection failed' }));
+          });
           return;
         }
         if (!['POST', 'PATCH'].includes(req.method || '')) {
@@ -4057,19 +4473,20 @@ function liveRuntimeMonitorPlugin(): Plugin {
               2000,
               Math.max(1, Number(requestUrl.searchParams.get('limit')) || 2000),
             );
-            void readFile(LIVE_RUNTIME_LOG_PATH, 'utf8')
-              .then((raw) => {
-                const events = raw
-                  .split(/\r?\n/)
-                  .filter(Boolean)
-                  .slice(-limit)
-                  .map((line) => JSON.parse(line));
+            const stagePrefix =
+              requestUrl.searchParams.get('stagePrefix')?.slice(0, 80) ||
+              undefined;
+            void readLiveRuntimeEventHistory(LIVE_RUNTIME_LOG_PATH, {
+              limit,
+              stagePrefix,
+            })
+              .then((events) => {
                 res.end(JSON.stringify({ events }));
               })
               .catch(() => res.end(JSON.stringify({ events: [] })));
             return;
           }
-          void sendHealth(res);
+          void sendHealth(req, res);
           return;
         }
         if (req.method !== 'POST') {
@@ -4198,19 +4615,14 @@ const TYPHOON_QUERY_SCRIPT =
     'query_typhoon_radar.mjs',
   );
 
-function runTyphoonQuery(question: string): Promise<string> {
-  return new Promise((resolve, reject) => {
-    execFile(
-      process.execPath,
-      [TYPHOON_QUERY_SCRIPT, '--question', question],
-      { timeout: 8_000, maxBuffer: 2 * 1024 * 1024, windowsHide: true },
-      (error, stdout) => {
-        if (error) reject(error);
-        else resolve(stdout.trim());
-      },
-    );
-  });
-}
+const runTyphoonQuery = createTyphoonRadarQueryAdapter({
+  loadModule: () =>
+    import(
+      pathToFileURL(TYPHOON_QUERY_SCRIPT).href
+    ) as Promise<TyphoonRadarQueryModule>,
+  root: process.env.TYPHOON_RADAR_ROOT || 'D:/typhoon boss radar',
+  baseUrl: LIVE_RADAR_BASE_URL,
+});
 
 function cityWeatherCodeLabel(value: unknown): string {
   const code = typeof value === 'number' ? value : Number(value);
@@ -4369,7 +4781,9 @@ async function fetchCityWeather(location: string) {
   const dailyParts = [
     dailyLow === undefined || dailyHigh === undefined
       ? ''
-      : `今天预计 ${formatWeatherNumber(dailyLow)}–${formatWeatherNumber(dailyHigh)}℃`,
+      : `今天预计 ${formatWeatherNumber(dailyLow)}–${formatWeatherNumber(
+          dailyHigh,
+        )}℃`,
     precipitationProbability === undefined
       ? ''
       : `最高降水概率 ${formatWeatherNumber(precipitationProbability)}%`,
@@ -4689,6 +5103,7 @@ export default defineConfig({
     alias: {
       // This app runs inside the monorepo. Resolve the workspace source
       // directly so a clean checkout does not depend on a prebuilt dist.
+      '@aituber-onair/chat': workspaceSourceEntry('chat'),
       '@aituber-onair/live-companion': workspaceSourceEntry('live-companion'),
       '@aituber-onair/soul': workspaceSourceEntry('soul'),
     },
@@ -4705,6 +5120,7 @@ export default defineConfig({
     shareRuntimeProxyWithPreview(),
     ...[
       runtimeOwnerLeasePlugin(),
+      liveSessionRegistryPlugin(),
       radarCityRelayPlugin(),
       liveProgramPlugin(),
       liveSafetyGatewayPlugin(),
@@ -4715,6 +5131,8 @@ export default defineConfig({
       createSoulRuntimePlugin({
         getRuntimeSettings: () =>
           runtimeSettings ? JSON.parse(runtimeSettings) : null,
+        authorizeClientMutation: ({ ownerId, leaseToken }) =>
+          runtimeOwnerLeaseRegistry.isLeaseOwner(ownerId, leaseToken),
         // The provider's observed tail occasionally exceeds the former 5.5s
         // cutoff even with thinking disabled. This remains below the plugin's
         // absolute 10s safety bound and does not add a retry/model call.
@@ -4833,8 +5251,7 @@ export default defineConfig({
         rewrite: (path) => path.replace(/^\/api\/flashhead/, ''),
       },
       '/api/live-connectors/platform-auth': {
-        target:
-          process.env.PLATFORM_QR_AUTH_URL || 'http://127.0.0.1:8198',
+        target: process.env.PLATFORM_QR_AUTH_URL || 'http://127.0.0.1:8198',
         changeOrigin: true,
         rewrite: (path) =>
           path.replace(/^\/api\/live-connectors\/platform-auth/, ''),

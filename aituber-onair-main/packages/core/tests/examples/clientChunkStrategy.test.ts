@@ -22,6 +22,46 @@ describe('client chunk strategy', () => {
       'profile-runtime',
     ],
     [
+      'D:/repo/packages/core/examples/react-purupuru-app/src/components/ControlRoom.tsx',
+      'control-room',
+    ],
+    [
+      'D:/repo/packages/core/examples/react-purupuru-app/src/components/SettingsPanel.tsx',
+      'settings-panel',
+    ],
+    [
+      'D:/repo/packages/core/examples/react-purupuru-app/src/lib/liveOperation.ts',
+      'host-runtime',
+    ],
+    [
+      'D:/repo/packages/core/examples/react-purupuru-app/src/lib/runtimeRecovery.ts',
+      'host-runtime',
+    ],
+    [
+      'D:/repo/packages/core/examples/react-purupuru-app/src/lib/liveSessionAuthority.ts',
+      'host-runtime',
+    ],
+    [
+      'D:/repo/packages/core/examples/react-purupuru-app/src/lib/liveSessionLifecycle.ts',
+      'host-runtime',
+    ],
+    [
+      'D:/repo/packages/core/examples/react-purupuru-app/src/lib/liveStartupGuide.ts',
+      'host-runtime',
+    ],
+    [
+      'D:/repo/packages/core/examples/react-purupuru-app/src/lib/operatorConfigurationProfile.ts',
+      'profile-runtime',
+    ],
+    [
+      'D:/repo/packages/core/examples/react-purupuru-app/src/lib/operatorPreflight.ts',
+      'profile-runtime',
+    ],
+    [
+      'D:/repo/packages/core/examples/react-purupuru-app/src/lib/viewerInteractionAccounting.ts',
+      'host-runtime',
+    ],
+    [
       'D:/repo/packages/core/examples/react-purupuru-app/src/lib/purupuruRenderer.ts',
       'avatar-runtime',
     ],

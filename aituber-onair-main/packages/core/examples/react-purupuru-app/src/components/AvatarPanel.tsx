@@ -6,6 +6,7 @@ import { createPuruPuruRenderer } from '../lib/purupuruRenderer';
 import type { AvatarViewTransform } from '../types/settings';
 import type { AvatarMotion } from '../lib/avatarMotion';
 import { getPersonaLiveClipUrl } from '../lib/avatarMotion';
+import { resolveAvatarLayerVisibility } from '../lib/speakingAvatarPresentation';
 
 const AVATAR_VIEW_MIN_SCALE = 0.2;
 const AVATAR_VIEW_MAX_SCALE = 3;
@@ -72,6 +73,10 @@ export function AvatarBackground({
   const [speakingLayerVisible, setSpeakingLayerVisible] = useState(
     Boolean(speakingAvatarVideoUrl),
   );
+  const avatarLayerVisibility = resolveAvatarLayerVisibility({
+    usePersonaLiveAvatar,
+    speakingAvatarVideoUrl: displayedSpeakingUrl,
+  });
 
   useEffect(() => {
     if (speakingAvatarVideoUrl) {
@@ -265,46 +270,44 @@ export function AvatarBackground({
 
   return (
     <div className="avatar-background" ref={containerRef}>
-      {usePersonaLiveAvatar && (
-        <>
-          <video
-            key={getPersonaLiveClipUrl(avatarMotion)}
-            className="personalive-avatar-video personalive-avatar-idle-layer"
-            src={getPersonaLiveClipUrl(avatarMotion)}
-            autoPlay
-            // Every production motion label currently resolves to the same
-            // canonical idle clip. Keep it looping for all labels; otherwise
-            // a non-idle label plays the clip once and leaves its black final
-            // frame visible, making the digital human appear to disappear.
-            loop
-            muted
-            playsInline
-            aria-label={`PersonaLive avatar motion: ${avatarMotion}`}
-            style={{
-              transform: `translate(${avatarViewTransform.x}px, ${avatarViewTransform.y}px) scale(${avatarViewTransform.scale})`,
-            }}
-          />
-          {displayedSpeakingUrl && (
-            <video
-              key={displayedSpeakingUrl}
-              className={`personalive-avatar-video personalive-avatar-speaking-layer${
-                speakingLayerVisible ? ' is-visible' : ''
-              }`}
-              src={displayedSpeakingUrl}
-              autoPlay
-              muted
-              playsInline
-              aria-label="Audio-driven speaking avatar"
-              style={{
-                transform: `translate(${avatarViewTransform.x}px, ${avatarViewTransform.y}px) scale(${avatarViewTransform.scale})`,
-              }}
-            />
-          )}
-        </>
+      {avatarLayerVisibility.showIdleVideo && (
+        <video
+          key={getPersonaLiveClipUrl(avatarMotion)}
+          className="personalive-avatar-video personalive-avatar-idle-layer"
+          src={getPersonaLiveClipUrl(avatarMotion)}
+          autoPlay
+          // Every production motion label currently resolves to the same
+          // canonical idle clip. Keep it looping for all labels; otherwise
+          // a non-idle label plays the clip once and leaves its black final
+          // frame visible, making the digital human appear to disappear.
+          loop
+          muted
+          playsInline
+          aria-label={`PersonaLive avatar motion: ${avatarMotion}`}
+          style={{
+            transform: `translate(${avatarViewTransform.x}px, ${avatarViewTransform.y}px) scale(${avatarViewTransform.scale})`,
+          }}
+        />
+      )}
+      {avatarLayerVisibility.showSpeakingVideo && displayedSpeakingUrl && (
+        <video
+          key={displayedSpeakingUrl}
+          className={`personalive-avatar-video personalive-avatar-speaking-layer${
+            speakingLayerVisible ? ' is-visible' : ''
+          }`}
+          src={displayedSpeakingUrl}
+          autoPlay
+          muted
+          playsInline
+          aria-label="Audio-driven speaking avatar"
+          style={{
+            transform: `translate(${avatarViewTransform.x}px, ${avatarViewTransform.y}px) scale(${avatarViewTransform.scale})`,
+          }}
+        />
       )}
       <canvas
         ref={canvasRef}
-        className={`avatar-canvas${usePersonaLiveAvatar ? ' is-hidden' : ''}${avatarPackage ? ' is-interactive' : ''}${
+        className={`avatar-canvas${avatarLayerVisibility.showCanvas ? '' : ' is-hidden'}${avatarPackage ? ' is-interactive' : ''}${
           isDragging ? ' is-dragging' : ''
         }`}
         aria-label={

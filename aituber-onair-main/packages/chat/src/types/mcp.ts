@@ -14,8 +14,18 @@ export interface MCPServerConfig {
   tool_configuration?: {
     enabled?: boolean;
     allowed_tools?: string[];
+    tool_permissions?: Record<
+      string,
+      {
+        effect: 'read' | 'write';
+        require_approval?: boolean;
+      }
+    >;
   };
   authorization_token?: string;
+  security?: {
+    max_response_bytes?: number;
+  };
 }
 
 /**

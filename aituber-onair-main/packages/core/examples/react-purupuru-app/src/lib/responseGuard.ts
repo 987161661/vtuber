@@ -31,6 +31,8 @@ export interface ResponseFactGuard {
   prohibitedAudienceNames?: string[];
   /** Mode-independent business decision for this public reply. */
   engagementDecision?: LiveEngagementDecisionV1;
+  /** Injectable wall clock used by deterministic time-of-day validation. */
+  nowMs?: number;
 }
 
 export interface GuardedResponse {
@@ -44,7 +46,7 @@ export interface GuardedResponse {
 const SAFE_FALLBACK = '这条回复出了点问题，稍后再说。';
 const OFF_TOPIC_FALLBACK = '刚才答偏了，你可以再问我一次。';
 const MONETIZATION_REWRITE =
-  '喜欢这段就投个蕉、送份礼物，或者上舰支持岚台；心意我会认真接住。';
+  '喜欢这段可以充个电、送份礼物，或者上舰支持岚台；心意我会认真接住。';
 const ACTION_CONTRACTS = [
   {
     capability: 'background-audio-control',
@@ -101,6 +103,14 @@ const EMOTION_UNCERTAINTY_FALLBACK =
   '这个表情我收到了；具体是什么心情，你愿意说我再接着听。';
 const PASSIVE_AUDIENCE_FALLBACK =
   '我先按自己的节奏说点自己的；想开口的人随时接一句就好。';
+const PAST_CALENDAR_REFERENCE = /(?:昨晚|昨天|前天)/u;
+const PAST_CALENDAR_REFERENCE_GLOBAL = /(?:昨晚|昨天|前天)/gu;
+const EVENING_REFERENCE = /(?:今晚|今夜)/u;
+const EVENING_REFERENCE_GLOBAL = /(?:今晚|今夜)/gu;
+const EVENING_CORRECTION =
+  /(?:大早上|早上|上午|白天).{0,12}(?:弄成|说成|变成|写成).{0,4}(?:今晚|今夜)|(?:不是|还没到).{0,6}(?:今晚|今夜)/u;
+const EVENING_REQUEST =
+  /(?:今晚|今夜).{0,18}(?:吗|呢|会|要|能|想|安排|节目|天气|下雨|直播|聊)/u;
 const UNSUPPORTED_CERTAINTY = [
   /(?:一定|肯定|必然).{0,8}(?:登陆|经过|进入|影响)/,
   /(?:一定|肯定|必然).{0,8}(?:达到|增强|减弱|升级|成为)/,
@@ -438,6 +448,41 @@ function unwrapStructuredSpeechPlan(text: string): string | null {
   }
 }
 
+function beijingHour(nowMs: number): number {
+  const hour = new Intl.DateTimeFormat('en-US', {
+    timeZone: 'Asia/Shanghai',
+    hour: '2-digit',
+    hourCycle: 'h23',
+  })
+    .formatToParts(new Date(nowMs))
+    .find((part) => part.type === 'hour')?.value;
+  return Number(hour ?? 0);
+}
+
+function rewriteUnsupportedEveningReference(
+  text: string,
+  context: ResponseFactGuard | undefined,
+  evidence: string,
+): { text: string; rewritten: boolean } {
+  if (!EVENING_REFERENCE.test(text)) return { text, rewritten: false };
+  const hour = beijingHour(context?.nowMs ?? Date.now());
+  if (hour >= 18 && hour <= 23) return { text, rewritten: false };
+
+  const viewerText = viewerMessageBody(context?.viewerText);
+  const viewerExplicitlyRequestsEvening =
+    !EVENING_CORRECTION.test(viewerText) && EVENING_REQUEST.test(viewerText);
+  if (
+    viewerExplicitlyRequestsEvening ||
+    EVENING_REFERENCE.test(evidence)
+  ) {
+    return { text, rewritten: false };
+  }
+  return {
+    text: text.replace(EVENING_REFERENCE_GLOBAL, '今天'),
+    rewritten: true,
+  };
+}
+
 /**
  * The only viewer-facing output gate. It cleans, validates, and performs one
  * deterministic rewrite before the text can reach history, memory, or TTS.
@@ -469,6 +514,14 @@ export function guardViewerResponse(
         (name) => name.trim() && sanitized.includes(name.trim()),
       ),
   );
+  const unsupportedRelativeTimeViolation = Boolean(
+    PAST_CALENDAR_REFERENCE.test(sanitized) &&
+      !PAST_CALENDAR_REFERENCE.test(viewerMessageBody(context?.viewerText)) &&
+      !PAST_CALENDAR_REFERENCE.test(evidence),
+  );
+  const relativeTimeFallback = unsupportedRelativeTimeViolation
+    ? sanitized.replace(PAST_CALENDAR_REFERENCE_GLOBAL, '之前')
+    : undefined;
   const violationFallback =
     actionViolation?.fallback ??
     (emotionInferenceViolation
@@ -477,7 +530,9 @@ export function guardViewerResponse(
         ? PASSIVE_AUDIENCE_FALLBACK
         : staleAudienceNameViolation
           ? PASSIVE_AUDIENCE_FALLBACK
-          : undefined);
+          : unsupportedRelativeTimeViolation
+            ? relativeTimeFallback
+            : undefined);
 
   if (context?.forceFallback) reasons.push('source_unavailable');
   if (!sanitized || unsafeArtifacts) reasons.push('unsafe_artifact');
@@ -485,6 +540,9 @@ export function guardViewerResponse(
   if (emotionInferenceViolation) reasons.push('unsupported_emotion_inference');
   if (passiveAudienceViolation) reasons.push('passive_audience_assumption');
   if (staleAudienceNameViolation) reasons.push('stale_audience_name');
+  if (unsupportedRelativeTimeViolation) {
+    reasons.push('unsupported_relative_time');
+  }
   if (HOSTILE_PHRASES.some((phrase) => sanitized.includes(phrase))) {
     reasons.push('hostile_tone');
   }
@@ -554,10 +612,21 @@ export function guardViewerResponse(
     context?.engagementDecision,
   );
   if (engagement.rewritten) reasons.push('engagement_postcondition');
+  const daypartGuard = rewriteUnsupportedEveningReference(
+    engagement.text,
+    context,
+    evidence,
+  );
+  if (daypartGuard.rewritten) {
+    reasons.push('unsupported_daypart_reference');
+  }
   return {
-    text: engagement.text,
+    text: daypartGuard.text,
     sanitizedText: sanitized,
-    rewritten: recoveredStructuredText !== null || engagement.rewritten,
+    rewritten:
+      recoveredStructuredText !== null ||
+      engagement.rewritten ||
+      daypartGuard.rewritten,
     reasons,
     unsafeArtifacts,
   };

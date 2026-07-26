@@ -4,13 +4,40 @@ import {
   buildLandfallStatus,
   buildOutlookRequiredAnswer,
   buildRequiredAnswer,
+  buildStormFeedUrl,
   extractNamedTyphoonQuery,
   extractSpecificPlace,
   intentFor,
   isAllowedGeocodeCandidate,
+  isUsableTrackSnapshot,
   selectStormsForQuestion,
   stormLocationAnswer,
 } from './query_typhoon_radar.mjs';
+
+test('uses the cached radar snapshot instead of the expensive live storm collector', () => {
+  assert.equal(
+    buildStormFeedUrl('http://127.0.0.1:3038/'),
+    'http://127.0.0.1:3038/api/radar/snapshot',
+  );
+});
+
+test('accepts only a fresh persisted track snapshot for the instant answer path', () => {
+  const now = Date.parse('2026-07-26T02:45:00.000Z');
+  assert.equal(
+    isUsableTrackSnapshot(
+      { fetchedAt: '2026-07-26T02:41:00.000Z', storms: [] },
+      now,
+    ),
+    true,
+  );
+  assert.equal(
+    isUsableTrackSnapshot(
+      { fetchedAt: '2026-07-26T02:20:00.000Z', storms: [] },
+      now,
+    ),
+    false,
+  );
+});
 
 test('recognizes genesis-outlook questions and preserves regional probability semantics', () => {
   assert.equal(intentFor('下一个台风胚胎可能在哪里，成台概率多大？'), 'outlook');
@@ -55,6 +82,7 @@ test('answers a historical named storm from its archived final classification', 
 });
 
 test('ignores the live-chat delivery prefix when extracting a named storm', () => {
+  assert.equal(extractNamedTyphoonQuery('台风到哪了'), null);
   assert.equal(
     extractNamedTyphoonQuery(
       '001号人类 的弹幕：海神是几号台风？它在2026年7月是否真实存在过？',
@@ -107,6 +135,28 @@ test('reports an empty active list without erasing recent typhoon history', () =
   );
   assert.match(answer, /当前活动台风列表是空的/);
   assert.match(answer, /不代表2026年7月没有出现过台风/);
+});
+
+test('does not announce a missing pressure sentinel as zero hectopascals', () => {
+  const answer = buildRequiredAnswer(
+    '红霞现在怎么样',
+    'storm',
+    null,
+    null,
+    [{
+      nameZh: '红霞',
+      stage: '台风',
+      maxWindMps: 38.9,
+      centerWindForceLevel: 13,
+      pressureHpa: 0,
+      observedAt: '2026-07-26T00:00:00.000Z',
+    }],
+    [],
+    { records: [] },
+  );
+
+  assert.match(answer, /中心气压未提供/);
+  assert.doesNotMatch(answer, /中心气压0百帕/);
 });
 
 test('answers a named storm that left the active feed as ended, not unavailable', () => {

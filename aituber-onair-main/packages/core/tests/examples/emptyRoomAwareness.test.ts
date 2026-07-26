@@ -245,7 +245,7 @@ describe('empty room awareness planner', () => {
     ).toBeNull();
   });
 
-  it('allows at most one passive-room turn per thirty minutes', () => {
+  it('allows a passive-room turn every configured two minutes', () => {
     const planner = new EmptyRoomAwarenessPlanner(() => 0);
     const passive = {
       ...context,
@@ -255,7 +255,6 @@ describe('empty room awareness planner', () => {
     };
     planner.markActivity(settings, 0);
     expect(planner.poll(settings, passive, 120_000)).not.toBeNull();
-    expect(planner.poll(settings, passive, 240_000)).toBeNull();
-    expect(planner.poll(settings, passive, 1_920_000)).not.toBeNull();
+    expect(planner.poll(settings, passive, 240_000)).not.toBeNull();
   });
 });

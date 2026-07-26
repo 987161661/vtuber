@@ -197,3 +197,23 @@ const receipts = await bus.dispatch(behavior);
 Adapters declare supported emotion names and action kinds. An incompatible
 adapter is skipped, and one failed renderer does not prevent other renderers
 from receiving the event.
+
+## Advanced runtime modules
+
+The package also exports composable modules for production hosts:
+
+- `OpenTelemetryLiveTelemetry` traces a turn across LLM, TTS, avatar, and
+  platform acknowledgement boundaries without recording viewer identities or
+  prompt content.
+- `StreamingSpeechPlane` coordinates incremental speech, visemes, semantic
+  beats, and immediate or beat-boundary interruption.
+- `TemporalMemoryGraph` stores bitemporal facts, provenance, contradictions,
+  retractions, and hybrid graph/vector retrieval.
+- `DeadlineAwareModelRouter` selects deep, fast, cached, or rule-based paths
+  using latency budgets, queue pressure, and circuit-breaker health.
+- `AdaptiveLocalInference` prefers ONNX Runtime WebGPU and falls back to WASM
+  behind a model-agnostic manifest and encode/decode interface.
+- `AvatarRenderRuntime` selects renderer adapters by maturity, quality, and
+  hardware capability. Local callback adapters cover Purupuru/VRM; remote
+  adapters share the same contract for MuseTalk, PersonaLive,
+  SoulX-FlashHead, and future renderers.

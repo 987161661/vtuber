@@ -1,10 +1,11 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import {
   SOUL_FAST_SYSTEM_PROMPT,
   type SoulFastRequestV1,
   type SoulReflectRequestV1,
   type SoulReflectionProposalV1,
   buildSoulFastMessages,
+  isSoulClientMutationAuthorized,
   createFastFallbackProposal,
   createReflectionLedgerInput,
   normalizeSemanticProposal,
@@ -106,6 +107,33 @@ function reflectRequest(): SoulReflectRequestV1 {
 }
 
 describe('soul runtime server protocol helpers', () => {
+  it('rejects missing and stale runtime mutation fences', () => {
+    const authorize = vi.fn(
+      ({ ownerId, leaseToken }) =>
+        ownerId === 'owner-1' && leaseToken === 'token-1',
+    );
+
+    expect(isSoulClientMutationAuthorized({}, authorize)).toBe(false);
+    expect(
+      isSoulClientMutationAuthorized(
+        {
+          'x-runtime-owner-id': 'owner-1',
+          'x-runtime-lease-token': 'stale-token',
+        },
+        authorize,
+      ),
+    ).toBe(false);
+    expect(
+      isSoulClientMutationAuthorized(
+        {
+          'x-runtime-owner-id': 'owner-1',
+          'x-runtime-lease-token': 'token-1',
+        },
+        authorize,
+      ),
+    ).toBe(true);
+  });
+
   it('parses direct JSON and performs at most one bounded fence repair', () => {
     expect(parseSoulModelJson('{"confidence":0.8}')).toEqual({
       value: { confidence: 0.8 },
@@ -269,7 +297,11 @@ describe('soul runtime server protocol helpers', () => {
       {
         output: {
           candidate_list: [
-            { type: '修复', message: '刚才是我没接好。', reasonCodes: ['repair'] },
+            {
+              type: '修复',
+              message: '刚才是我没接好。',
+              reasonCodes: ['repair'],
+            },
             { type: '回应', reasonCodes: ['missing-speech'] },
           ],
         },
@@ -300,6 +332,16 @@ describe('soul runtime server protocol helpers', () => {
       'social-evaluation',
       'attention-competition',
     ]);
+  });
+
+  it('keeps an audience turn speakable when the fast provider times out', () => {
+    const proposal = createFastFallbackProposal(fastRequest().event);
+
+    expect(proposal.candidates[0]).toMatchObject({
+      action: 'acknowledge',
+      reasonCodes: ['provider-unavailable-safe-audience-acknowledgement'],
+    });
+    expect(proposal.candidates[0].utterance?.trim()).not.toBe('');
   });
 
   it('builds a causal, non-scenario prompt and keeps credentials out', () => {

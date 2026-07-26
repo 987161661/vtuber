@@ -2,10 +2,19 @@ import { createHash } from 'node:crypto';
 import type {
   InteractionAccountingEffect,
   OperatorQueueItem,
+  OperatorQueueScope,
+  OperatorQueueSnapshotQuery,
   OperatorQueueStatus,
   PreparedSpeechPlan,
 } from '../src/lib/operatorQueue';
-import { wouldRegressCompletedDelivery } from '../src/lib/operatorQueue';
+import {
+  isOperatorQueueActiveStatus,
+  isOperatorQueueHistoryStatus,
+  operatorQueueScopesEqual,
+  projectOperatorQueueItems,
+  summarizeOperatorQueueItems,
+  wouldRegressCompletedDelivery,
+} from '../src/lib/operatorQueue';
 import type { SerializedJsonStore } from './serializedJsonStore';
 
 export type OperatorQueueRuntimeStore = SerializedJsonStore<
@@ -134,6 +143,9 @@ export function createOperatorQueueRuntime(options: {
   prepareLeaseMs?: number;
   speakLeaseMs?: number;
   maxRetries?: number;
+  archiveLegacyAfterMs?: number;
+  historyRetentionMs?: number;
+  maxHistoryItems?: number;
   onPersistenceError?: (error: unknown) => void;
   onRestoreError?: (error: unknown) => void;
 }) {
@@ -142,6 +154,10 @@ export function createOperatorQueueRuntime(options: {
   const prepareLeaseMs = options.prepareLeaseMs ?? 120_000;
   const speakLeaseMs = options.speakLeaseMs ?? 60_000;
   const maxRetries = options.maxRetries ?? 4;
+  const archiveLegacyAfterMs = options.archiveLegacyAfterMs ?? 15 * 60_000;
+  const historyRetentionMs =
+    options.historyRetentionMs ?? 30 * 24 * 60 * 60_000;
+  const maxHistoryItems = options.maxHistoryItems ?? 1_000;
   let persistenceTail: Promise<void> = Promise.resolve();
 
   function orderedItems(releaseExpired = true): OperatorQueueItem[] {
@@ -154,8 +170,27 @@ export function createOperatorQueueRuntime(options: {
       );
   }
 
-  function snapshot(releaseExpired = true): OperatorQueueItem[] {
-    return structuredClone(orderedItems(releaseExpired));
+  function snapshot(
+    queryOrReleaseExpired: OperatorQueueSnapshotQuery | boolean = true,
+  ): OperatorQueueItem[] {
+    const releaseExpired =
+      typeof queryOrReleaseExpired === 'boolean' ? queryOrReleaseExpired : true;
+    const query =
+      typeof queryOrReleaseExpired === 'boolean'
+        ? undefined
+        : queryOrReleaseExpired;
+    return projectOperatorQueueItems(
+      structuredClone(orderedItems(releaseExpired)),
+      query,
+    );
+  }
+
+  function summarize(query: OperatorQueueSnapshotQuery = {}) {
+    const summaryQuery =
+      query.view === 'history' ? { ...query, limit: 1_000 } : query;
+    return summarizeOperatorQueueItems(
+      projectOperatorQueueItems(structuredClone(orderedItems()), summaryQuery),
+    );
   }
 
   function get(eventId: string): OperatorQueueItem | undefined {
@@ -190,9 +225,68 @@ export function createOperatorQueueRuntime(options: {
         items.set(item.eventId, item);
       }
       normalizeOrder();
+      if (compactItems(now())) await persist();
     } catch (error) {
       options.onRestoreError?.(error);
     }
+  }
+
+  function compactItems(at: number, activeScope?: OperatorQueueScope): boolean {
+    let changed = false;
+    for (const item of items.values()) {
+      if (
+        isOperatorQueueActiveStatus(item.status) &&
+        !item.testRunId &&
+        activeScope &&
+        ((!item.scope && at - item.createdAt > archiveLegacyAfterMs) ||
+          (item.scope && !operatorQueueScopesEqual(item.scope, activeScope)))
+      ) {
+        item.status = 'archived';
+        item.archivedAt = at;
+        item.finishReason = item.scope
+          ? 'broadcast_session_changed'
+          : 'legacy_scope_missing';
+        item.leaseOwnerId = undefined;
+        item.leaseExpiresAt = undefined;
+        changed = true;
+      }
+    }
+
+    const history = [...items.values()]
+      .filter((item) => isOperatorQueueHistoryStatus(item.status))
+      .sort((left, right) => historyTimestamp(right) - historyTimestamp(left));
+    for (const item of history) {
+      if (at - historyTimestamp(item) <= historyRetentionMs) continue;
+      items.delete(item.eventId);
+      changed = true;
+    }
+    const retainedHistory = history.filter((item) => items.has(item.eventId));
+    for (const item of retainedHistory.slice(maxHistoryItems)) {
+      items.delete(item.eventId);
+      changed = true;
+    }
+    if (changed) normalizeOrder();
+    return changed;
+  }
+
+  async function activateScope(scope: OperatorQueueScope): Promise<number> {
+    const before = items.size;
+    const previouslyArchived = [...items.values()].filter(
+      (item) => item.status === 'archived',
+    ).length;
+    const changed = compactItems(now(), scope);
+    if (changed) await persist();
+    const archived = [...items.values()].filter(
+      (item) => item.status === 'archived',
+    ).length;
+    return Math.max(0, archived - previouslyArchived) + (before - items.size);
+  }
+
+  async function compact(): Promise<number> {
+    const before = items.size;
+    const changed = compactItems(now());
+    if (changed) await persist();
+    return before - items.size;
   }
 
   async function persist(): Promise<void> {
@@ -471,6 +565,8 @@ export function createOperatorQueueRuntime(options: {
   }
 
   return {
+    activateScope,
+    compact,
     execute,
     flushPersistence: () => persistenceTail,
     get,
@@ -482,7 +578,12 @@ export function createOperatorQueueRuntime(options: {
     restore,
     schedulePersistence,
     snapshot,
+    summarize,
   };
+}
+
+function historyTimestamp(item: OperatorQueueItem): number {
+  return item.doneAt ?? item.updatedAt ?? item.archivedAt ?? item.createdAt;
 }
 
 function mergeRoomContext(

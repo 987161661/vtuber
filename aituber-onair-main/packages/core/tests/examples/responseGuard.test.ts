@@ -42,12 +42,36 @@ describe('guardViewerResponse', () => {
     expect(result.text).toBe('这条回复出了点问题，稍后再说。');
   });
 
+  it('removes an ungrounded past-calendar claim before speech', () => {
+    const result = guardViewerResponse(
+      '修好啦～昨晚折腾一阵子，这会儿正正常常的。',
+      {
+        isWeather: false,
+        viewerText: '子安哥哥THU 的弹幕：修好了吧？',
+      },
+    );
+
+    expect(result.reasons).toContain('unsupported_relative_time');
+    expect(result.text).toBe('修好啦～之前折腾一阵子，这会儿正正常常的。');
+    expect(result.text).not.toContain('昨晚');
+  });
+
+  it('keeps a past-calendar reference supplied by the viewer', () => {
+    const result = guardViewerResponse('昨晚就修好了。', {
+      isWeather: false,
+      viewerText: '昨晚修好了吗？',
+    });
+
+    expect(result.reasons).not.toContain('unsupported_relative_time');
+    expect(result.text).toBe('昨晚就修好了。');
+  });
+
   it('removes gift-based pressure to stay', () => {
     const result = guardViewerResponse('在呢，辣条都收了还能跑了你？', {
       isWeather: false,
     });
     expect(result.reasons).toContain('gift_retention_pressure');
-    expect(result.text).toContain('投个蕉');
+    expect(result.text).toContain('充个电');
     expect(result.text).toContain('上舰支持岚台');
     expect(result.text).not.toContain('跑不了');
   });
@@ -210,7 +234,7 @@ describe('guardViewerResponse', () => {
         viewerText: '我这个一会给他看崩了吧',
       },
     );
-    const dependency = guardViewerResponse('又来一个赞，今晚就靠你们养着了～', {
+    const dependency = guardViewerResponse('又来一个赞，这场就靠你们养着了～', {
       isWeather: false,
       viewerText: '点赞',
       engagementSignals: ['like'],
@@ -259,6 +283,62 @@ describe('guardViewerResponse', () => {
     expect(paid.text).toMatch(/投个蕉|送份礼物|上舰支持岚台/u);
     expect(paid.reasons).toContain('engagement_postcondition');
     expect(free.text).not.toContain('扣个表情');
+  });
+
+  it('does not append an evening CTA during the morning even when the viewer is correcting that mistake', () => {
+    const result = guardViewerResponse(
+      '我也想快点修，一恢复我就告诉你。',
+      {
+        isWeather: false,
+        viewerText:
+          '子安哥哥THU 的弹幕：你都把今天大早上的弄成今晚了',
+        nowMs: Date.parse('2026-07-26T00:49:00.000Z'),
+        engagementDecision: {
+          version: 1,
+          decisionId:
+            'engagement:bilibili:0e1dccf9ce7c46129d14e2ad',
+          eventId: 'bilibili:0e1dccf9ce7c46129d14e2ad',
+          action: 'invite-paid-support',
+          target: 'room',
+          reasonCode: 'paid-slot-ready',
+          eligibleAt: 0,
+          snapshot: {
+            paidInRollingHour: 0,
+            nonPaidDeliveredSincePaid: 3,
+          },
+        },
+      },
+    );
+
+    expect(result.text).not.toContain('今晚');
+    expect(result.reasons).toContain('engagement_postcondition');
+  });
+
+  it('rewrites a model-generated evening reference during the morning', () => {
+    const result = guardViewerResponse(
+      '岚台要继续运转，上舰支持岚台，今晚就靠你们养着了。',
+      {
+        isWeather: false,
+        viewerText:
+          '子安哥哥THU 的弹幕：你都把今天大早上的弄成今晚了',
+        nowMs: Date.parse('2026-07-26T00:49:00.000Z'),
+      },
+    );
+
+    expect(result.text).not.toContain('今晚');
+    expect(result.text).toContain('今天');
+    expect(result.reasons).toContain('unsupported_daypart_reference');
+  });
+
+  it('keeps a viewer-requested future evening reference during the morning', () => {
+    const result = guardViewerResponse('今晚还会播一会儿。', {
+      isWeather: false,
+      viewerText: '今晚还直播吗？',
+      nowMs: Date.parse('2026-07-26T00:49:00.000Z'),
+    });
+
+    expect(result.text).toBe('今晚还会播一会儿。');
+    expect(result.reasons).not.toContain('unsupported_daypart_reference');
   });
 
   it('removes stale proactive names and silent-audience mind reading', () => {
@@ -500,4 +580,5 @@ describe('guardViewerResponse', () => {
 
     expect(result).toBe('第一句先回答问题。第二句补充必要依据。');
   });
+
 });

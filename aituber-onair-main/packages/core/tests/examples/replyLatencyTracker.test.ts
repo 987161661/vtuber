@@ -33,6 +33,7 @@ describe('reply latency tracker', () => {
       source: 'live',
     });
     tracker.record({ type: 'llm-completed', at: 160, reply: 'answer' });
+    tracker.setLlm({ provider: 'ollama-local', model: 'qwen3:8b' });
     tracker.record({ type: 'tts-requested', at: 180 });
     tracker.record({ type: 'tts-first-byte', at: 230 });
     tracker.record({ type: 'flashhead-first-frame', at: 250 });
@@ -46,6 +47,9 @@ describe('reply latency tracker', () => {
       requestId: 'request-1',
       eventId: 'event-1',
       reply: 'answer',
+      models: {
+        llm: { provider: 'ollama-local', model: 'qwen3:8b' },
+      },
       endedAt: 420,
       inputToLlmMs: 60,
       llmToTtsRequestMs: 20,

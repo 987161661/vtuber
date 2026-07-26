@@ -86,7 +86,8 @@ export function createSoulQuietEventData(input: {
       : 0,
     audiencePresent: participantCount > 0,
     participantCount,
-    audienceActivityMode: input.roomContext?.audienceActivityMode ??
+    audienceActivityMode:
+      input.roomContext?.audienceActivityMode ??
       (participantCount > 0 ? 'passive' : 'empty'),
     activeAudienceCount: Math.max(
       0,
@@ -123,18 +124,26 @@ export function minimumQuietIntervalMs(settings: EmptyRoomAwarenessSettings) {
   return Math.max(2 * 60_000, settings.minIntervalMs);
 }
 
-function scheduleDelay(settings: EmptyRoomAwarenessSettings, random: () => number) {
+function scheduleDelay(
+  settings: EmptyRoomAwarenessSettings,
+  random: () => number,
+) {
   const min = minimumQuietIntervalMs(settings);
   const max = Math.max(min, settings.maxIntervalMs);
   return Math.round(min + clampRandom(random()) * (max - min));
 }
 
-function isInsideLocalSchedule(settings: EmptyRoomAwarenessSettings, at: number) {
+function isInsideLocalSchedule(
+  settings: EmptyRoomAwarenessSettings,
+  at: number,
+) {
   if (!settings.scheduleEnabled) return true;
   const { scheduleStartHour: start, scheduleEndHour: end } = settings;
   if (start === end) return true;
   const hour = new Date(at).getHours();
-  return start < end ? hour >= start && hour < end : hour >= start || hour < end;
+  return start < end
+    ? hour >= start && hour < end
+    : hour >= start || hour < end;
 }
 
 function chooseStrategy(
@@ -142,9 +151,13 @@ function chooseStrategy(
   random: () => number,
 ) {
   const available = strategies.filter(
-    (strategy) => strategy.enabled && strategy.probability > 0 && strategy.prompt.trim(),
+    (strategy) =>
+      strategy.enabled && strategy.probability > 0 && strategy.prompt.trim(),
   );
-  const total = available.reduce((sum, strategy) => sum + strategy.probability, 0);
+  const total = available.reduce(
+    (sum, strategy) => sum + strategy.probability,
+    0,
+  );
   if (!total) return null;
   let cursor = clampRandom(random()) * total;
   for (const strategy of available) {
@@ -171,8 +184,9 @@ function audienceContext(context: EmptyRoomAwarenessContext) {
       : '- 当前没有检测到观众。';
   }
   return context.audienceMembers
-    .map((member) =>
-      `- ${member.name ? `@${member.name}` : member.id || '未命名观众'}（平台：${member.platform || '未知'}；进入：${formatPromptTime(member.enteredAt)}；最后真实发言：${formatPromptTime(member.lastInteractionAt)}；累计发言：${member.messageCount}）`,
+    .map(
+      (member) =>
+        `- ${member.name ? `@${member.name}` : member.id || '未命名观众'}（平台：${member.platform || '未知'}；进入：${formatPromptTime(member.enteredAt)}；最后真实发言：${formatPromptTime(member.lastInteractionAt)}；累计发言：${member.messageCount}）`,
     )
     .join('\n');
 }
@@ -181,7 +195,6 @@ export class EmptyRoomAwarenessPlanner {
   private readonly random: () => number;
   private readonly personaRuntime: PersonaRuntimeState;
   private nextAt = 0;
-  private lastPassiveSpeechAt = 0;
 
   constructor(
     random: () => number = Math.random,
@@ -197,7 +210,6 @@ export class EmptyRoomAwarenessPlanner {
 
   reset() {
     this.nextAt = 0;
-    this.lastPassiveSpeechAt = 0;
   }
 
   getNextAt() {
@@ -219,19 +231,14 @@ export class EmptyRoomAwarenessPlanner {
     }
     if (at < this.nextAt) return false;
     this.markActivity(settings, at);
-    if (!isInsideLocalSchedule(settings, at) || !context.isLive || context.busy) {
+    if (
+      !isInsideLocalSchedule(settings, at) ||
+      !context.isLive ||
+      context.busy
+    ) {
       return false;
     }
     if (context.audienceActivityMode === 'likely-resting') return false;
-    if (context.engageableAudienceCount <= 0) {
-      if (
-        this.lastPassiveSpeechAt > 0 &&
-        at - this.lastPassiveSpeechAt < 30 * 60_000
-      ) {
-        return false;
-      }
-      this.lastPassiveSpeechAt = at;
-    }
     return true;
   }
 
@@ -244,11 +251,12 @@ export class EmptyRoomAwarenessPlanner {
 
     const strategy = chooseStrategy(settings.behaviorStrategies, this.random);
     if (!strategy) return null;
-    const personaIntent = this.personaRuntime.planProactive(
+    const personaIntent = this.personaRuntime.tryPlanProactive(
       context,
       strategy.id,
       at,
     );
+    if (!personaIntent) return null;
 
     const prompt = `<empty_room_awareness>
 这是直播总控在持续没有互动时触发的一次内部意识脉冲，不是观众消息。

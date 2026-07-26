@@ -8,8 +8,40 @@ export type OperatorQueueStatus =
   | 'done'
   | 'skipped'
   | 'failed'
+  | 'archived'
   /** Persistence tombstone; queue snapshots never expose deleted items. */
   | 'deleted';
+
+export type OperatorQueueScope = {
+  personaId: string;
+  platform: string;
+  roomId: string;
+  sessionId: string;
+};
+
+export type OperatorQueueView = 'all' | 'session' | 'history';
+
+export type OperatorQueueListOptions = {
+  observer?: string;
+  view?: OperatorQueueView;
+  scope?: OperatorQueueScope;
+  limit?: number;
+  includeTestRuns?: boolean;
+};
+
+export type OperatorQueueSnapshotQuery = Omit<
+  OperatorQueueListOptions,
+  'observer'
+>;
+
+export type OperatorQueueSummary = {
+  total: number;
+  active: number;
+  done: number;
+  skipped: number;
+  failed: number;
+  archived: number;
+};
 
 /**
  * Serializable SpeechPlan subset kept with a prepared queue item.  Keeping
@@ -66,6 +98,9 @@ export type OperatorQueueItem = {
   updatedAt: number;
   order: number;
   status: OperatorQueueStatus;
+  /** Broadcast session that owns this turn. Missing means pre-scope legacy data. */
+  scope?: OperatorQueueScope;
+  archivedAt?: number;
   preparedReply?: string;
   /** Original structured output used by the TTS/animation execution path. */
   preparedSpeechPlan?: PreparedSpeechPlan;
@@ -129,12 +164,10 @@ export type OperatorQueueIngestInput = {
   engagementSignals?: OperatorQueueItem['engagementSignals'];
   presenceOnly?: boolean;
   createdAt?: number;
+  scope?: OperatorQueueScope;
 };
 
-type QueueRequest = (
-  input: string,
-  init?: RequestInit,
-) => Promise<Response>;
+type QueueRequest = (input: string, init?: RequestInit) => Promise<Response>;
 
 export type OperatorQueueClientOptions = {
   request: QueueRequest;
@@ -191,6 +224,98 @@ export function isStaleReadyReply(
   );
 }
 
+export function isOperatorQueueActiveStatus(
+  status: OperatorQueueStatus,
+): boolean {
+  return ['pending', 'preparing', 'ready', 'speaking'].includes(status);
+}
+
+export function isOperatorQueueHistoryStatus(
+  status: OperatorQueueStatus,
+): boolean {
+  return ['done', 'skipped', 'failed', 'archived'].includes(status);
+}
+
+export function operatorQueueScopesEqual(
+  left: OperatorQueueScope | undefined,
+  right: OperatorQueueScope | undefined,
+): boolean {
+  return Boolean(
+    left &&
+      right &&
+      left.personaId === right.personaId &&
+      left.platform === right.platform &&
+      left.roomId === right.roomId &&
+      left.sessionId === right.sessionId,
+  );
+}
+
+export function appendOperatorQueueQuery(
+  path: string,
+  options: OperatorQueueListOptions,
+): string {
+  const url = new URL(path, 'http://operator-queue.local');
+  if (options.observer) url.searchParams.set('observer', options.observer);
+  if (options.view) url.searchParams.set('view', options.view);
+  if (options.limit) url.searchParams.set('limit', String(options.limit));
+  if (options.includeTestRuns) url.searchParams.set('includeTestRuns', '1');
+  if (options.scope) {
+    url.searchParams.set('personaId', options.scope.personaId);
+    url.searchParams.set('platform', options.scope.platform);
+    url.searchParams.set('roomId', options.scope.roomId);
+    url.searchParams.set('sessionId', options.scope.sessionId);
+  }
+  return `${url.pathname}${url.search}`;
+}
+
+export function projectOperatorQueueItems(
+  items: readonly OperatorQueueItem[],
+  query: OperatorQueueSnapshotQuery = {},
+): OperatorQueueItem[] {
+  const view = query.view ?? 'all';
+  if (view === 'all') return [...items];
+
+  if (view === 'history') {
+    const limit = Math.max(1, Math.min(1_000, query.limit ?? 200));
+    return items
+      .filter(
+        (item) =>
+          isOperatorQueueHistoryStatus(item.status) &&
+          (!query.scope || operatorQueueScopesEqual(item.scope, query.scope)),
+      )
+      .sort(
+        (left, right) =>
+          (right.doneAt ?? right.archivedAt ?? right.updatedAt) -
+          (left.doneAt ?? left.archivedAt ?? left.updatedAt),
+      )
+      .slice(0, limit);
+  }
+
+  if (!query.scope) return [];
+  return items.filter(
+    (item) =>
+      operatorQueueScopesEqual(item.scope, query.scope) ||
+      (query.includeTestRuns && Boolean(item.testRunId)),
+  );
+}
+
+export function summarizeOperatorQueueItems(
+  items: readonly OperatorQueueItem[],
+): OperatorQueueSummary {
+  return items.reduce<OperatorQueueSummary>(
+    (summary, item) => {
+      summary.total += 1;
+      if (isOperatorQueueActiveStatus(item.status)) summary.active += 1;
+      if (item.status === 'done') summary.done += 1;
+      if (item.status === 'skipped') summary.skipped += 1;
+      if (item.status === 'failed') summary.failed += 1;
+      if (item.status === 'archived') summary.archived += 1;
+      return summary;
+    },
+    { total: 0, active: 0, done: 0, skipped: 0, failed: 0, archived: 0 },
+  );
+}
+
 export function createOperatorQueueClient(options: OperatorQueueClientOptions) {
   const now = options.now ?? Date.now;
   const createId = options.createId ?? (() => crypto.randomUUID());
@@ -202,13 +327,13 @@ export function createOperatorQueueClient(options: OperatorQueueClientOptions) {
     });
 
   return {
-    async list(observer?: string): Promise<OperatorQueueItem[]> {
-      const suffix = observer
-        ? `?observer=${encodeURIComponent(observer)}`
-        : '';
-      const response = await options.request(`/api/operator-queue${suffix}`, {
-        cache: 'no-store',
-      });
+    async list(
+      input?: string | OperatorQueueListOptions,
+    ): Promise<OperatorQueueItem[]> {
+      const listOptions =
+        typeof input === 'string' ? { observer: input } : (input ?? {});
+      const path = appendOperatorQueueQuery('/api/operator-queue', listOptions);
+      const response = await options.request(path, { cache: 'no-store' });
       if (!response.ok) {
         throw new Error(`operator queue list failed (${response.status})`);
       }
@@ -216,6 +341,31 @@ export function createOperatorQueueClient(options: OperatorQueueClientOptions) {
         items?: OperatorQueueItem[];
       };
       return Array.isArray(payload.items) ? payload.items : [];
+    },
+
+    async page(
+      input: OperatorQueueListOptions,
+    ): Promise<{ items: OperatorQueueItem[]; summary: OperatorQueueSummary }> {
+      const path = appendOperatorQueueQuery('/api/operator-queue', input);
+      const response = await options.request(path, { cache: 'no-store' });
+      if (!response.ok) {
+        throw new Error(`operator queue page failed (${response.status})`);
+      }
+      const payload = (await response.json()) as {
+        items?: OperatorQueueItem[];
+        summary?: OperatorQueueSummary;
+      };
+      return {
+        items: Array.isArray(payload.items) ? payload.items : [],
+        summary: payload.summary ?? {
+          total: 0,
+          active: 0,
+          done: 0,
+          skipped: 0,
+          failed: 0,
+          archived: 0,
+        },
+      };
     },
 
     async ingest(input: OperatorQueueIngestInput): Promise<void> {
@@ -233,7 +383,10 @@ export function createOperatorQueueClient(options: OperatorQueueClientOptions) {
       );
     },
 
-    async manualBroadcast(text: string): Promise<boolean> {
+    async manualBroadcast(
+      text: string,
+      scope?: OperatorQueueScope,
+    ): Promise<boolean> {
       const preparedReply = text.trim();
       if (!preparedReply) return false;
       const response = await post({
@@ -246,6 +399,7 @@ export function createOperatorQueueClient(options: OperatorQueueClientOptions) {
         viewerName: '主播总控',
         sourcesSeen: ['operator-manual'],
         createdAt: now(),
+        scope,
         auditActor: 'control-room',
       });
       if (!response.ok) {

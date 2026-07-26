@@ -44,6 +44,7 @@ export {
   createSubjectiveFrame,
   parseBestEffortJsonObject,
   parseSemanticProposal,
+  parseStrictSemanticProposal,
 } from './model.js';
 export type {
   CreateSubjectiveFrameOptions,
@@ -61,6 +62,15 @@ export type {
   SubjectiveGoalV1,
   SubjectiveMemoryRefV1,
 } from './model.js';
+export {
+  SOUL_REFLECTION_PROPOSAL_SCHEMA_V1,
+  SOUL_SEMANTIC_PROPOSAL_SCHEMA_V1,
+  createStrictStructuredOutputProtocol,
+} from './structured-output.js';
+export type {
+  JsonSchemaV1,
+  StrictStructuredOutputProtocol,
+} from './structured-output.js';
 export {
   SoulScopeMismatchError,
   applySoulEvent,
@@ -94,6 +104,7 @@ export {
   SoulSnapshotRestoreError,
   createSoulRuntime,
   restoreSoulRuntime,
+  serializeSoulRuntime,
   validateSoulSnapshotCompatibility,
 } from './runtime.js';
 export type {
@@ -101,3 +112,4 @@ export type {
   SoulRuntimeOptions,
   SoulRuntimeRestoreOptions,
 } from './runtime.js';
+export { hashValue, matchesHashValue, stableStringify } from './utils.js';

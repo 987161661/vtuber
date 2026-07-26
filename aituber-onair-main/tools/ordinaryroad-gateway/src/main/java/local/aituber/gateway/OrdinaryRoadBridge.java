@@ -94,12 +94,20 @@ public final class OrdinaryRoadBridge {
     String action = string(command.get("action"));
     String commandId = string(command.get("commandId"));
     if ("connect".equals(action)) {
-      connect(
-          required(command, "connectionId"),
-          required(command, "platform"),
-          required(command, "roomId"),
-          string(command.get("cookie"))
-      );
+      String connectionId = required(command, "connectionId");
+      String platform = required(command, "platform");
+      String roomId = required(command, "roomId");
+      try {
+        connect(connectionId, platform, roomId, string(command.get("cookie")));
+      } catch (Exception error) {
+        emit("connection", Map.of(
+            "connectionId", connectionId,
+            "platform", platform,
+            "roomId", roomId,
+            "state", "error",
+            "error", safeError(error)
+        ));
+      }
       return;
     }
     if ("disconnect".equals(action)) {
@@ -217,16 +225,16 @@ public final class OrdinaryRoadBridge {
   private BilibiliLiveChatClient createBilibili(String id, String room, String cookie) {
     BilibiliLiveChatClientConfig config = new BilibiliLiveChatClientConfig();
     configure(config, room, cookie);
-    // The compressed Bilibili path in this OrdinaryRoad build can decode GBK
-    // danmaku as UTF-8, turning @上海 into replacement characters before the
-    // Node bridge sees it. The uncompressed protocol retains the original
-    // UTF-8 JSON payload and is adequate for this single-room local relay.
-    config.setProtover(ProtoverEnum.NORMAL_NO_COMPRESSION);
+    // Bilibili currently resets some uncompressed WebSocket handshakes before
+    // authentication completes. Use the library's supported default protocol;
+    // the bridge stdout is explicitly UTF-8, so Chinese danmaku remains intact
+    // on the Node JSON-lines boundary.
+    config.setProtover(ProtoverEnum.NORMAL_BROTLI);
     return new BilibiliLiveChatClient(config, new IBilibiliMsgListener() {
       public void onDanmuMsg(DanmuMsgMsg msg) { publishDanmu(id, "bilibili", room, msg, "comment"); }
       public void onGiftMsg(SendGiftMsg msg) { publishGift(id, "bilibili", room, msg); }
       public void onSuperChatMsg(SuperChatMessageMsg msg) { publishDanmu(id, "bilibili", room, msg, "superchat"); }
-      public void onEnterRoomMsg(InteractWordMsg msg) { publishEntry(id, "bilibili", room, msg); }
+      public void onEnterRoomMsg(InteractWordMsg msg) { publishBilibiliEntry(id, room, msg); }
       @Override
       public void onMsg(IMsg rawMsg) {
         // IBaseMsgListener guarantees this callback for every decoded packet,
@@ -307,6 +315,23 @@ public final class OrdinaryRoadBridge {
     publishEvent(id, platform, room, "entry", msg.getUid(), msg.getUsername(), msg.getUserAvatar(), "", Map.of());
   }
 
+  private void publishBilibiliEntry(String id, String room, InteractWordMsg msg) {
+    Map<String, Object> metadata = new LinkedHashMap<>();
+    InteractWordMsg.Data data = msg.getData();
+    int msgType = data == null ? 0 : data.getMsg_type();
+    String eventType = bilibiliInteractionEventType(msgType);
+    if (eventType.isBlank()) return;
+    metadata.put("msgType", msgType);
+    if (data != null) {
+      String eventRoom = data.getRoomid() > 0 ? String.valueOf(data.getRoomid()) : room;
+      addBilibiliRoomFanMetadata(metadata, eventRoom, data.getFans_medal());
+    }
+    publishEvent(
+        id, "bilibili", room, eventType, msg.getUid(), msg.getUsername(),
+        msg.getUserAvatar(), "", metadata
+    );
+  }
+
   /**
    * OrdinaryRoad 1.5.8 only declares INTERACT_WORD in BilibiliCmdEnum. Bilibili
    * currently sends ordinary viewer arrivals as INTERACT_WORD_V2, which the
@@ -345,17 +370,75 @@ public final class OrdinaryRoadBridge {
       }
     }
     if (uid.isBlank() && username.isBlank()) return;
+    Map<String, Object> metadata = new LinkedHashMap<>();
+    metadata.put("command", "INTERACT_WORD_V2");
+    int msgType = interaction.path("msg_type").asInt(0);
+    String eventType = bilibiliInteractionEventType(msgType);
+    if (eventType.isBlank()) return;
+    metadata.put("msgType", msgType);
+    String eventRoom = jsonText(interaction, "roomid");
+    addBilibiliRoomFanMetadata(
+        metadata, eventRoom.isBlank() ? roomId : eventRoom, interaction.get("fans_medal")
+    );
     publishEvent(
         connectionId,
         "bilibili",
         roomId,
-        "entry",
+        eventType,
         uid.isBlank() ? username : uid,
         username.isBlank() ? "观众" : username,
         avatar,
         "",
-        Map.of("command", "INTERACT_WORD_V2")
+        metadata
     );
+  }
+
+  private static String bilibiliInteractionEventType(int msgType) {
+    return switch (msgType) {
+      case 0, 1 -> "entry";
+      case 2 -> "follow";
+      default -> "";
+    };
+  }
+
+  private static void addBilibiliRoomFanMetadata(
+      Map<String, Object> metadata, String roomId, InteractWordMsg.Fans_medal medal
+  ) {
+    String medalName = medal == null ? "" : string(medal.getMedal_name());
+    if (medal == null || medalName.isBlank()) return;
+    if (!sameNumericId(roomId, medal.getAnchor_roomid())) return;
+    addVerifiedFanMetadata(
+        metadata, medalName, Byte.toUnsignedInt(medal.getMedal_level())
+    );
+  }
+
+  private static void addBilibiliRoomFanMetadata(
+      Map<String, Object> metadata, String roomId, JsonNode medal
+  ) {
+    if (medal == null || !medal.isObject()) return;
+    String medalName = jsonText(medal, "medal_name");
+    long anchorRoomId = medal.path("anchor_roomid").asLong(0);
+    if (medalName.isBlank() || !sameNumericId(roomId, anchorRoomId)) return;
+    addVerifiedFanMetadata(metadata, medalName, medal.path("medal_level").asInt(0));
+  }
+
+  private static void addVerifiedFanMetadata(
+      Map<String, Object> metadata, String medalName, int medalLevel
+  ) {
+    metadata.put("viewerRelation", "fan");
+    metadata.put("viewerRelationState", "verified");
+    metadata.put("viewerRelationEvidence", "room-fans-medal");
+    metadata.put("fanMedalName", medalName);
+    metadata.put("fanMedalLevel", Math.max(0, medalLevel));
+  }
+
+  private static boolean sameNumericId(String left, long right) {
+    if (right <= 0) return false;
+    try {
+      return Long.parseLong(left.trim()) == right;
+    } catch (NumberFormatException ignored) {
+      return false;
+    }
   }
 
   private void publishLike(String id, String platform, String room, ILikeMsg msg) {

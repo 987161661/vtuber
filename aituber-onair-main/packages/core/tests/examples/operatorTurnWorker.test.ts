@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
+  coordinatorGenerationStagesForReadyTurn,
   ownsOperatorAttempt,
   planOperatorTurnWork,
 } from '../../examples/react-purupuru-app/src/lib/operatorTurnWorker';
@@ -40,6 +41,21 @@ const runtime = {
 };
 
 describe('operator turn worker', () => {
+  it('completes generation for a ready turn already selected by the coordinator', () => {
+    expect(
+      coordinatorGenerationStagesForReadyTurn('proactive-1', 'proactive-1'),
+    ).toEqual(['completed']);
+  });
+
+  it('starts and completes generation when the ready turn is not active yet', () => {
+    expect(
+      coordinatorGenerationStagesForReadyTurn('viewer-1', 'gift-1'),
+    ).toEqual(['started', 'completed']);
+    expect(
+      coordinatorGenerationStagesForReadyTurn(undefined, 'gift-1'),
+    ).toEqual(['started', 'completed']);
+  });
+
   it('selects only scope-valid work assigned to this runtime owner', () => {
     const wrongOwner = item('wrong-owner', 'pending', {
       assignedOwnerId: 'owner-2',

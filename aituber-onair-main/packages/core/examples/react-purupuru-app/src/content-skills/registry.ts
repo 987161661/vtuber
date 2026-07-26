@@ -1,5 +1,7 @@
 import type { ContentSkillDefinition } from './types';
 
+export const FAN_ENTRY_WELCOME_SKILL_ID = 'fan-entry-welcome';
+
 /**
  * Content skills are selected per digital human. Runtime paths and endpoints
  * belong to deployment configuration, not this registry or persona data.
@@ -9,6 +11,12 @@ export const CONTENT_SKILLS = [
     id: 'typhoon-boss-radar',
     name: '台风专业主播',
     summary: '回答台风实况、路径、风力、预警与 Typhoon Boss 雷达界面问题。',
+  },
+  {
+    id: FAN_ENTRY_WELCOME_SKILL_ID,
+    name: '粉丝进房问候',
+    summary:
+      '识别已确认粉丝并按关系亲密度主动问候；小房间也会欢迎其他有名字的观众，短时重进自动冷却。',
   },
 ] as const satisfies readonly ContentSkillDefinition[];
 

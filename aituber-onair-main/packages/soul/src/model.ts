@@ -16,6 +16,12 @@ import type {
   SoulTruthMode,
 } from './contracts.js';
 import { clamp, deepClone, unique } from './utils.js';
+import {
+  SOUL_REFLECTION_PROPOSAL_SCHEMA_V1,
+  SOUL_SEMANTIC_PROPOSAL_SCHEMA_V1,
+  createStrictStructuredOutputProtocol,
+  type JsonSchemaV1,
+} from './structured-output.js';
 
 export interface SubjectiveGoalV1 {
   id: string;
@@ -147,7 +153,12 @@ export interface MiniMaxM3TransportRequestV1 {
   maxCompletionTokens: number;
   thinking: { type: 'disabled' | 'adaptive' };
   reasoningSplit: boolean;
-  responseFormat: { type: 'json_object' };
+  responseFormat:
+    | { type: 'json_object' }
+    | {
+        type: 'json_schema';
+        json_schema: { name: string; strict: true; schema: JsonSchemaV1 };
+      };
   stream: true;
 }
 
@@ -156,6 +167,7 @@ export interface MiniMaxM3TransportRequestV1 {
  * retries, streaming aggregation, and cancellation.
  */
 export interface MiniMaxM3Transport {
+  readonly structuredOutput?: 'json-object' | 'json-schema';
   complete(request: MiniMaxM3TransportRequestV1): Promise<string>;
 }
 
@@ -200,6 +212,7 @@ export class MiniMaxM3SoulAdapter implements SoulModelAdapter {
   async proposeFast(
     request: SoulFastModelRequestV1,
   ): Promise<SemanticProposalV1> {
+    const strict = this.transport.structuredOutput === 'json-schema';
     const raw = await this.transport.complete(
       createTransportRequest(
         this.modelProfile.fast,
@@ -210,18 +223,28 @@ export class MiniMaxM3SoulAdapter implements SoulModelAdapter {
           frame: request.frame,
           event: compactEvent(request.event),
         }),
+        strict
+          ? {
+              name: 'soul_semantic_proposal_v1',
+              schema: SOUL_SEMANTIC_PROPOSAL_SCHEMA_V1,
+            }
+          : undefined,
       ),
     );
-    return parseSemanticProposal(raw, {
+    const context = {
       eventId: request.event.id,
       scope: request.event.scope,
       modelProfileId: this.modelProfile.id,
-    });
+    };
+    return strict
+      ? parseStrictSemanticProposal(raw, context)
+      : parseSemanticProposal(raw, context);
   }
 
   async reflectSlow(
     request: SoulSlowModelRequestV1,
   ): Promise<SoulReflectionProposalV1> {
+    const strict = this.transport.structuredOutput === 'json-schema';
     const raw = await this.transport.complete(
       createTransportRequest(
         this.modelProfile.slow,
@@ -233,9 +256,15 @@ export class MiniMaxM3SoulAdapter implements SoulModelAdapter {
           ledgerSummary: request.ledgerSummary,
           reflectionId: request.reflectionId,
         }),
+        strict
+          ? {
+              name: 'soul_reflection_proposal_v1',
+              schema: SOUL_REFLECTION_PROPOSAL_SCHEMA_V1,
+            }
+          : undefined,
       ),
     );
-    return parseReflectionProposal(raw, request);
+    return parseReflectionProposal(raw, request, strict);
   }
 }
 
@@ -342,6 +371,44 @@ export function parseSemanticProposal(
   };
 }
 
+interface StrictSemanticProposalPayloadV1 {
+  protocolVersion: '1.0';
+  confidence: number;
+  attribution: SemanticProposalV1['attribution'];
+  evidence: readonly SemanticEvidenceV1[];
+  candidates: readonly SoulActionCandidateV1[];
+}
+
+const strictSemanticProposalProtocol =
+  createStrictStructuredOutputProtocol<StrictSemanticProposalPayloadV1>({
+    id: 'Strict semantic proposal',
+    schema: SOUL_SEMANTIC_PROPOSAL_SCHEMA_V1,
+  });
+
+const strictReflectionProposalProtocol =
+  createStrictStructuredOutputProtocol<Record<string, unknown>>({
+    id: 'Strict reflection proposal',
+    schema: SOUL_REFLECTION_PROPOSAL_SCHEMA_V1,
+  });
+
+export function parseStrictSemanticProposal(
+  raw: string,
+  context: ParseSemanticProposalContext,
+): SemanticProposalV1 {
+  const payload = strictSemanticProposalProtocol.parse(raw);
+  return {
+    protocolVersion: '1.0',
+    eventId: context.eventId,
+    scope: deepClone(context.scope),
+    modelProfileId: context.modelProfileId,
+    confidence: payload.confidence,
+    attribution: payload.attribution,
+    evidence: deepClone(payload.evidence),
+    candidates: deepClone(payload.candidates),
+    repairNotes: [],
+  };
+}
+
 export function parseBestEffortJsonObject(
   raw: string,
   repairNotes: string[] = [],
@@ -374,9 +441,12 @@ export function parseBestEffortJsonObject(
 function parseReflectionProposal(
   raw: string,
   request: SoulSlowModelRequestV1,
+  strict = false,
 ): SoulReflectionProposalV1 {
   const repairNotes: string[] = [];
-  const parsed = parseBestEffortJsonObject(raw, repairNotes);
+  const parsed = strict
+    ? strictReflectionProposalProtocol.parse(raw)
+    : parseBestEffortJsonObject(raw, repairNotes);
   const goalWeightDeltas = (arrayValue(parsed.goalWeightDeltas) ?? [])
     .map((item) => objectValue(item))
     .filter((item): item is Record<string, unknown> => item !== undefined)
@@ -541,6 +611,7 @@ function createTransportRequest(
   profile: MiniMaxM3PhaseProfileV1,
   system: string,
   user: string,
+  structured?: { name: string; schema: JsonSchemaV1 },
 ): MiniMaxM3TransportRequestV1 {
   return {
     model: profile.model,
@@ -552,7 +623,16 @@ function createTransportRequest(
     maxCompletionTokens: profile.maxCompletionTokens,
     thinking: { type: profile.thinking },
     reasoningSplit: profile.reasoningSplit,
-    responseFormat: { type: 'json_object' },
+    responseFormat: structured
+      ? {
+          type: 'json_schema',
+          json_schema: {
+            name: structured.name,
+            strict: true,
+            schema: structured.schema,
+          },
+        }
+      : { type: 'json_object' },
     stream: true,
   };
 }

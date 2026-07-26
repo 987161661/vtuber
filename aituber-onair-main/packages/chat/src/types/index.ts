@@ -4,7 +4,7 @@
  */
 
 // Chat related type definitions
-export {
+export type {
   Message,
   MessageWithVision,
   VisionBlock,

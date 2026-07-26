@@ -40,7 +40,13 @@ are always rejected by this API and must use the separate canon review flow.
   fields, or mutate state without observed allowlisted evidence and an explicit
   policy approval.
 
-State and chain hashes are deterministic integrity checks for replay and
-accidental corruption, not cryptographic signatures. Persist the ledger head in
-a trusted service or sign it externally when adversarial tamper resistance is
-required.
+State and chain hashes use SHA-256 as deterministic integrity checks. Restore
+also accepts legacy FNV-1a hashes so existing ledgers can be migrated without
+rewriting history. A digest is not an authenticated signature: persist the
+ledger head in a trusted service or sign it externally when adversarial tamper
+resistance is required.
+
+For durable Node.js deployments, `@aituber-onair/soul-sqlite` provides a WAL
+SQLite ledger, atomic outbox commits, leases, retries, and acknowledgements.
+Wrap state-changing runtime calls with `serializeSoulRuntime(runtime)` when
+multiple asynchronous producers share one soul instance.

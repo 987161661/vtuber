@@ -15,7 +15,14 @@ export interface PlatformCapabilities {
   outbound: boolean;
   credential: boolean;
   events: Array<
-    'comment' | 'gift' | 'superchat' | 'entry' | 'like' | 'status' | 'stats'
+    | 'comment'
+    | 'gift'
+    | 'superchat'
+    | 'entry'
+    | 'follow'
+    | 'like'
+    | 'status'
+    | 'stats'
   >;
 }
 
@@ -65,6 +72,7 @@ export const ORDINARYROAD_PLATFORMS: ConnectorPlatformManifest[] = [
         'gift',
         'superchat',
         'entry',
+        'follow',
         'like',
         'status',
         'stats',

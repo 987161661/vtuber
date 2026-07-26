@@ -13,6 +13,22 @@ const WORKSPACE_RUNTIME_CHUNKS = [
 ] as const;
 
 const APPLICATION_RUNTIME_CHUNKS = [
+  ['/react-purupuru-app/src/components/controlroom.tsx', 'control-room'],
+  ['/react-purupuru-app/src/components/settingspanel.tsx', 'settings-panel'],
+  ['/react-purupuru-app/src/lib/liveoperation.ts', 'host-runtime'],
+  ['/react-purupuru-app/src/lib/runtimerecovery.ts', 'host-runtime'],
+  ['/react-purupuru-app/src/lib/livesessionauthority.ts', 'host-runtime'],
+  ['/react-purupuru-app/src/lib/livesessionlifecycle.ts', 'host-runtime'],
+  ['/react-purupuru-app/src/lib/livestartupguide.ts', 'host-runtime'],
+  [
+    '/react-purupuru-app/src/lib/operatorconfigurationprofile.ts',
+    'profile-runtime',
+  ],
+  ['/react-purupuru-app/src/lib/operatorpreflight.ts', 'profile-runtime'],
+  [
+    '/react-purupuru-app/src/lib/viewerinteractionaccounting.ts',
+    'host-runtime',
+  ],
   ['/react-purupuru-app/src/config/characterprofile.ts', 'profile-runtime'],
   ['/react-purupuru-app/src/config/memoryarchiveseed.ts', 'profile-runtime'],
   ['/react-purupuru-app/src/components/avatarpanel.tsx', 'avatar-runtime'],

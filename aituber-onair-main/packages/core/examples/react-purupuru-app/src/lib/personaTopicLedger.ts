@@ -1,3 +1,5 @@
+import type { IdleExpressionMode } from './idleThoughtComposer';
+
 export type ProactiveContinuity = 'new' | 'continue' | 'close';
 
 export interface PersonaTopicEntry {
@@ -8,6 +10,7 @@ export interface PersonaTopicEntry {
   continuity: ProactiveContinuity;
   spokenAt: number;
   audienceResponded: boolean;
+  expressionMode?: IdleExpressionMode;
 }
 
 export interface PersonaTopicCandidate {
@@ -137,10 +140,19 @@ export class PersonaTopicLedger {
   private readonly cooldownTurns: number;
   private readonly cooldownMs: number;
 
-  constructor(maxEntries = 12, cooldownTurns = 6, cooldownMs = 30 * 60_000) {
+  constructor(
+    maxEntries = 12,
+    cooldownTurns = 6,
+    cooldownMs = 30 * 60_000,
+    initialEntries: readonly PersonaTopicEntry[] = [],
+  ) {
     this.maxEntries = maxEntries;
     this.cooldownTurns = cooldownTurns;
     this.cooldownMs = cooldownMs;
+    this.entries = initialEntries.slice(-maxEntries).map((entry) => ({
+      ...entry,
+      entities: [...entry.entities],
+    }));
   }
 
   snapshot() {

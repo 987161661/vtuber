@@ -9,6 +9,11 @@ import type {
   LiveHostSnapshot,
   LiveHostTurn,
 } from './types.js';
+import {
+  NOOP_LIVE_TELEMETRY,
+  createLiveTelemetryRecord,
+  type LiveTelemetrySink,
+} from './telemetry.js';
 
 type PendingTurnStage = 'queued' | 'generating' | 'ready';
 
@@ -58,9 +63,14 @@ export class LiveHostCoordinator {
   private lastDecisionReason = 'initial_state';
   private lastQueuedLikeAt?: number;
   private readonly policy: LiveHostPolicy;
+  private readonly telemetry: LiveTelemetrySink;
 
-  constructor(policy: Partial<LiveHostPolicy> = {}) {
+  constructor(
+    policy: Partial<LiveHostPolicy> = {},
+    telemetry: LiveTelemetrySink = NOOP_LIVE_TELEMETRY,
+  ) {
     this.policy = { ...DEFAULT_LIVE_HOST_POLICY, ...policy };
+    this.telemetry = telemetry;
   }
 
   updatePolicy(policy: Partial<LiveHostPolicy>) {
@@ -73,7 +83,15 @@ export class LiveHostCoordinator {
     if (decisions.length) {
       this.lastDecisionReason = decisions[decisions.length - 1].reasonCode;
     }
-    return this.toActions(event, decisions);
+    const actions = this.toActions(event, decisions);
+    try {
+      this.telemetry.record(
+        createLiveTelemetryRecord(event, actions, this.snapshot()),
+      );
+    } catch {
+      // Observability must never become a second failure path for the host.
+    }
+    return actions;
   }
 
   snapshot(): LiveHostSnapshot {

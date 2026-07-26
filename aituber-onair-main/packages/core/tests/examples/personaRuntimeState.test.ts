@@ -24,6 +24,107 @@ const context: EmptyRoomAwarenessContext = {
 };
 
 describe('PersonaRuntimeState', () => {
+  it('uses the full bounded memory window instead of repeating the first four cues', () => {
+    const runtime = new PersonaRuntimeState();
+    const memoryDetails = [
+      ['深夜歌单', '一首有空间感的音乐'],
+      ['悬疑故事', '一个没有解释完的结局'],
+      ['咸味零食', '控制台旁的一包海苔'],
+      ['老朋友', '一次很久以前的重逢'],
+      ['节目开场', '想试一次更短的开场'],
+      ['旧外套', '袖口已经磨得发白'],
+      ['纸质地图', '折痕刚好穿过海岸线'],
+      ['窗边植物', '新叶朝着灯光生长'],
+    ] as const;
+    const memoryRichContext: EmptyRoomAwarenessContext = {
+      ...context,
+      interfaceContext: '',
+      engageableAudienceCount: 0,
+      memoryCues: memoryDetails.map(([title, content], index) => ({
+        id: `memory-${index + 1}`,
+        title,
+        content,
+      })),
+    };
+    const selectedMemoryRefs = new Set<string>();
+
+    for (let index = 0; index < 8; index += 1) {
+      const plan = runtime.tryPlanProactive(
+        memoryRichContext,
+        'memory-association',
+        1_000 + index * 1_000,
+      );
+      expect(plan).not.toBeNull();
+      if (!plan) break;
+      if (plan.source === 'memory' && plan.sourceRef) {
+        selectedMemoryRefs.add(plan.sourceRef);
+      }
+      runtime.commitProactive(plan, 1_000 + index * 1_000);
+    }
+
+    expect(
+      [...selectedMemoryRefs].some((sourceRef) =>
+        sourceRef.includes('节目开场'),
+      ),
+    ).toBe(true);
+  });
+
+  it('stays silent after all safe topics are cooling', () => {
+    const runtime = new PersonaRuntimeState();
+    const sparseContext: EmptyRoomAwarenessContext = {
+      ...context,
+      audiencePresent: false,
+      participantCount: 0,
+      activeAudienceCount: 0,
+      engageableAudienceCount: 0,
+      interfaceContext: '',
+      memoryCues: [],
+    };
+    let spokenTurns = 0;
+
+    while (spokenTurns < 20) {
+      const at = 1_000 + spokenTurns * 1_000;
+      const plan = runtime.tryPlanProactive(
+        sparseContext,
+        'present-thought',
+        at,
+      );
+      if (!plan) break;
+      runtime.commitProactive(plan, at);
+      spokenTurns += 1;
+    }
+
+    expect(spokenTurns).toBeGreaterThan(1);
+    expect(spokenTurns).toBeLessThan(20);
+    expect(
+      runtime.tryPlanProactive(sparseContext, 'present-thought', 30_000),
+    ).toBeNull();
+  });
+
+  it('restores recent topic cooling after the runtime is rebuilt', () => {
+    const firstRuntime = new PersonaRuntimeState();
+    const first = firstRuntime.tryPlanProactive(
+      context,
+      'memory-association',
+      1_000,
+    );
+    expect(first).not.toBeNull();
+    if (!first) return;
+    firstRuntime.commitProactive(first, 1_000);
+
+    const restored = new PersonaRuntimeState({
+      topics: firstRuntime.snapshot(2_000).topics,
+    });
+    const next = restored.tryPlanProactive(
+      context,
+      'memory-association',
+      2_000,
+    );
+
+    expect(next?.topicFamily).not.toBe(first.topicFamily);
+    expect(next?.mustAvoidTopics).toContain(first.topicFamily);
+  });
+
   it('uses one bounded source and cools a semantic topic after a spoken turn', () => {
     const runtime = new PersonaRuntimeState();
     const first = runtime.planProactive(context, 'memory-association', 1_000);
@@ -57,6 +158,10 @@ describe('PersonaRuntimeState', () => {
 
     expect(plans.filter((plan) => plan.source === 'self_goal')).toHaveLength(1);
     expect(new Set(plans.map((plan) => plan.source)).size).toBeGreaterThan(2);
+    expect(new Set(plans.map((plan) => plan.expressionMode)).size).toBe(5);
+    expect(plans.every((plan) => plan.expressionInstruction.length > 10)).toBe(
+      true,
+    );
   });
 
   it('keeps emotion state separate from the expressed TTS label and commits explicitly', () => {
@@ -81,7 +186,9 @@ describe('PersonaRuntimeState', () => {
     expect(prepared.plan.deliveryTarget.emotion).toBe('impatient');
     expect(runtime.snapshot(1_000).emotion.activeAffect).toBeNull();
     runtime.commitInteraction(prepared.transition);
-    expect(runtime.snapshot(1_000).emotion.activeAffect?.label).toBe('impatient');
+    expect(runtime.snapshot(1_000).emotion.activeAffect?.label).toBe(
+      'impatient',
+    );
     expect(runtime.snapshot(1_000).emotion.mood.tension).toBeGreaterThan(0.16);
   });
 });

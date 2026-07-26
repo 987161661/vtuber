@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
   applyLiveEngagementDecision,
   commitDeliveredEngagement,
+  composePaidSupportInvitation,
   createLiveEngagementLedger,
   evaluateLiveEngagement,
   recordSupportAssociation,
@@ -32,12 +33,14 @@ function deliver(
   ledger: ReturnType<typeof createLiveEngagementLedger>,
   eventId: string,
   now: number,
-  reply = '先把眼前这段聊好。',
+  reply?: string,
 ) {
   const decision = evaluate(ledger, eventId, now);
+  const deliveredReply =
+    reply ?? applyLiveEngagementDecision('先把眼前这段聊好。', decision).text;
   return commitDeliveredEngagement(ledger, {
     decision,
-    reply,
+    reply: deliveredReply,
     deliveryStatus: 'spoken',
     deliveredAt: now,
   });
@@ -76,9 +79,23 @@ describe('live engagement policy', () => {
       });
     }
 
-    expect(evaluate(ledger, 'fourth', 48 * MINUTE).reasonCode).toBe(
-      'paid-hourly-cap',
+    const fourthDecision = evaluate(ledger, 'fourth', 48 * MINUTE);
+    ledger = commitDeliveredEngagement(ledger, {
+      decision: fourthDecision,
+      reply: applyLiveEngagementDecision('节目继续。', fourthDecision).text,
+      deliveryStatus: 'spoken',
+      deliveredAt: 48 * MINUTE,
+    });
+
+    expect(evaluate(ledger, 'capped', 49 * MINUTE).action).not.toBe(
+      'invite-paid-support',
     );
+    const paidDelivered = summarizeLiveEngagement(
+      ledger,
+      49 * MINUTE,
+    ).paidDeliveredLastHour;
+    expect(paidDelivered).toBeGreaterThanOrEqual(2);
+    expect(paidDelivered).toBeLessThanOrEqual(3);
   });
 
   it('does not invite support in repair, urgent, or paid-thank turns', () => {
@@ -124,6 +141,104 @@ describe('live engagement policy', () => {
         hasVerifiedAudience: false,
       }).action,
     ).toBe('none');
+  });
+
+  it('turns an eligible free-engagement slot into a natural follow invitation', () => {
+    let ledger = createLiveEngagementLedger();
+    for (let index = 0; index < 4; index += 1) {
+      ledger = commitDeliveredEngagement(ledger, {
+        decision: evaluate(ledger, `content-${index}`, index * MINUTE, {
+          isLive: false,
+        }),
+        reply: '先把内容讲清楚。',
+        deliveryStatus: 'spoken',
+        deliveredAt: index * MINUTE,
+      });
+    }
+
+    const decision = evaluate(ledger, 'follow-slot', 8 * MINUTE, {
+      platform: 'bilibili',
+    });
+    const finalized = applyLiveEngagementDecision('后面的节目继续。', decision);
+
+    expect(decision.action).toBe('invite-free-engagement');
+    expect(decision.reasonCode).toBe('follow-slot-ready');
+    expect(finalized.text).toMatch(/关注/u);
+    expect(finalized.text).not.toMatch(/投蕉|投个蕉/u);
+  });
+
+  it('opens the next proactive follow slot after six minutes of content', () => {
+    let ledger = createLiveEngagementLedger();
+    const firstFollow = evaluate(
+      ledger,
+      'first-follow',
+      0,
+      { isProactive: true },
+    );
+    ledger = commitDeliveredEngagement(ledger, {
+      decision: firstFollow,
+      reply: applyLiveEngagementDecision('节目继续。', firstFollow).text,
+      deliveryStatus: 'spoken',
+      deliveredAt: 0,
+    });
+    ledger = commitDeliveredEngagement(ledger, {
+      decision: evaluate(ledger, 'content-between', 2 * MINUTE, {
+        isLive: false,
+      }),
+      reply: '先把内容讲清楚。',
+      deliveryStatus: 'spoken',
+      deliveredAt: 2 * MINUTE,
+    });
+    expect(
+      evaluate(ledger, 'too-soon', 5 * MINUTE, { isProactive: true }).action,
+    ).toBe('none');
+    expect(
+      evaluate(ledger, 'six-minutes', 6 * MINUTE, { isProactive: true })
+        .action,
+    ).toBe('invite-free-engagement');
+  });
+
+  it('delivers five follow invitations across a thirty-minute two-minute idle cadence', () => {
+    let ledger = createLiveEngagementLedger();
+    const actions: string[] = [];
+
+    for (let minute = 0; minute < 30; minute += 2) {
+      const decision = evaluate(ledger, `idle-${minute}`, minute * MINUTE, {
+        isProactive: true,
+        platform: 'bilibili',
+      });
+      const finalized = applyLiveEngagementDecision('节目继续。', decision);
+      actions.push(finalized.action);
+      ledger = commitDeliveredEngagement(ledger, {
+        decision,
+        reply: finalized.text,
+        deliveryStatus: 'spoken',
+        deliveredAt: minute * MINUTE,
+      });
+    }
+
+    expect(
+      actions.filter((action) => action === 'invite-free-engagement'),
+    ).toHaveLength(5);
+    expect(
+      actions.some(
+        (action, index) =>
+          action === 'invite-free-engagement' &&
+          actions[index + 1] === 'invite-free-engagement',
+      ),
+    ).toBe(false);
+  });
+
+  it('never composes an AcFun-style banana invitation for Bilibili or unknown platforms', () => {
+    expect(composePaidSupportInvitation('paid:bilibili', 'bilibili')).not.toMatch(
+      /投蕉|投个蕉/u,
+    );
+    expect(composePaidSupportInvitation('paid:unknown')).not.toMatch(
+      /投蕉|投个蕉/u,
+    );
+    expect(composePaidSupportInvitation('paid:acfun', 'acfun')).toMatch(
+      /投蕉|投个蕉/u,
+    );
   });
 
   it('associates support occurring within ten minutes without claiming causality', () => {

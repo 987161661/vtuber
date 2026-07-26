@@ -5,6 +5,13 @@ import {
 } from '../../examples/react-purupuru-app/server/operatorQueueRuntime';
 import type { OperatorQueueItem } from '../../examples/react-purupuru-app/src/lib/operatorQueue';
 
+const currentScope = {
+  personaId: 'host-1',
+  platform: 'bilibili',
+  roomId: 'room-1',
+  sessionId: 'session-current',
+};
+
 function queueItem(
   overrides: Partial<OperatorQueueItem> = {},
 ): OperatorQueueItem {
@@ -139,6 +146,103 @@ describe('operator queue runtime', () => {
 
     expect(runtime.snapshot(false).map((item) => item.eventId)).toEqual([
       'retained',
+    ]);
+    expect(writes).toHaveLength(1);
+  });
+
+  it('activates one broadcast session and archives stale work outside it', async () => {
+    const now = 2_000_000;
+    const current = queueItem({
+      eventId: 'current',
+      scope: currentScope,
+      createdAt: now - 1_000,
+    });
+    const previous = queueItem({
+      eventId: 'previous',
+      scope: { ...currentScope, sessionId: 'session-previous' },
+      createdAt: now - 1_000,
+    });
+    const legacy = queueItem({
+      eventId: 'legacy',
+      createdAt: now - 20 * 60_000,
+    });
+    const stress = queueItem({
+      eventId: 'stress',
+      testRunId: 'run-1',
+      createdAt: now - 20 * 60_000,
+    });
+    const { store, writes } = memoryStore();
+    const runtime = createOperatorQueueRuntime({
+      initialItems: new Map(
+        [current, previous, legacy, stress].map((item) => [item.eventId, item]),
+      ),
+      now: () => now,
+      store,
+    });
+
+    await expect(runtime.activateScope(currentScope)).resolves.toBe(2);
+
+    expect(runtime.get('previous')).toMatchObject({
+      status: 'archived',
+      finishReason: 'broadcast_session_changed',
+    });
+    expect(runtime.get('legacy')).toMatchObject({
+      status: 'archived',
+      finishReason: 'legacy_scope_missing',
+    });
+    expect(
+      runtime
+        .snapshot({
+          view: 'session',
+          scope: currentScope,
+          includeTestRuns: true,
+        })
+        .map((item) => item.eventId)
+        .sort(),
+    ).toEqual(['current', 'stress']);
+    expect(
+      runtime
+        .snapshot({ view: 'history' })
+        .map((item) => item.eventId)
+        .sort(),
+    ).toEqual(['legacy', 'previous']);
+    expect(runtime.summarize({ view: 'history' })).toMatchObject({
+      total: 2,
+      archived: 2,
+      active: 0,
+    });
+    expect(writes).toHaveLength(1);
+  });
+
+  it('enforces bounded history retention during restore', async () => {
+    const now = 10 * 24 * 60 * 60_000;
+    const old = queueItem({
+      eventId: 'old',
+      status: 'done',
+      doneAt: now - 8 * 24 * 60 * 60_000,
+      updatedAt: now - 8 * 24 * 60 * 60_000,
+    });
+    const recent = [0, 1, 2].map((index) =>
+      queueItem({
+        eventId: `recent-${index}`,
+        status: 'done',
+        doneAt: now - index,
+        updatedAt: now - index,
+      }),
+    );
+    const { store, writes } = memoryStore([old, ...recent]);
+    const runtime = createOperatorQueueRuntime({
+      historyRetentionMs: 7 * 24 * 60 * 60_000,
+      maxHistoryItems: 2,
+      now: () => now,
+      store,
+    });
+
+    await runtime.restore();
+
+    expect(runtime.snapshot(false).map((item) => item.eventId)).toEqual([
+      'recent-0',
+      'recent-1',
     ]);
     expect(writes).toHaveLength(1);
   });

@@ -73,7 +73,13 @@ export function createLiveRuntimeEventRequestHandler(options: {
           ? omitFields(eventForAttestation, PRIVATE_MODEL_FIELDS)
           : eventForAttestation;
 
-      options.monitor.ingest(event, occurredAt);
+      // Liveness is an ingress fact. A browser clock can drift, pause in a
+      // background tab, or be virtualized; none of those should make a
+      // heartbeat expire before the server has even processed it.
+      options.monitor.ingest(
+        event,
+        stage === 'runtime-owner-heartbeat' ? serverReceivedAt : occurredAt,
+      );
       await options.appendRuntimeEvent({
         ...event,
         at: occurredAt,

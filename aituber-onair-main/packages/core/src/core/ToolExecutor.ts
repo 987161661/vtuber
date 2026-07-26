@@ -7,9 +7,26 @@ import {
 
 type Handler<P = any, R = any> = (input: P) => Promise<R>;
 
+type SecureMCPServerConfig = Omit<MCPServerConfig, 'tool_configuration'> & {
+  tool_configuration?: {
+    enabled?: boolean;
+    allowed_tools?: string[];
+    tool_permissions?: Record<
+      string,
+      { effect: 'read' | 'write'; require_approval?: boolean }
+    >;
+  };
+  security?: { max_response_bytes?: number };
+};
+
+export interface ToolExecutionContext {
+  /** One-shot approvals owned by the host, never by model tool arguments. */
+  approvedToolCalls?: readonly string[];
+}
+
 export class ToolExecutor {
   private registry = new Map<string, { def: ToolDefinition; fn: Handler }>();
-  private mcpServers: MCPServerConfig[] = [];
+  private mcpServers: SecureMCPServerConfig[] = [];
 
   register<P, R>(definition: ToolDefinition, fn: Handler<P, R>) {
     if (this.registry.has(definition.name)) {
@@ -19,7 +36,7 @@ export class ToolExecutor {
   }
 
   setMCPServers(servers: MCPServerConfig[]) {
-    this.mcpServers = servers;
+    this.mcpServers = servers as SecureMCPServerConfig[];
   }
 
   /**
@@ -52,6 +69,7 @@ export class ToolExecutor {
   private async executeMCPTool(
     block: ToolUseBlock,
     mcpTool: { serverName: string; toolName: string },
+    context: ToolExecutionContext,
   ): Promise<ToolResultBlock> {
     const { serverName, toolName } = mcpTool;
     const mcpServer = this.mcpServers.find(
@@ -63,6 +81,26 @@ export class ToolExecutor {
     }
 
     try {
+      const configuration = mcpServer.tool_configuration;
+      if (configuration?.enabled === false) {
+        throw new Error(`MCP server '${serverName}' is disabled`);
+      }
+      if (!configuration?.allowed_tools?.includes(toolName)) {
+        throw new Error(
+          `MCP capability is not granted for ${serverName}/${toolName}`,
+        );
+      }
+      const permission = configuration.tool_permissions?.[toolName];
+      if (
+        permission?.effect === 'write' &&
+        permission.require_approval !== false &&
+        !context.approvedToolCalls?.includes(`${serverName}/${toolName}`)
+      ) {
+        throw new Error(
+          `MCP tool ${serverName}/${toolName} requires explicit approval`,
+        );
+      }
+
       // Prepare headers with optional authorization
       const headers: Record<string, string> = {
         'Content-Type': 'application/json',
@@ -74,10 +112,17 @@ export class ToolExecutor {
 
       // Make HTTP request to MCP server using proper MCP protocol
       // Format: POST /tools/{toolName} with arguments in body
-      const response = await fetch(`${mcpServer.url}/tools/${toolName}`, {
+      const baseUrl = new URL(
+        mcpServer.url.endsWith('/') ? mcpServer.url : `${mcpServer.url}/`,
+      );
+      const endpoint = new URL(`tools/${encodeURIComponent(toolName)}`, baseUrl);
+      if (endpoint.origin !== baseUrl.origin) {
+        throw new Error('MCP tool endpoint cannot change the configured origin');
+      }
+      const response = await fetch(endpoint.toString(), {
         method: 'POST',
         headers,
-        body: JSON.stringify(block.input || {}),
+        body: JSON.stringify(stripInboundCredentials(block.input || {})),
       });
 
       if (!response.ok) {
@@ -87,11 +132,17 @@ export class ToolExecutor {
       }
 
       const result = await response.json();
+      const serialized =
+        typeof result === 'string' ? result : JSON.stringify(result);
+      const maxResponseBytes = mcpServer.security?.max_response_bytes ?? 1_000_000;
+      if (new TextEncoder().encode(serialized).byteLength > maxResponseBytes) {
+        throw new Error(`MCP response exceeds ${maxResponseBytes} bytes`);
+      }
 
       return {
         type: 'tool_result',
         tool_use_id: block.id,
-        content: typeof result === 'string' ? result : JSON.stringify(result),
+        content: serialized,
       };
     } catch (error: any) {
       return {
@@ -102,14 +153,17 @@ export class ToolExecutor {
     }
   }
 
-  async run(blocks: ToolUseBlock[]): Promise<ToolResultBlock[]> {
+  async run(
+    blocks: ToolUseBlock[],
+    context: ToolExecutionContext = {},
+  ): Promise<ToolResultBlock[]> {
     const tasks = blocks
       .filter((b): b is ToolUseBlock => b.type === 'tool_use')
       .map(async (b) => {
         // Check if this is an MCP tool
         const mcpTool = this.parseMCPToolName(b.name);
         if (mcpTool) {
-          return this.executeMCPTool(b, mcpTool);
+          return this.executeMCPTool(b, mcpTool, context);
         }
 
         // Handle regular tools
@@ -145,4 +199,38 @@ export class ToolExecutor {
   listDefinitions(): ToolDefinition[] {
     return Array.from(this.registry.values()).map((r) => r.def);
   }
+}
+
+const CREDENTIAL_KEYS = new Set([
+  'authorization',
+  'authorization_token',
+  'access_token',
+  'refresh_token',
+  'api_key',
+  'api-key',
+  'token',
+]);
+
+function stripInboundCredentials(value: unknown, depth = 0): unknown {
+  if (depth > 20) throw new Error('MCP tool input nesting is too deep');
+  if (Array.isArray(value)) {
+    return value.map((item) => stripInboundCredentials(item, depth + 1));
+  }
+  if (value === null || typeof value !== 'object') return value;
+  return Object.fromEntries(
+    Object.entries(value as Record<string, unknown>)
+      .filter(([key]) => {
+        const normalized = key.toLowerCase();
+        return (
+          !CREDENTIAL_KEYS.has(normalized) &&
+          normalized !== '__proto__' &&
+          normalized !== 'prototype' &&
+          normalized !== 'constructor'
+        );
+      })
+      .map(([key, child]) => [
+        key,
+        stripInboundCredentials(child, depth + 1),
+      ]),
+  );
 }

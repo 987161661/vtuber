@@ -11,6 +11,7 @@ export type LiveEngagementDecisionV1 = {
   target: 'room';
   reasonCode: string;
   eligibleAt: number;
+  platform?: string;
   snapshot: {
     paidInRollingHour: number;
     nonPaidDeliveredSincePaid: number;
@@ -51,16 +52,18 @@ export type LiveEngagementPolicyInput = {
   routeMode?: string;
   routeIntent?: string;
   sourceLabel?: string;
+  platform?: string;
   isCityReport?: boolean;
   engagementSignals?: Array<'follow' | 'like' | 'gift' | 'superchat' | 'guard'>;
 };
 
 const HOUR_MS = 60 * 60_000;
 const PAID_COOLDOWN_MS = 12 * 60_000;
-const FREE_COOLDOWN_MS = 15 * 60_000;
+const FREE_COOLDOWN_MS = 6 * 60_000;
 const SUPPORT_ASSOCIATION_WINDOW_MS = 10 * 60_000;
 const MAX_PAID_PER_HOUR = 3;
 const MIN_NON_PAID_BETWEEN_PAID = 3;
+const MIN_CONTENT_TURNS_BETWEEN_FOLLOW_INVITATIONS = 4;
 
 const PAID_INVITATION =
   /(?:要不|顺手|喜欢.{0,6}就|想支持.{0,6}(?:可以|就)|来|给|帮).{0,14}(?:投.{0,3}蕉|送.{0,4}(?:礼物|辣条)|上舰|开舰|充电)|(?:投个蕉|送份礼物|上舰支持岚台|开个舰|充个电)/u;
@@ -99,6 +102,7 @@ function decision(
     target: 'room',
     reasonCode,
     eligibleAt,
+    platform: input.platform,
     snapshot,
   };
 }
@@ -125,6 +129,11 @@ export function evaluateLiveEngagement(
     (record) =>
       record.action !== 'invite-paid-support' &&
       (!lastPaid || record.deliveredAt > lastPaid.deliveredAt),
+  ).length;
+  const contentDeliveredSinceFree = recent.filter(
+    (record) =>
+      record.action === 'none' &&
+      (!lastFree || record.deliveredAt > lastFree.deliveredAt),
   ).length;
   const snapshot = {
     paidInRollingHour: paid.length,
@@ -171,6 +180,22 @@ export function evaluateLiveEngagement(
     );
   }
 
+  const freeEligible =
+    (!lastFree || input.now - lastFree.deliveredAt >= FREE_COOLDOWN_MS) &&
+    recent.at(-1)?.action !== 'invite-free-engagement' &&
+    (input.isProactive ||
+      contentDeliveredSinceFree >=
+        MIN_CONTENT_TURNS_BETWEEN_FOLLOW_INVITATIONS);
+  if (freeEligible) {
+    return decision(
+      input,
+      'invite-free-engagement',
+      'follow-slot-ready',
+      input.now,
+      snapshot,
+    );
+  }
+
   const cooldownSatisfied =
     !lastPaid || input.now - lastPaid.deliveredAt >= PAID_COOLDOWN_MS;
   const spacingSatisfied =
@@ -184,20 +209,6 @@ export function evaluateLiveEngagement(
       input,
       'invite-paid-support',
       'paid-slot-ready',
-      input.now,
-      snapshot,
-    );
-  }
-
-  const freeEligible =
-    input.isProactive &&
-    (!lastFree || input.now - lastFree.deliveredAt >= FREE_COOLDOWN_MS) &&
-    recent.at(-1)?.action !== 'invite-free-engagement';
-  if (freeEligible) {
-    return decision(
-      input,
-      'invite-free-engagement',
-      'quiet-room-free-invitation',
       input.now,
       snapshot,
     );
@@ -228,15 +239,40 @@ function pick(values: readonly string[], key: string, salt: number): string {
   return values[hash % values.length];
 }
 
-export function composePaidSupportInvitation(decisionId: string): string {
+function normalizedPlatform(platform?: string): string {
+  return (platform ?? '').trim().toLowerCase();
+}
+
+export function composePaidSupportInvitation(
+  decisionId: string,
+  platform?: string,
+): string {
   const hooks = ['喜欢这段', '岚台要继续运转', '这段要是把你留住了'] as const;
-  const support = ['投个蕉', '送份礼物', '上舰支持岚台'] as const;
+  const support =
+    normalizedPlatform(platform) === 'acfun'
+      ? (['投个蕉', '送份礼物', '支持一下岚台'] as const)
+      : normalizedPlatform(platform) === 'bilibili'
+        ? (['充个电', '送份礼物', '上舰支持岚台'] as const)
+        : (['送份礼物', '支持一下岚台'] as const);
   const endings = [
     '让我重启一下。',
-    '今晚就靠你们养着了。',
+    '后面的节目还靠你们支持。',
     '我会把后面的节目接着做好。',
   ] as const;
   return `${pick(hooks, decisionId, 7)}，${pick(support, decisionId, 17)}，${pick(endings, decisionId, 29)}`;
+}
+
+export function composeFollowInvitation(decisionId: string): string {
+  return pick(
+    [
+      '觉得这段有点意思，就顺手点个关注，后面的内容我接着做好。',
+      '喜欢本王这套播法，就点个关注，下次开播别走丢。',
+      '想继续看岚台的战报和闲聊，就点个关注，后面还有。',
+      '这段要是对你有用，点个关注吧，下一条有意思的我继续报。',
+    ] as const,
+    decisionId,
+    23,
+  );
 }
 
 function stripUnscheduledFreeInvitation(text: string): string {
@@ -269,7 +305,7 @@ export function applyLiveEngagementDecision(
   }
   if (engagement.action === 'invite-paid-support') {
     return {
-      text: `${original}${/[。！？!?]$/u.test(original) ? '' : '。'}${composePaidSupportInvitation(engagement.decisionId)}`,
+      text: `${original}${/[。！？!?]$/u.test(original) ? '' : '。'}${composePaidSupportInvitation(engagement.decisionId, engagement.platform)}`,
       action: 'invite-paid-support',
       rewritten: true,
     };
@@ -283,7 +319,7 @@ export function applyLiveEngagementDecision(
       };
     }
     return {
-      text: `${original}${/[。！？!?]$/u.test(original) ? '' : '。'}想接话就丢个表情，我接着聊。`,
+      text: `${original}${/[。！？!?]$/u.test(original) ? '' : '。'}${composeFollowInvitation(engagement.decisionId)}`,
       action: 'invite-free-engagement',
       rewritten: true,
     };

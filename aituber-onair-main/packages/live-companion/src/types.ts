@@ -405,6 +405,16 @@ export type LiveHostEvent = (
       interruptibleAfter?: boolean;
     }
   | {
+      type: 'delivery-observation';
+      at: number;
+      eventId: string;
+      stage:
+        | 'llm-first-token'
+        | 'tts-first-packet'
+        | 'avatar-first-frame'
+        | 'platform-ack';
+    }
+  | {
       type: 'runtime-fault';
       at: number;
       eventId?: string;
@@ -417,7 +427,11 @@ export type LiveHostEvent = (
       command: 'takeover' | 'mute' | 'resume';
       isLive?: boolean;
     }
-) & { scope?: LiveHostScope };
+) & {
+  scope?: LiveHostScope;
+  /** W3C trace-context carrier supplied by a platform adapter. */
+  traceContext?: Readonly<Record<string, string>>;
+};
 
 export interface LiveHostDecisionMetadata {
   /** Stable key for idempotent execution by an integration. */

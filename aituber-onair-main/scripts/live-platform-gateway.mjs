@@ -17,8 +17,12 @@ import { LiveEventHub, splitLiveChatText } from './live-platform-gateway-common.
 const DEFAULT_PORT = 8197;
 const DEFAULT_SEND_INTERVAL_MS = 1600;
 const OUTBOUND_ECHO_TTL_MS = 30_000;
+const BILIBILI_HISTORY_POLL_MS = 2_000;
 const RADAR_CITY_EVENT_URL =
   process.env.RADAR_CITY_EVENT_URL || 'http://127.0.0.1:3038/api/live-city-events';
+const HOST_EXTERNAL_CHAT_URL =
+  process.env.LINGLAN_EXTERNAL_CHAT_URL ||
+  'http://127.0.0.1:5173/api/external-chat';
 const ORDINARYROAD_VERSION = '1.5.8';
 const here = dirname(fileURLToPath(import.meta.url));
 const appRoot = resolve(here, '..');
@@ -89,6 +93,86 @@ function safeError(error) {
 
 export function isBilibiliRoomLive(payload) {
   return Number(payload?.data?.live_status) === 1;
+}
+
+export function normalizeBilibiliHistoryComment(comment) {
+  const text = String(comment?.text || '').trim();
+  if (!text) return null;
+  const timeline = String(comment.timeline || '');
+  const parsedAt = timeline
+    ? new Date(`${timeline.replace(' ', 'T')}+08:00`).getTime()
+    : Date.now();
+  return {
+    id: `history:${comment.id_str || `${comment.uid}:${comment.rnd}:${timeline}`}`,
+    type: 'comment',
+    text,
+    timestamp: Number.isFinite(parsedAt) ? parsedAt : Date.now(),
+    author: {
+      id: String(comment.uid || comment.nickname || 'anonymous'),
+      name: String(comment.nickname || '观众'),
+      avatarUrl: comment.user?.base?.face || undefined,
+    },
+    metadata: {
+      platformId: 'bilibili',
+      command: 'HISTORY_DANMU',
+      source: 'history-poll',
+    },
+  };
+}
+
+export function selectNewBilibiliHistoryEvents(events, seenIds, seedOnly) {
+  const fresh = [];
+  for (const event of events) {
+    if (!event || seenIds.has(event.id)) continue;
+    seenIds.add(event.id);
+    if (!seedOnly) fresh.push(event);
+  }
+  while (seenIds.size > 500) {
+    const oldest = seenIds.values().next().value;
+    if (oldest === undefined) break;
+    seenIds.delete(oldest);
+  }
+  return fresh;
+}
+
+async function fetchBilibiliHistoryComments(roomId, fetchImpl = fetch) {
+  const response = await fetchImpl(
+    'https://api.live.bilibili.com/xlive/web-room/v1/dM/gethistory',
+    {
+      method: 'POST',
+      headers: {
+        Accept: 'application/json',
+        'Content-Type': 'application/x-www-form-urlencoded',
+        Referer: `https://live.bilibili.com/${roomId}`,
+        'User-Agent': 'Mozilla/5.0 Chrome/136 Safari/537.36',
+      },
+      body: new URLSearchParams({ roomid: String(roomId) }),
+      signal: AbortSignal.timeout(8_000),
+    },
+  );
+  const payload = await response.json();
+  if (!response.ok || payload?.code !== 0) {
+    throw new Error(
+      `bilibili_history_${response.status}_${payload?.code ?? 'invalid'}`,
+    );
+  }
+  return (payload.data?.room || [])
+    .map(normalizeBilibiliHistoryComment)
+    .filter(Boolean);
+}
+
+export function shouldRetryStartupConnections(config, platforms) {
+  const enabledStates = PLATFORM_MANIFEST.filter(
+    (manifest) => config.platforms[manifest.id]?.enabled,
+  ).map((manifest) => platforms[manifest.id]?.state);
+  return (
+    enabledStates.length > 0 &&
+    enabledStates.every((state) => state === 'disabled' || state === 'error')
+  );
+}
+
+export function shouldRetryFailedPlatformConnection(config, status) {
+  return config?.enabled === true && status?.state === 'error';
 }
 
 function readJson(path, fallback) {
@@ -273,6 +357,9 @@ class LivePlatformGateway {
     this.hub = new LiveEventHub();
     this.idempotency = new Map();
     this.pendingOutboundEchoes = new Map();
+    this.connectionRetryTimers = new Map();
+    this.bilibiliHistorySeenIds = new Set();
+    this.bilibiliHistoryPollInFlight = false;
     this.config = loadConfig();
     if (options.platform && options.roomId) {
       this.config.platforms[options.platform] = {
@@ -367,7 +454,16 @@ class LivePlatformGateway {
   async start() {
     await this.refreshCredentialStates();
     await this.refreshBilibiliLiveStatus();
+    await this.pollBilibiliHistory(true);
     this.bridge.start();
+    // A freshly spawned JVM can accept the first JSON-line command before
+    // its live client is ready on Windows. Reconcile once after startup so a
+    // lost initial connect cannot leave the gateway stuck indefinitely.
+    this.startupSyncTimer = setTimeout(() => {
+      if (shouldRetryStartupConnections(this.config, this.platforms)) {
+        this.syncConnections();
+      }
+    }, 4_000);
     this.authTimer = setInterval(() => void this.refreshCredentialStates(), 60_000);
     // OrdinaryRoad emits only live-status changes.  A gateway started after
     // the stream has begun would otherwise retain the initial false value and
@@ -376,12 +472,53 @@ class LivePlatformGateway {
       () => void this.refreshBilibiliLiveStatus(),
       30_000,
     );
+    this.bilibiliHistoryTimer = setInterval(
+      () => void this.pollBilibiliHistory(false),
+      BILIBILI_HISTORY_POLL_MS,
+    );
   }
 
   stop() {
+    clearTimeout(this.startupSyncTimer);
     clearInterval(this.authTimer);
     clearInterval(this.liveStatusTimer);
+    clearInterval(this.bilibiliHistoryTimer);
+    for (const timer of this.connectionRetryTimers.values()) clearTimeout(timer);
+    this.connectionRetryTimers.clear();
     this.bridge.stop();
+  }
+
+  async pollBilibiliHistory(seedOnly) {
+    const roomId = String(this.config.platforms.bilibili?.roomId || '').trim();
+    if (
+      this.bilibiliHistoryPollInFlight ||
+      !this.config.platforms.bilibili?.enabled ||
+      !roomId
+    ) {
+      return;
+    }
+    this.bilibiliHistoryPollInFlight = true;
+    try {
+      const events = await fetchBilibiliHistoryComments(roomId);
+      const fresh = selectNewBilibiliHistoryEvents(
+        events,
+        this.bilibiliHistorySeenIds,
+        seedOnly,
+      );
+      for (const event of fresh) {
+        this.handleBridgeMessage({
+          kind: 'room-event',
+          platform: 'bilibili',
+          event,
+        });
+      }
+    } catch (error) {
+      log('warn', 'Bilibili history fallback failed', {
+        error: safeError(error),
+      });
+    } finally {
+      this.bilibiliHistoryPollInFlight = false;
+    }
   }
 
   async refreshBilibiliLiveStatus() {
@@ -509,12 +646,41 @@ class LivePlatformGateway {
         status.normalizedEvents += 1;
         status.lastEventAt = Date.now();
         void forwardCityCommentToRadar(message.event, platformId);
+        void forwardLiveCommentToHost(message.event, platformId);
       }
       return;
     }
     if (message.kind === 'connection') {
       status.state = message.state || 'error';
       status.error = message.error || '';
+      const retryTimer = this.connectionRetryTimers.get(platformId);
+      if (retryTimer) {
+        clearTimeout(retryTimer);
+        this.connectionRetryTimers.delete(platformId);
+      }
+      if (status.state === 'online') {
+        clearTimeout(this.startupSyncTimer);
+      } else if (
+        shouldRetryFailedPlatformConnection(
+          this.config.platforms[platformId],
+          status,
+        )
+      ) {
+        this.connectionRetryTimers.set(
+          platformId,
+          setTimeout(() => {
+            this.connectionRetryTimers.delete(platformId);
+            if (
+              shouldRetryFailedPlatformConnection(
+                this.config.platforms[platformId],
+                status,
+              )
+            ) {
+              this.syncConnections();
+            }
+          }, 5_000),
+        );
+      }
     } else if (message.kind === 'room-stats') {
       status.onlineCount = Number(message.onlineCount || 0);
     } else if (message.kind === 'live-status') {
@@ -618,34 +784,94 @@ class LivePlatformGateway {
   }
 }
 
-async function forwardCityCommentToRadar(event, platform) {
-  if (event?.type !== 'comment' || !String(event.text || '').trim()) return;
-  try {
-    const response = await fetch(RADAR_CITY_EVENT_URL, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        type: 'aituber:live-comment',
-        version: 1,
-        id: String(event.id || ''),
-        text: String(event.text).trim(),
-        viewerId: String(event.author?.id || ''),
-        viewerName: String(event.author?.name || ''),
-        platform: String(platform || event.metadata?.platformId || 'live'),
-        followEvidence: 'unknown',
-        receivedAt: Number(event.metadata?.receivedAt) || Number(event.timestamp) || Date.now(),
-      }),
-      signal: AbortSignal.timeout(2_000),
-    });
-    if (!response.ok) {
-      log('warn', 'Radar city event forwarding rejected', {
-        status: response.status,
-        platform,
-      });
+export async function forwardCityCommentToRadar(event, platform, options = {}) {
+  if (event?.type !== 'comment' || !String(event.text || '').trim()) return false;
+  const fetcher = options.fetcher || fetch;
+  const timeoutMs = Number(options.timeoutMs) || 3_000;
+  const retryDelaysMs = options.retryDelaysMs || [250, 1_000, 2_500];
+  const payload = {
+    type: 'aituber:live-comment',
+    version: 1,
+    id: String(event.id || ''),
+    text: String(event.text).trim(),
+    viewerId: String(event.author?.id || ''),
+    viewerName: String(event.author?.name || ''),
+    platform: String(platform || event.metadata?.platformId || 'live'),
+    followEvidence: 'unknown',
+    receivedAt: Number(event.metadata?.receivedAt) || Number(event.timestamp) || Date.now(),
+  };
+  let lastError = null;
+  for (let attempt = 0; attempt <= retryDelaysMs.length; attempt += 1) {
+    if (attempt > 0) {
+      await new Promise((resolveRetry) => setTimeout(resolveRetry, retryDelaysMs[attempt - 1]));
     }
-  } catch (error) {
-    log('warn', 'Radar city event forwarding failed', { error: safeError(error) });
+    try {
+      const response = await fetcher(RADAR_CITY_EVENT_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+        signal: AbortSignal.timeout(timeoutMs),
+      });
+      if (response.ok) return true;
+      lastError = new Error(`radar_city_forward_${response.status}`);
+      if (response.status < 500) break;
+    } catch (error) {
+      lastError = error;
+    }
   }
+  log('warn', 'Radar city event forwarding failed', {
+    error: safeError(lastError),
+    platform,
+    eventId: payload.id,
+  });
+  return false;
+}
+
+export async function forwardLiveCommentToHost(event, platform, options = {}) {
+  if (
+    event?.type !== 'comment' ||
+    !String(event.text || '').trim() ||
+    RADAR_CITY_COMMAND.test(String(event.text).trim().normalize('NFKC'))
+  ) {
+    return false;
+  }
+  const fetcher = options.fetcher || fetch;
+  const timeoutMs = Number(options.timeoutMs) || 3_000;
+  const retryDelaysMs = options.retryDelaysMs || [250, 1_000];
+  const payload = {
+    requestId: String(event.id || ''),
+    text: String(event.text).trim(),
+    viewerId: String(event.author?.id || ''),
+    viewerName: String(event.author?.name || ''),
+    requestedAt: Number(event.timestamp) || Date.now(),
+  };
+  let lastError = null;
+  for (let attempt = 0; attempt <= retryDelaysMs.length; attempt += 1) {
+    if (attempt > 0) {
+      await new Promise((resolveRetry) =>
+        setTimeout(resolveRetry, retryDelaysMs[attempt - 1]),
+      );
+    }
+    try {
+      const response = await fetcher(HOST_EXTERNAL_CHAT_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+        signal: AbortSignal.timeout(timeoutMs),
+      });
+      if (response.ok) return true;
+      lastError = new Error(`host_comment_forward_${response.status}`);
+      if (response.status < 500) break;
+    } catch (error) {
+      lastError = error;
+    }
+  }
+  log('warn', 'Live comment forwarding to host failed', {
+    error: safeError(lastError),
+    platform,
+    eventId: payload.requestId,
+  });
+  return false;
 }
 
 function readRequestJson(request, maxSize = 16_384) {

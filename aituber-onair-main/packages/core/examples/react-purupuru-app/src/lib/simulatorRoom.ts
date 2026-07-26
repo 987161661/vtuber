@@ -1,8 +1,8 @@
+import { ORDINARYROAD_PLATFORMS } from '../services/live-platform/connectors';
 import type {
   LiveRoomEvent,
   LiveRoomEventType,
 } from '../services/live-platform/types';
-import { ORDINARYROAD_PLATFORMS } from '../services/live-platform/connectors';
 
 export type SimulatorInteractionType = Extract<
   LiveRoomEventType,
@@ -174,6 +174,25 @@ export interface SimulatorEventDraft {
 interface SimulatorEventIdentity {
   id: string;
   timestamp: number;
+}
+
+export interface SimulatorDispatchPlan {
+  ensureRoomLive: true;
+  enableAutomation: boolean;
+}
+
+/**
+ * A simulator send is an explicit request to exercise the complete response
+ * pipeline. It starts an in-app preview when the normal broadcast consumer is
+ * idle, without changing any external platform connection.
+ */
+export function planSimulatorDispatch(input: {
+  autoBroadcastEnabled: boolean;
+}): SimulatorDispatchPlan {
+  return {
+    ensureRoomLive: true,
+    enableAutomation: !input.autoBroadcastEnabled,
+  };
 }
 
 function positiveInteger(value: number, fallback = 1) {

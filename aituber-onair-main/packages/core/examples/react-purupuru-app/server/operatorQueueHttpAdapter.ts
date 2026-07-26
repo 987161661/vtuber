@@ -2,8 +2,11 @@ import { createHash } from 'node:crypto';
 import { sanitizeSpeechText } from '../../../../voice/src/utils/sanitizeSpeechText';
 import type {
   OperatorQueueItem,
+  OperatorQueueScope,
+  OperatorQueueSnapshotQuery,
   PreparedSpeechPlan,
 } from '../src/lib/operatorQueue';
+import { operatorQueueScopesEqual } from '../src/lib/operatorQueue';
 import type { OperatorQueueCommand } from './operatorQueueRuntime';
 
 type OperatorQueueMutationCommand = Exclude<
@@ -55,6 +58,7 @@ export function decodeOperatorQueueIngest(
 
   const sourcesSeen = stringArray(body.sourcesSeen);
   const roomContext = sanitizeRoomContext(body.roomContext, context.now);
+  const scope = sanitizeOperatorQueueScope(body.scope);
   const existing = context.items.find((item) => item.eventId === eventId);
   if (existing) {
     return {
@@ -72,6 +76,8 @@ export function decodeOperatorQueueIngest(
       context.items.some(
         (item) =>
           item.viewerId === viewerId &&
+          ((!scope && !item.scope) ||
+            operatorQueueScopesEqual(item.scope, scope)) &&
           context.now - item.createdAt <= 15_000 &&
           normalizeQueueText(item.text) === normalizeQueueText(text),
       ),
@@ -110,6 +116,7 @@ export function decodeOperatorQueueIngest(
         : repeatedByViewer
           ? 'skipped'
           : 'pending',
+      scope,
       skipReason: repeatedByViewer ? 'duplicate_text' : undefined,
       preparedReply,
       preparedSpeechPlan,
@@ -131,6 +138,30 @@ export function decodeOperatorQueueIngest(
       engagementSignals: decodeEngagementSignals(body.engagementSignals),
       roomContext,
     },
+  };
+}
+
+export function decodeOperatorQueueSnapshotQuery(
+  searchParams: URLSearchParams,
+): OperatorQueueSnapshotQuery {
+  const view = searchParams.get('view');
+  const requestedLimit = Number(searchParams.get('limit'));
+  const scope = sanitizeOperatorQueueScope({
+    personaId: searchParams.get('personaId'),
+    platform: searchParams.get('platform'),
+    roomId: searchParams.get('roomId'),
+    sessionId: searchParams.get('sessionId'),
+  });
+  return {
+    view:
+      view === 'session' || view === 'history' || view === 'all'
+        ? view
+        : undefined,
+    scope,
+    limit: Number.isFinite(requestedLimit)
+      ? Math.max(1, Math.min(1_000, requestedLimit))
+      : undefined,
+    includeTestRuns: searchParams.get('includeTestRuns') === '1',
   };
 }
 
@@ -309,6 +340,25 @@ export function sanitizePreparedSpeechPlan(
 function finiteTimestamp(value: unknown): number | undefined {
   return typeof value === 'number' && Number.isFinite(value) && value > 0
     ? value
+    : undefined;
+}
+
+function sanitizeOperatorQueueScope(
+  value: unknown,
+): OperatorQueueScope | undefined {
+  if (!value || typeof value !== 'object') return undefined;
+  const record = value as Record<string, unknown>;
+  const bounded = (field: keyof OperatorQueueScope) => {
+    const normalized =
+      typeof record[field] === 'string' ? record[field].trim() : '';
+    return normalized && normalized.length <= 200 ? normalized : undefined;
+  };
+  const personaId = bounded('personaId');
+  const platform = bounded('platform');
+  const roomId = bounded('roomId');
+  const sessionId = bounded('sessionId');
+  return personaId && platform && roomId && sessionId
+    ? { personaId, platform, roomId, sessionId }
     : undefined;
 }
 

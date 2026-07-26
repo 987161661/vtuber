@@ -176,21 +176,22 @@ export function buildLiveRoomTranscript(
     currentInput &&
       classifyConversationRelevance(currentInput, '') === 'continuation',
   );
-  const selected = [...new Map(
-    [
-      ...contextualTurns.slice(-6),
-      ...(needsImmediateContext ? recent.slice(-3) : []),
-      ...currentTurns,
-      ...(!currentInput ? currentViewerTurns : []),
-    ].map((turn) => [
-      turn.eventId || `${turn.at}:${turn.input}`,
-      turn,
-    ]),
-  ).values()].sort((left, right) => left.at - right.at);
+  const selected = [
+    ...new Map(
+      [
+        ...contextualTurns.slice(-6),
+        ...(needsImmediateContext ? recent.slice(-3) : []),
+        ...currentTurns,
+        ...(!currentInput ? currentViewerTurns : []),
+      ].map((turn) => [turn.eventId || `${turn.at}:${turn.input}`, turn]),
+    ).values(),
+  ].sort((left, right) => left.at - right.at);
   if (!selected.length) return '';
   const participants = recentParticipantEvidence(recent, now);
   const participantEvidence = participants.length
-    ? participants.map((participant) => participant.name || participant.id).join('、')
+    ? participants
+        .map((participant) => participant.name || participant.id)
+        .join('、')
     : '无';
   const transcript = selected
     .map((turn) => {
@@ -208,18 +209,9 @@ export function buildLiveResponseContract(
   input: string,
   turns: RecentLiveTurn[],
   routing: SkillRoutingDecision = PROGRAM_DEFAULT,
+  now = new Date(),
 ): LiveResponseContract {
-  const currentBeijingTime = new Intl.DateTimeFormat('zh-CN', {
-    timeZone: 'Asia/Shanghai',
-    year: 'numeric',
-    month: '2-digit',
-    day: '2-digit',
-    hour: '2-digit',
-    minute: '2-digit',
-    second: '2-digit',
-    hour12: false,
-  }).format(new Date());
-  const runtimeClockContext = `\n\n<runtime_clock>\n当前北京时间：${currentBeijingTime}。这是判断“现在、今晚、凌晨”等时间词的唯一当前时钟；历史转写和上一轮数据时次只能作为过去记录，禁止拿它们推断当前时间。\n</runtime_clock>`;
+  const runtimeClockContext = buildRuntimeClockContext(now);
   const recentAnswered = [...turns]
     .reverse()
     .filter((turn) => turn.reply && turn.status !== 'skipped');
@@ -253,8 +245,10 @@ export function buildLiveResponseContract(
         inheritedSkills.length),
   );
   const modeCard: Record<SkillRoutingDecision['mode'], string> = {
-    companion: '陪伴直播：闲聊、玩梗、情绪和日常优先。台风不是默认背景，禁止主动提及。',
-    variety: '轻量节目：接住唱歌、故事、游戏或共创请求；不能做时给有个性的替代互动，不冷拒绝。',
+    companion:
+      '陪伴直播：闲聊、玩梗、情绪和日常优先。台风不是默认背景，禁止主动提及。',
+    variety:
+      '轻量节目：接住唱歌、故事、游戏或共创请求；不能做时给有个性的替代互动，不冷拒绝。',
     weather: '专业栏目：只依据本轮技能事实回答台风/天气/雷达问题。',
     urgent: '紧急信息：先说清安全结论，停止玩笑与关注引导。',
   };
@@ -276,7 +270,7 @@ export function buildLiveResponseContract(
     preferMultipleBeats
       ? '本轮适合在确有查证、承接或情绪反应时使用两到三句短节拍；最后一个节拍必须给出完整主答案。'
       : '无需为了表演强行拆句。'
-  }\n拟人要求：只有当观众明确询问台风、天气、雷达或相关的上一轮追问时，才调用或提及台风。普通问候、情绪、玩笑、关系和生活话题，就像一个有自己性格的主播一样直接回应，不要拿台风实况做转场。自然聊天可以提出猜想，但不能擅自断言观众昨晚没睡、住在哪里、做过什么或是什么关系；若缺少同一 actor 的明确自述，只能用不带事实预设的接话或询问。\n回答策略：第一句直接回答观众真正问的内容；资料不能支持时，明确说不知道或资料未提供，不得拿相关但不同的问题代替。\n长度要求：大多数情况下用 1 到 2 句完成，总长不超过 80 个中文字；不要重复题目、不要带出推理过程或内部规则。\n</live_response_contract>`;
+  }\n拟人要求：只有当观众明确询问台风、天气、雷达或相关的上一轮追问时，才调用或提及台风。普通问候、情绪、玩笑、关系和生活话题，就像一个有自己性格的主播一样直接回应，不要拿台风实况做转场。自然聊天可以提出猜想，但不能擅自断言观众过去的睡眠、住址、行为或关系；若缺少同一 actor 的明确自述，只能用不带事实预设的接话或询问。\n回答策略：第一句直接回答观众真正问的内容；资料不能支持时，明确说不知道或资料未提供，不得拿相关但不同的问题代替。\n长度要求：大多数情况下用 1 到 2 句完成，总长不超过 80 个中文字；不要重复题目、不要带出推理过程或内部规则。\n</live_response_contract>`;
   return {
     contract: runtimeClockContext + contract,
     inheritedSkills,
@@ -287,4 +281,41 @@ export function buildLiveResponseContract(
     preferMultipleBeats,
     hasPrimaryQuestion,
   };
+}
+
+export function buildRuntimeClockContext(now = new Date()) {
+  const formatter = new Intl.DateTimeFormat('zh-CN', {
+    timeZone: 'Asia/Shanghai',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hour12: false,
+    hourCycle: 'h23',
+  });
+  const currentBeijingTime = formatter.format(now);
+  const hour = Number(
+    formatter.formatToParts(now).find((part) => part.type === 'hour')?.value,
+  );
+  const daypart =
+    hour < 5
+      ? '凌晨'
+      : hour < 8
+        ? '清晨'
+        : hour < 12
+          ? '上午'
+          : hour < 14
+            ? '中午'
+            : hour < 18
+              ? '下午'
+              : hour < 22
+                ? '晚上'
+                : '深夜';
+  const daylightCorrection =
+    hour < 18
+      ? '描述此刻时，禁止称作晚上、今晚或夜间；谈未来的今晚必须明确是未来时段。'
+      : '';
+  return `\n\n<runtime_clock>\n当前北京时间：${currentBeijingTime}。当前时段：${daypart}。描述此刻时只能使用这个时段，禁止改成其他时段。${daylightCorrection}这是判断“现在、今晚、凌晨”等时间词的唯一当前时钟；历史转写和上一轮数据时次只能作为过去记录，禁止拿它们推断当前时间。\n</runtime_clock>`;
 }

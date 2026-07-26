@@ -68,8 +68,11 @@ if (Test-Path -LiteralPath $baseLauncher -PathType Leaf) {
   & $flashHeadLauncher
   if (-not (Get-NetTCPConnection -LocalPort 5173 -State Listen -ErrorAction SilentlyContinue)) {
     New-Item -ItemType Directory -Path $logPath -Force | Out-Null
-    Start-Process -FilePath 'npm.cmd' `
-      -ArgumentList @('run', 'dev', '--', '--host', '127.0.0.1') `
+    # The control room keeps a sizeable in-memory live-session history. Give
+    # Vite's Node process enough headroom so it does not exit at Node's 4 GB
+    # default heap limit during a long broadcast.
+    Start-Process -FilePath 'cmd.exe' `
+      -ArgumentList @('/d', '/c', 'set "NODE_OPTIONS=--max-old-space-size=8192" && npm.cmd run dev -- --host 127.0.0.1') `
       -WorkingDirectory $appPath `
       -WindowStyle Hidden `
       -RedirectStandardOutput (Join-Path $logPath 'vite.out.log') `

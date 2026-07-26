@@ -23,6 +23,15 @@ export type OperatorTurnWorkPlan = {
   speak: OperatorQueueItem | null;
 };
 
+export function coordinatorGenerationStagesForReadyTurn(
+  activeTurnEventId: string | undefined,
+  readyEventId: string,
+): Array<'started' | 'completed'> {
+  return activeTurnEventId === readyEventId
+    ? ['completed']
+    : ['started', 'completed'];
+}
+
 function belongsToOwner(item: OperatorQueueItem, ownerId: string): boolean {
   return !item.assignedOwnerId || item.assignedOwnerId === ownerId;
 }

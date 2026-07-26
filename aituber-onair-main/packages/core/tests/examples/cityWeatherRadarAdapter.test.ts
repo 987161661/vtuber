@@ -80,4 +80,38 @@ describe('city weather radar adapter', () => {
       }),
     ).rejects.toThrow('radar_city_weather_unavailable');
   });
+
+  it('keeps usable current weather when only the warning snapshot is degraded', async () => {
+    const fetcher = vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          status: 'degraded',
+          city: {
+            name: '\u5317\u4eac',
+            province: '\u5317\u4eac\u5e02',
+            administrativePath: { city: '\u5317\u4eac\u5e02' },
+          },
+          current: {
+            evidenceLevel: 'observed',
+            observedAt: '2026-07-26T14:00+08:00',
+            temperatureC: 30,
+            weatherText: '\u9634',
+          },
+          warnings: {
+            status: 'unavailable',
+          },
+        }),
+        { status: 200 },
+      ),
+    );
+
+    const result = await fetchRadarCityWeather({
+      baseUrl: 'http://127.0.0.1:3038',
+      location: '\u5317\u4eac',
+      fetcher,
+    });
+
+    expect(result.requiredAnswer).toContain('\u5317\u4eac\u5e02');
+    expect(result.requiredAnswer).toContain('\u6c14\u6e29 30\u2103');
+  });
 });

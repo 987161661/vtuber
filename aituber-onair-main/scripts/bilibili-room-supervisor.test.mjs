@@ -83,6 +83,20 @@ test('normalizes viewer entry events', () => {
   assert.equal(event.timestamp, 1_700_000_000_000);
 });
 
+test('normalizes Bilibili follow interactions without treating them as entry', () => {
+  const event = normalizeRoomEvent({
+    cmd: 'INTERACT_WORD',
+    data: {
+      uid: 42,
+      uname: 'viewer',
+      timestamp: 1_700_000_000,
+      msg_type: 2,
+    },
+  });
+  assert.equal(event.type, 'follow');
+  assert.equal(event.author.id, '42');
+});
+
 test('deduplicates identical comment text across Bilibili sources', () => {
   const hub = new EventHub();
   const first = {
