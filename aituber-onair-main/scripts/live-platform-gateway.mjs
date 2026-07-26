@@ -18,6 +18,7 @@ const DEFAULT_PORT = 8197;
 const DEFAULT_SEND_INTERVAL_MS = 1600;
 const OUTBOUND_ECHO_TTL_MS = 30_000;
 const BILIBILI_HISTORY_POLL_MS = 2_000;
+const BILIBILI_HISTORY_HEALTH_TTL_MS = BILIBILI_HISTORY_POLL_MS * 5;
 const RADAR_CITY_EVENT_URL =
   process.env.RADAR_CITY_EVENT_URL || 'http://127.0.0.1:3038/api/live-city-events';
 const HOST_EXTERNAL_CHAT_URL =
@@ -172,7 +173,39 @@ export function shouldRetryStartupConnections(config, platforms) {
 }
 
 export function shouldRetryFailedPlatformConnection(config, status) {
-  return config?.enabled === true && status?.state === 'error';
+  return (
+    config?.enabled === true &&
+    (status?.state === 'error' || status?.state === 'disabled')
+  );
+}
+
+export function effectivePlatformStatus(
+  status,
+  config,
+  now = Date.now(),
+) {
+  const snapshot = structuredClone(status);
+  const fallbackHealthy =
+    snapshot.platformId === 'bilibili' &&
+    config?.enabled === true &&
+    Number.isFinite(snapshot.lastHistoryPollAt) &&
+    now - snapshot.lastHistoryPollAt <= BILIBILI_HISTORY_HEALTH_TTL_MS;
+  snapshot.transportState = snapshot.state;
+  snapshot.fallbackHealthy = fallbackHealthy;
+  if (
+    fallbackHealthy &&
+    ['starting', 'connecting', 'reconnecting', 'error', 'disabled'].includes(
+      snapshot.state,
+    )
+  ) {
+    snapshot.state = 'online';
+    snapshot.degraded = true;
+    snapshot.ingestMode = 'history-poll';
+  } else {
+    snapshot.degraded = false;
+    snapshot.ingestMode = snapshot.state === 'online' ? 'websocket' : 'none';
+  }
+  return snapshot;
 }
 
 function readJson(path, fallback) {
@@ -380,6 +413,7 @@ class LivePlatformGateway {
           normalizedEvents: 0,
           sentCount: 0,
           lastEventAt: null,
+          lastHistoryPollAt: null,
           lastSentAt: null,
           error: '',
         },
@@ -500,6 +534,7 @@ class LivePlatformGateway {
     this.bilibiliHistoryPollInFlight = true;
     try {
       const events = await fetchBilibiliHistoryComments(roomId);
+      this.platforms.bilibili.lastHistoryPollAt = Date.now();
       const fresh = selectNewBilibiliHistoryEvents(
         events,
         this.bilibiliHistorySeenIds,
@@ -567,8 +602,19 @@ class LivePlatformGateway {
   }
 
   safeStatus() {
-    const enabled = Object.values(this.platforms).filter((item) => item.state !== 'disabled');
-    const bilibili = this.platforms.bilibili;
+    const platforms = Object.fromEntries(
+      PLATFORM_MANIFEST.map((manifest) => [
+        manifest.id,
+        effectivePlatformStatus(
+          this.platforms[manifest.id],
+          this.config.platforms[manifest.id],
+        ),
+      ]),
+    );
+    const enabled = Object.values(platforms).filter(
+      (item) => this.config.platforms[item.platformId]?.enabled,
+    );
+    const bilibili = platforms.bilibili;
     const state = enabled.some((item) => item.state === 'online')
       ? 'online'
       : enabled.some((item) => item.state === 'error')
@@ -581,7 +627,7 @@ class LivePlatformGateway {
       connectorId: 'ordinaryroad',
       bridgeEngine: 'ordinaryroad-live-chat-client',
       ordinaryroadVersion: ORDINARYROAD_VERSION,
-      platforms: structuredClone(this.platforms),
+      platforms,
       connectedClients: this.hub.clients.size,
       at: Date.now(),
       // One-release compatibility fields for the existing supervisor skill.

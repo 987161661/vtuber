@@ -122,45 +122,51 @@ public final class OrdinaryRoadBridge {
   }
 
   private void connect(String connectionId, String platform, String roomId, String cookie) {
-    disconnect(connectionId);
+    // Replacing a transport is a reconnect, not a user-requested disable.
+    // Destroying the previous client can emit delayed lifecycle callbacks, so
+    // remove it first and suppress the synthetic "disabled" transition.
+    disconnect(connectionId, false);
     IBaseLiveChatClient<?, ?> client = createClient(connectionId, platform, roomId, cookie);
     Connection connection = new Connection(connectionId, platform, roomId, client);
     connections.put(connectionId, connection);
-    client.addStatusChangeListener((event, previous, current) -> emit("connection", Map.of(
-        "connectionId", connectionId,
-        "platform", platform,
-        "roomId", roomId,
-        "state", statusName(current)
-    )));
+    emitConnectionIfCurrent(connection, "connecting", "");
+    client.addStatusChangeListener((event, previous, current) ->
+        emitConnectionIfCurrent(connection, statusName(current), ""));
     client.connect(
-        () -> emit("connection", Map.of(
-            "connectionId", connectionId,
-            "platform", platform,
-            "roomId", roomId,
-            "state", "online"
-        )),
-        error -> emit("connection", Map.of(
-            "connectionId", connectionId,
-            "platform", platform,
-            "roomId", roomId,
-            "state", "error",
-            "error", safeError(error)
-        ))
+        () -> emitConnectionIfCurrent(connection, "online", ""),
+        error -> emitConnectionIfCurrent(connection, "error", safeError(error))
     );
   }
 
   private void disconnect(String connectionId) {
+    disconnect(connectionId, true);
+  }
+
+  private void disconnect(String connectionId, boolean emitDisabled) {
     Connection previous = connections.remove(connectionId);
     if (previous == null) return;
     try {
       previous.client().destroy();
     } catch (Exception ignored) {}
-    emit("connection", Map.of(
-        "connectionId", connectionId,
-        "platform", previous.platform(),
-        "roomId", previous.roomId(),
-        "state", "disabled"
-    ));
+    if (emitDisabled) {
+      emit("connection", Map.of(
+          "connectionId", connectionId,
+          "platform", previous.platform(),
+          "roomId", previous.roomId(),
+          "state", "disabled"
+      ));
+    }
+  }
+
+  private void emitConnectionIfCurrent(Connection connection, String state, String error) {
+    if (connections.get(connection.id()) != connection) return;
+    Map<String, Object> payload = new LinkedHashMap<>();
+    payload.put("connectionId", connection.id());
+    payload.put("platform", connection.platform());
+    payload.put("roomId", connection.roomId());
+    payload.put("state", state);
+    if (error != null && !error.isBlank()) payload.put("error", error);
+    emit("connection", payload);
   }
 
   private void send(String connectionId, String commandId, String message)
@@ -507,7 +513,8 @@ public final class OrdinaryRoadBridge {
       case CONNECTING -> "connecting";
       case RECONNECTING -> "reconnecting";
       case CONNECT_FAILED -> "error";
-      case DISCONNECTED, DESTROYED -> "disabled";
+      case DISCONNECTED -> "reconnecting";
+      case DESTROYED -> "disabled";
       default -> status.name().toLowerCase();
     };
   }

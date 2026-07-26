@@ -606,8 +606,9 @@ export default function App() {
     ],
   );
   const [isTemporaryStressOwner, setIsTemporaryStressOwner] = useState(false);
+  const isRuntimePreview = query.get('runtime') === 'preview';
   const [runtimeOwnershipRequested, setRuntimeOwnershipRequested] = useState(
-    isObsOverlay || query.get('listener') === '1',
+    !isRuntimePreview && (isObsOverlay || query.get('listener') === '1'),
   );
   const isLiveRuntimeCandidate =
     runtimeOwnershipRequested || isTemporaryStressOwner;

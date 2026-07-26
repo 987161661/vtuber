@@ -5,6 +5,7 @@ import {
   splitLiveChatText,
 } from './live-platform-gateway-common.mjs';
 import {
+  effectivePlatformStatus,
   forwardCityCommentToRadar,
   forwardLiveCommentToHost,
   isBilibiliRoomLive,
@@ -140,7 +141,7 @@ test('startup recovery does not destroy a connection that is still connecting', 
   );
 });
 
-test('failed enabled platform connections are retried but disabled ones are not', () => {
+test('failed or unexpectedly disabled enabled-platform connections are retried', () => {
   assert.equal(
     shouldRetryFailedPlatformConnection(
       { enabled: true },
@@ -162,6 +163,50 @@ test('failed enabled platform connections are retried but disabled ones are not'
     ),
     false,
   );
+  assert.equal(
+    shouldRetryFailedPlatformConnection(
+      { enabled: true },
+      { state: 'disabled' },
+    ),
+    true,
+  );
+});
+
+test('healthy Bilibili history ingestion keeps the host online during transport reconnects', () => {
+  const now = 1_785_041_900_000;
+  const status = effectivePlatformStatus(
+    {
+      platformId: 'bilibili',
+      state: 'disabled',
+      lastHistoryPollAt: now - 1_000,
+    },
+    { enabled: true },
+    now,
+  );
+
+  assert.equal(status.state, 'online');
+  assert.equal(status.transportState, 'disabled');
+  assert.equal(status.fallbackHealthy, true);
+  assert.equal(status.degraded, true);
+  assert.equal(status.ingestMode, 'history-poll');
+});
+
+test('stale Bilibili history ingestion does not hide a disconnected transport', () => {
+  const now = 1_785_041_900_000;
+  const status = effectivePlatformStatus(
+    {
+      platformId: 'bilibili',
+      state: 'disabled',
+      lastHistoryPollAt: now - 60_000,
+    },
+    { enabled: true },
+    now,
+  );
+
+  assert.equal(status.state, 'disabled');
+  assert.equal(status.fallbackHealthy, false);
+  assert.equal(status.degraded, false);
+  assert.equal(status.ingestMode, 'none');
 });
 
 test('self-authored radar city commands bypass generic echo suppression', () => {
