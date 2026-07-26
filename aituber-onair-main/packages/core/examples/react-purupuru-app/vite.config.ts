@@ -36,11 +36,15 @@ import { decodeOperatorQueueSnapshotQuery } from './server/operatorQueueHttpAdap
 import { createLiveRuntimeMonitor } from './server/liveRuntimeMonitor';
 import { createLiveRuntimeEventRequestHandler } from './server/liveRuntimeEventRequest';
 import { readLiveRuntimeEventHistory } from './server/liveRuntimeEventHistory';
-import { createRuntimeOwnerLeaseRegistry } from './server/runtimeOwnerLease';
+import {
+  createRuntimeOwnerLeaseRegistry,
+  RUNTIME_OWNER_LEASE_TTL_MS,
+} from './server/runtimeOwnerLease';
 import { resolveMinimaxUpstreamEndpoint } from './server/minimaxGatewayRouting';
 import {
   LOCAL_LIVE_CHAT_TIMEOUT_MS,
   requestLocalLiveChat,
+  warmLocalLiveChatModel,
 } from './server/localLiveChat';
 import { fetchMinimaxWithRetry } from './server/minimaxGatewayFetch';
 import {
@@ -664,6 +668,7 @@ const externalChatQueue = new Map<
     requestedAt: number;
     viewerId?: string;
     viewerName?: string;
+    source?: string;
     sourceLabel?: string;
     sourcesSeen?: string[];
   }
@@ -719,9 +724,12 @@ const handleLiveRuntimeEventRequest = createLiveRuntimeEventRequestHandler({
 // A core recovery rebuilds React state asynchronously.  Allow the recovered
 // owner to become ready before treating a no-draft completion as terminal.
 // This remains bounded so a genuine provider failure is still observable.
-const RUNTIME_OWNER_LEASE_MS = 10_000;
+// OBS embeds the owner in a cross-origin iframe. Chromium can coalesce even a
+// dedicated worker's 3 s heartbeat to roughly 9 s while that frame is not
+// being painted, so a 10 s lease turns normal timer jitter into a disconnect.
+// Keep failover bounded while leaving enough room for two delayed renewals.
 const runtimeOwnerLeaseRegistry = createRuntimeOwnerLeaseRegistry({
-  ttlMs: RUNTIME_OWNER_LEASE_MS,
+  ttlMs: RUNTIME_OWNER_LEASE_TTL_MS,
 });
 const liveSessionRegistry = createLiveSessionRegistry({
   store: createSerializedJsonStore({
@@ -763,7 +771,72 @@ function runtimeOwnerLeasePlugin(): Plugin {
   return {
     name: 'runtime-owner-lease',
     configureServer(server) {
+      const activeStreams = new Map<string, symbol>();
       server.middlewares.use('/api/live-runtime-owner', (req, res) => {
+        const requestUrl = new URL(req.url || '/', 'http://localhost');
+        if (req.method === 'GET' && requestUrl.pathname === '/stream') {
+          const ownerId = requestUrl.searchParams.get('ownerId')?.trim() || '';
+          if (!ownerId) {
+            res.statusCode = 400;
+            res.end('owner id is required');
+            return;
+          }
+          const label = requestUrl.searchParams.get('label') || undefined;
+          const requestedRole = requestUrl.searchParams.get('role');
+          const role =
+            requestedRole === 'control-room' ||
+            requestedRole === 'obs-overlay' ||
+            requestedRole === 'stress-runner' ||
+            requestedRole === 'unknown'
+              ? requestedRole
+              : 'unknown';
+          const streamId = Symbol(ownerId);
+          activeStreams.set(ownerId, streamId);
+          res.statusCode = 200;
+          res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
+          res.setHeader('Cache-Control', 'no-store, no-transform');
+          res.setHeader('Connection', 'keep-alive');
+          res.setHeader('X-Accel-Buffering', 'no');
+          res.flushHeaders();
+          let leaseToken = '';
+          let closed = false;
+          let initialClaim = true;
+          const renew = () => {
+            if (closed) return;
+            const result = runtimeOwnerLeaseRegistry.claim(
+              {
+                ownerId,
+                label,
+                role,
+                replaceExistingRole: initialClaim && role === 'obs-overlay',
+              },
+              Date.now(),
+            );
+            initialClaim = false;
+            if (result.owns && result.leaseToken) {
+              leaseToken = result.leaseToken;
+            }
+            res.write(`data: ${JSON.stringify(result)}\n\n`);
+          };
+          renew();
+          const timer = setInterval(renew, 15_000);
+          const cleanup = () => {
+            if (closed) return;
+            closed = true;
+            clearInterval(timer);
+            if (activeStreams.get(ownerId) !== streamId) return;
+            activeStreams.delete(ownerId);
+            if (leaseToken) {
+              runtimeOwnerLeaseRegistry.release(
+                ownerId,
+                leaseToken,
+                Date.now(),
+              );
+            }
+          };
+          res.on('close', cleanup);
+          return;
+        }
         res.setHeader('Content-Type', 'application/json; charset=utf-8');
         res.setHeader('Cache-Control', 'no-store');
         if (req.method === 'GET') {
@@ -2304,6 +2377,9 @@ function localLiveChatPlugin(): Plugin {
   return {
     name: 'local-live-chat',
     configureServer(server) {
+      // Load the local model while the control room is starting so the first
+      // viewer message does not pay the full cold-start cost.
+      void warmLocalLiveChatModel().catch(() => undefined);
       server.middlewares.use('/api/local-live-chat', (req, res) => {
         if (req.method !== 'POST') {
           res.statusCode = 405;
@@ -4318,6 +4394,7 @@ function liveRuntimeMonitorPlugin(): Plugin {
               requestedAt?: unknown;
               viewerId?: unknown;
               viewerName?: unknown;
+              source?: unknown;
               sourceLabel?: unknown;
               sourcesSeen?: unknown;
             };
@@ -4342,6 +4419,10 @@ function liveRuntimeMonitorPlugin(): Plugin {
                 viewerName:
                   typeof value.viewerName === 'string'
                     ? value.viewerName
+                    : undefined,
+                source:
+                  typeof value.source === 'string'
+                    ? value.source.trim()
                     : undefined,
                 sourceLabel:
                   typeof value.sourceLabel === 'string'
@@ -5167,6 +5248,7 @@ export default defineConfig({
       minimaxAudioBridgePlugin(),
       liveRuntimeMonitorPlugin(),
       typhoonContextPlugin(),
+      localLiveChatPlugin(),
       localTtsCapturePlugin(),
       replyLatencyPlugin(),
     ].map(exposeRuntimePluginInPreview),

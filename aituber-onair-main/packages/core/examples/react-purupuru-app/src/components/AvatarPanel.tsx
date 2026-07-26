@@ -291,7 +291,10 @@ export function AvatarBackground({
       )}
       {avatarLayerVisibility.showSpeakingVideo && displayedSpeakingUrl && (
         <video
-          key={displayedSpeakingUrl}
+          // Reuse one decoder across FlashHead fragments. Keying this node by
+          // every Blob URL forced OBS CEF to destroy and recreate its VP9
+          // pipeline mid-sentence, which could stall the next render request
+          // long enough for the audio queue to run dry.
           className={`personalive-avatar-video personalive-avatar-speaking-layer${
             speakingLayerVisible ? ' is-visible' : ''
           }`}
@@ -299,6 +302,7 @@ export function AvatarBackground({
           autoPlay
           muted
           playsInline
+          preload="auto"
           aria-label="Audio-driven speaking avatar"
           style={{
             transform: `translate(${avatarViewTransform.x}px, ${avatarViewTransform.y}px) scale(${avatarViewTransform.scale})`,

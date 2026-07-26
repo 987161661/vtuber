@@ -77,7 +77,12 @@ export type SpeakingMediaPipelineOptions = {
 };
 
 const DEFAULT_FLASHHEAD_START_BUFFER_SECONDS = 2.5;
-const DEFAULT_FLASHHEAD_PLAYBACK_START_WAIT_MS = 2_800;
+// Rendering normally stays below the duration of a 32 KiB speech fragment,
+// but a cold/busy CUDA pass can take several seconds. Starting a lone staged
+// fragment after 2.8 s lets playback outrun the renderer and produces an
+// audible gap before the next fragment is ready.
+const DEFAULT_FLASHHEAD_PLAYBACK_START_WAIT_MS = 15_000;
+const DEFAULT_SPEAKING_RENDER_TIMEOUT_MS = 12_000;
 
 export async function getAudioPlaybackTimeoutMs(audio: ArrayBuffer) {
   const url = URL.createObjectURL(new Blob([audio.slice(0)]));
@@ -285,6 +290,13 @@ export function createSpeakingMediaPipeline(
     };
 
     const enqueueFallback = async (audio: ArrayBuffer, reason?: string) => {
+      // A later render can fail while earlier renderer-aligned media is still
+      // staged below the startup buffer threshold. Preserve and enqueue that
+      // successful media before the raw tail; otherwise the beginning of the
+      // sentence disappears exactly when FlashHead degrades.
+      if (!playbackStarted && stagedMedia.length > 0) {
+        await startStagedPlayback();
+      }
       if (!playbackStarted) {
         playbackStarted = true;
         if (startDeadlineTimer !== null) {
@@ -433,7 +445,7 @@ export function createSpeakingAvatarHttpRenderer(
       const controller = new AbortController();
       const timeout = window.setTimeout(
         () => controller.abort(),
-        options.timeoutMs ?? 6_000,
+        options.timeoutMs ?? DEFAULT_SPEAKING_RENDER_TIMEOUT_MS,
       );
       const requestedAt = now();
       try {

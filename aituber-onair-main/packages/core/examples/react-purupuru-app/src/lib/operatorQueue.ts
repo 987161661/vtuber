@@ -217,10 +217,11 @@ export function isStaleReadyReply(
   now = Date.now(),
   maxAgeMs = MAX_READY_REPLY_AGE_MS,
 ): boolean {
+  const preparedAt = item.preparedAt ?? item.updatedAt;
   return (
     item.status === 'ready' &&
     item.source !== 'operator-manual' &&
-    now - item.createdAt > maxAgeMs
+    now - preparedAt > maxAgeMs
   );
 }
 

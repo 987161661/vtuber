@@ -12,6 +12,7 @@ import {
   normalizeBilibiliHistoryComment,
   safeError,
   selectNewBilibiliHistoryEvents,
+  shouldUseHostCommentFallback,
   shouldRetryFailedPlatformConnection,
   shouldRetryStartupConnections,
   shouldSuppressConfiguredSelfEvent,
@@ -76,9 +77,7 @@ test('LiveEventHub resumes after the last delivered event', () => {
 });
 
 test('safeError redacts authentication material from dependency logs', () => {
-  const sanitized = safeError(
-    'Cookie: secret; SESSDATA=one; bili_jct: two',
-  );
+  const sanitized = safeError('Cookie: secret; SESSDATA=one; bili_jct: two');
   assert.equal(sanitized.includes('secret'), false);
   assert.equal(sanitized.includes('one'), false);
   assert.equal(sanitized.includes('two'), false);
@@ -143,17 +142,11 @@ test('startup recovery does not destroy a connection that is still connecting', 
 
 test('failed or unexpectedly disabled enabled-platform connections are retried', () => {
   assert.equal(
-    shouldRetryFailedPlatformConnection(
-      { enabled: true },
-      { state: 'error' },
-    ),
+    shouldRetryFailedPlatformConnection({ enabled: true }, { state: 'error' }),
     true,
   );
   assert.equal(
-    shouldRetryFailedPlatformConnection(
-      { enabled: false },
-      { state: 'error' },
-    ),
+    shouldRetryFailedPlatformConnection({ enabled: false }, { state: 'error' }),
     false,
   );
   assert.equal(
@@ -239,7 +232,8 @@ test('radar city forwarding retries a transient timeout without changing the eve
   const requests = [];
   const fetcher = async (_url, options) => {
     requests.push(JSON.parse(options.body));
-    if (requests.length === 1) throw new DOMException('timed out', 'TimeoutError');
+    if (requests.length === 1)
+      throw new DOMException('timed out', 'TimeoutError');
     return new Response('{}', { status: 200 });
   };
   const event = {
@@ -285,11 +279,22 @@ test('live comments reach the host bridge even when no SSE client is connected',
     }),
     true,
   );
-  assert.deepEqual(requests, [{
-    requestId: event.id,
-    text: event.text,
-    viewerId: event.author.id,
-    viewerName: event.author.name,
-    requestedAt: event.timestamp,
-  }]);
+  assert.deepEqual(requests, [
+    {
+      requestId: event.id,
+      text: event.text,
+      viewerId: event.author.id,
+      viewerName: event.author.name,
+      requestedAt: event.timestamp,
+      source: 'bilibili',
+      sourceLabel: '哔哩哔哩',
+      sourcesSeen: ['bilibili'],
+    },
+  ]);
+});
+
+test('the host bridge is only a fallback when no SSE consumer is connected', () => {
+  assert.equal(shouldUseHostCommentFallback(0), true);
+  assert.equal(shouldUseHostCommentFallback(1), false);
+  assert.equal(shouldUseHostCommentFallback(2), false);
 });

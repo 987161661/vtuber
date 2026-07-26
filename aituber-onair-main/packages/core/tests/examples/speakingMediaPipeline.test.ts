@@ -60,6 +60,7 @@ function createHarness(overrides: Partial<SpeakingMediaPipelineOptions> = {}) {
 
 describe('speaking media pipeline', () => {
   afterEach(() => {
+    vi.useRealTimers();
     vi.unstubAllGlobals();
   });
 
@@ -123,12 +124,13 @@ describe('speaking media pipeline', () => {
     expect(harness.lifecycle.onFinished).toHaveBeenCalledOnce();
   });
 
-  it('starts a short FlashHead stream by its deadline so later speech is not blocked', async () => {
+  it('keeps enough startup headroom for a slow FlashHead fragment', async () => {
     let releaseStream!: () => void;
     const streamMayContinue = new Promise<void>((resolve) => {
       releaseStream = resolve;
     });
     let startupDeadline: (() => void) | undefined;
+    let startupDelayMs = 0;
     const renderer = {
       render: vi
         .fn()
@@ -147,10 +149,10 @@ describe('speaking media pipeline', () => {
     const harness = createHarness({
       renderer,
       flashHeadStartBufferSeconds: 2.5,
-      flashHeadPlaybackStartWaitMs: 2_800,
       scheduler: {
-        set: vi.fn((callback) => {
+        set: vi.fn((callback, delayMs) => {
           startupDeadline = callback;
+          startupDelayMs = delayMs;
           return 1;
         }),
         clear: vi.fn(),
@@ -167,6 +169,7 @@ describe('speaking media pipeline', () => {
 
     expect(harness.queued).toEqual([]);
     expect(startupDeadline).toBeTypeOf('function');
+    expect(startupDelayMs).toBeGreaterThanOrEqual(12_000);
 
     startupDeadline?.();
     await vi.waitFor(() => expect(harness.queued).toEqual([[10]]));
@@ -175,6 +178,33 @@ describe('speaking media pipeline', () => {
     await playing;
 
     expect(harness.queued).toEqual([[10], [20]]);
+    expect(harness.lifecycle.onPlaybackStarted).toHaveBeenCalledOnce();
+  });
+
+  it('flushes staged rendered audio before falling back from a later fragment', async () => {
+    const renderer = {
+      render: vi
+        .fn()
+        .mockResolvedValueOnce({
+          audioBuffer: bytes(10),
+          videoUrl: 'blob:first-video',
+          durationSeconds: 1,
+        })
+        .mockResolvedValueOnce({
+          fallbackAudioBuffer: bytes(2),
+          failureReason: 'flashhead render timeout',
+        }),
+    };
+    const harness = createHarness({ renderer });
+    async function* stream() {
+      yield bytes(1);
+      yield bytes(2);
+      yield bytes(3);
+    }
+
+    await harness.pipeline.playStream(stream());
+
+    expect(harness.queued).toEqual([[10], [2, 3]]);
     expect(harness.lifecycle.onPlaybackStarted).toHaveBeenCalledOnce();
   });
 
@@ -292,6 +322,49 @@ describe('speaking media pipeline', () => {
         stage: 'flashhead_render_failed',
         reason: expect.stringContaining('CUDA failure'),
       }),
+    );
+  });
+
+  it('does not abort a healthy FlashHead render at the old six-second boundary', async () => {
+    vi.useFakeTimers();
+    const request = vi.fn<typeof fetch>(
+      async (_input, init) =>
+        new Promise<Response>((resolve, reject) => {
+          const timer = setTimeout(
+            () => resolve(new Response(null, { status: 204 })),
+            7_000,
+          );
+          init?.signal?.addEventListener(
+            'abort',
+            () => {
+              clearTimeout(timer);
+              reject(new DOMException('aborted', 'AbortError'));
+            },
+            { once: true },
+          );
+        }),
+    );
+    vi.stubGlobal('fetch', request);
+    vi.stubGlobal('window', { setTimeout, clearTimeout });
+    const emit = vi.fn();
+    const renderer = createSpeakingAvatarHttpRenderer({
+      enabled: true,
+      engine: 'flashhead',
+      getTrace: () => null,
+      getEventId: () => 'event-slow-healthy',
+      emit,
+      onFirstFrame: vi.fn(),
+    });
+
+    const rendering = renderer.render(bytes(1, 2, 3), {
+      reset: true,
+      sequence: 0,
+    });
+    await vi.advanceTimersByTimeAsync(7_000);
+
+    await expect(rendering).resolves.toBeNull();
+    expect(emit).not.toHaveBeenCalledWith(
+      expect.objectContaining({ stage: 'flashhead_render_failed' }),
     );
   });
 });

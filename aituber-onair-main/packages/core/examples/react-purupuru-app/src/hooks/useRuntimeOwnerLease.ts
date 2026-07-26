@@ -1,4 +1,14 @@
 import { useEffect, useRef, useState } from 'react';
+import {
+  startRuntimeOwnerHeartbeatWorker,
+  type RuntimeOwnerHeartbeatResult,
+} from '../lib/runtimeOwnerHeartbeatWorker';
+import {
+  reconcileRuntimeOwnerLease,
+  selectRuntimeOwnerLeaseTransport,
+  type RuntimeOwnerClientLease,
+} from '../lib/runtimeOwnerLeaseState';
+import { startRuntimeOwnerLeaseStream } from '../lib/runtimeOwnerLeaseStream';
 
 const LEASE_HEARTBEAT_MS = 3_000;
 
@@ -39,9 +49,11 @@ export function useRuntimeOwnerLease(
   identity: RuntimeOwnerLeaseIdentity,
 ): RuntimeOwnerLeaseState {
   const [ownerId] = useState(() => crypto.randomUUID());
-  const [status, setStatus] =
-    useState<RuntimeOwnerLeaseState['status']>('idle');
-  const [activeLeaseToken, setActiveLeaseToken] = useState<string>();
+  const [clientLease, setClientLease] = useState<RuntimeOwnerClientLease>({
+    status: 'idle',
+  });
+  const clientLeaseRef = useRef(clientLease);
+  clientLeaseRef.current = clientLease;
   const activationRef = useRef(0);
   const { label, role } = identity;
 
@@ -49,8 +61,9 @@ export function useRuntimeOwnerLease(
     const activation = ++activationRef.current;
     if (!candidate) {
       queueMicrotask(() => {
-        setStatus('idle');
-        setActiveLeaseToken(undefined);
+        const idleLease = { status: 'idle' } as const;
+        clientLeaseRef.current = idleLease;
+        setClientLease(idleLease);
       });
       return;
     }
@@ -59,6 +72,17 @@ export function useRuntimeOwnerLease(
     // local server remains the authoritative owner across control/OBS pages.
     let disposed = false;
     let leaseToken = '';
+    const applyHeartbeatResult = (result: RuntimeOwnerHeartbeatResult) => {
+      if (disposed) return;
+      const next = reconcileRuntimeOwnerLease(
+        clientLeaseRef.current,
+        result,
+        Date.now(),
+      );
+      clientLeaseRef.current = next;
+      if (next.leaseToken) leaseToken = next.leaseToken;
+      setClientLease(next);
+    };
     const heartbeat = async () => {
       try {
         const response = await fetch('/api/live-runtime-owner', {
@@ -66,36 +90,67 @@ export function useRuntimeOwnerLease(
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ ownerId, label, role }),
         });
-        if (!response.ok) throw 0;
-        const payload = (await response.json()) as {
-          owns?: unknown;
-          leaseToken?: unknown;
-        };
-        const ownsRuntime = payload.owns === true;
-        if (ownsRuntime && typeof payload.leaseToken === 'string') {
-          leaseToken = payload.leaseToken;
-          if (!disposed) setActiveLeaseToken(payload.leaseToken);
-        } else if (!disposed) {
-          setActiveLeaseToken(undefined);
-        }
-        if (!disposed) setStatus(ownsRuntime ? 'owned' : 'contended');
+        applyHeartbeatResult({
+          type: 'result',
+          ok: response.ok,
+          payload: response.ok
+            ? ((await response.json()) as Record<string, unknown>)
+            : undefined,
+        });
       } catch {
-        if (!disposed) {
-          setStatus('unavailable');
-          setActiveLeaseToken(undefined);
-        }
+        applyHeartbeatResult({ type: 'result', ok: false });
       }
     };
-    setStatus('claiming');
-    void heartbeat();
-    const timer = window.setInterval(
-      () => void heartbeat(),
-      LEASE_HEARTBEAT_MS,
-    );
+    const claimingLease = { status: 'claiming' } as const;
+    clientLeaseRef.current = claimingLease;
+    setClientLease(claimingLease);
+    let stopHeartbeat: () => void;
+    const transport = selectRuntimeOwnerLeaseTransport({
+      worker:
+        typeof Worker !== 'undefined' &&
+        typeof Blob !== 'undefined' &&
+        typeof URL.createObjectURL === 'function',
+      eventSource: typeof EventSource !== 'undefined',
+    });
+    if (transport === 'worker') {
+      stopHeartbeat = startRuntimeOwnerHeartbeatWorker({
+        endpoint: new URL('/api/live-runtime-owner', window.location.href).href,
+        heartbeatMs: LEASE_HEARTBEAT_MS,
+        identity: { ownerId, label, role },
+        onResult: applyHeartbeatResult,
+        createWorker: (source) => {
+          const workerUrl = URL.createObjectURL(
+            new Blob([source], { type: 'text/javascript' }),
+          );
+          try {
+            return new Worker(workerUrl);
+          } finally {
+            URL.revokeObjectURL(workerUrl);
+          }
+        },
+      });
+    } else if (transport === 'event-source') {
+      stopHeartbeat = startRuntimeOwnerLeaseStream({
+        endpoint: new URL(
+          '/api/live-runtime-owner/stream',
+          window.location.href,
+        ).href,
+        identity: { ownerId, label, role },
+        onResult: applyHeartbeatResult,
+        createEventSource: (url) => new EventSource(url),
+      });
+    } else {
+      void heartbeat();
+      const timer = window.setInterval(
+        () => void heartbeat(),
+        LEASE_HEARTBEAT_MS,
+      );
+      stopHeartbeat = () => window.clearInterval(timer);
+    }
 
     return () => {
       disposed = true;
-      window.clearInterval(timer);
+      stopHeartbeat();
       // Strict Mode immediately replaces effects in development. A delayed,
       // generation-checked release cannot delete the replacement heartbeat.
       window.setTimeout(() => {
@@ -112,9 +167,10 @@ export function useRuntimeOwnerLease(
   }, [candidate, label, ownerId, role]);
 
   return {
-    ownsRuntime: status === 'owned' && Boolean(activeLeaseToken),
+    ownsRuntime:
+      clientLease.status === 'owned' && Boolean(clientLease.leaseToken),
     ownerId,
-    leaseToken: activeLeaseToken,
-    status,
+    leaseToken: clientLease.leaseToken,
+    status: clientLease.status,
   };
 }

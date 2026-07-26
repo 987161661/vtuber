@@ -62,6 +62,7 @@ import {
   type SpeakingRenderTrace,
 } from './lib/speakingMediaPipeline';
 import { resolveEffectiveLiveRoomStatus } from './lib/liveRoomRuntimeState';
+import { createRuntimeEventTransport } from './lib/runtimeEventTransport';
 import {
   planSimulatorDispatch,
   routeSimulatorEventForQueue,
@@ -209,6 +210,7 @@ import {
   type CapturedGenerationFailure,
 } from './lib/operatorPreparationRecovery';
 import { GenerationFailureCoordinator } from './lib/generationFailureCoordinator';
+import { buildCompanionGenerationFallback } from './lib/companionGenerationFallback';
 import { settleOperatorSpeechFailure } from './lib/operatorSpeechFailureSettlement';
 import {
   projectSpeechTerminalOutcome,
@@ -1130,8 +1132,9 @@ export default function App() {
       topics: loadIdleThoughtHistory(window.localStorage, runtimeProfile.id),
     });
   }
-  const idleBroadcastRotationRef =
-    useRef<IdleBroadcastRotationState | null>(null);
+  const idleBroadcastRotationRef = useRef<IdleBroadcastRotationState | null>(
+    null,
+  );
   if (!idleBroadcastRotationRef.current) {
     idleBroadcastRotationRef.current = loadIdleBroadcastRotation(
       window.localStorage,
@@ -1249,6 +1252,10 @@ export default function App() {
     string | null
   >(null);
   const usePersonaLiveAvatar = activeProfileAvatarId !== runtimeProfile.id;
+  const runtimeEventTransport = useMemo(
+    () => createRuntimeEventTransport(fetch),
+    [],
+  );
 
   const emitRuntimeEvent = useCallback(
     (event: Record<string, unknown>) => {
@@ -1264,13 +1271,9 @@ export default function App() {
         'Content-Type': 'application/json',
         ...soulCanaryRuntimeHeadersRef.current(),
       };
-      void fetch('/api/live-runtime-events', {
-        method: 'POST',
-        headers,
-        body: JSON.stringify(runtimeEvent),
-      }).catch(() => undefined);
+      runtimeEventTransport.emit(runtimeEvent, headers);
     },
-    [recordInteraction, soulRuntimeMode, soulScope],
+    [recordInteraction, runtimeEventTransport, soulRuntimeMode, soulScope],
   );
   const publishEngagementMetrics = useCallback(() => {
     const summary = summarizeLiveEngagement(
@@ -4946,7 +4949,7 @@ export default function App() {
           at: Date.now(),
         });
       }
-      return processChat(text, {
+      const modelAccepted = await processChat(text, {
         ...options,
         eventId,
         memoryContext: `${options?.memoryContext ?? ''}${
@@ -5028,6 +5031,37 @@ export default function App() {
           options.onPrepared(reply, enrichment.skills, speechPlan);
         },
       });
+      if (modelAccepted !== false) return modelAccepted;
+      if (
+        isProactive ||
+        enrichment.isDomainSensitive ||
+        enrichment.forceFallback
+      ) {
+        return false;
+      }
+      const fallbackReply = buildCompanionGenerationFallback({
+        text: displayText,
+        viewerName: options.viewerName,
+      });
+      generationFailureByEventIdRef.current.delete(eventId);
+      processingLiveEventIdsRef.current.delete(eventId);
+      dispatchLiveHostEvent({
+        type: 'generation',
+        at: Date.now(),
+        eventId,
+        stage: 'completed',
+        turn,
+      });
+      stageLiveEngagementReply(eventId, engagementDecision, fallbackReply);
+      emitRuntimeEvent({
+        eventId,
+        attemptId: options.attemptId,
+        stage: 'companion_deterministic_fallback',
+        at: Date.now(),
+        reason: 'model_provider_unavailable',
+      });
+      options.onPrepared(fallbackReply, enrichment.skills);
+      return true;
     },
     [
       activeSoulCanon,
@@ -6730,6 +6764,7 @@ export default function App() {
           directReply?: unknown;
           viewerId?: unknown;
           viewerName?: unknown;
+          source?: unknown;
           sourceLabel?: unknown;
           sourcesSeen?: unknown;
         };
@@ -6742,6 +6777,10 @@ export default function App() {
           typeof data.viewerId === 'string' ? data.viewerId : 'external-viewer';
         const viewerName =
           typeof data.viewerName === 'string' ? data.viewerName : '001号人类';
+        const source =
+          typeof data.source === 'string' && data.source.trim()
+            ? data.source.trim()
+            : 'external-chat-bridge';
         const sourceLabel =
           typeof data.sourceLabel === 'string' && data.sourceLabel.trim()
             ? data.sourceLabel.trim()
@@ -6755,12 +6794,12 @@ export default function App() {
               .map((source) => source.trim())
               .slice(0, 8)
           : [];
-        markLiveActivity('external-chat-bridge');
+        markLiveActivity(source);
         if (!interruptProactiveSpeech(eventId, viewerId)) return;
         void enqueueOperatorMessage({
           eventId,
           text,
-          source: 'external-chat-bridge',
+          source,
           sourceLabel,
           sourcesSeen,
           viewerId:
@@ -7003,8 +7042,7 @@ export default function App() {
         );
     if (awareness) {
       const rotation = selectIdleBroadcastContent(
-        idleBroadcastRotationRef.current ??
-          createIdleBroadcastRotationState(),
+        idleBroadcastRotationRef.current ?? createIdleBroadcastRotationState(),
       );
       idleBroadcastRotationRef.current = rotation.state;
       saveIdleBroadcastRotation(

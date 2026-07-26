@@ -1,7 +1,24 @@
 import { describe, expect, it } from 'vitest';
-import { createRuntimeOwnerLeaseRegistry } from '../../examples/react-purupuru-app/server/runtimeOwnerLease';
+import {
+  createRuntimeOwnerLeaseRegistry,
+  RUNTIME_OWNER_LEASE_TTL_MS,
+} from '../../examples/react-purupuru-app/server/runtimeOwnerLease';
 
 describe('runtime owner lease registry', () => {
+  it('survives Chromium background timer throttling without rotating the token', () => {
+    let tokenNumber = 0;
+    const registry = createRuntimeOwnerLeaseRegistry({
+      ttlMs: RUNTIME_OWNER_LEASE_TTL_MS,
+      createToken: () => `token-${++tokenNumber}`,
+    });
+    const first = registry.claim({ ownerId: 'obs-owner' }, 1_000);
+    const throttledRenewal = registry.claim({ ownerId: 'obs-owner' }, 36_000);
+
+    expect(RUNTIME_OWNER_LEASE_TTL_MS).toBeGreaterThanOrEqual(90_000);
+    expect(throttledRenewal.leaseToken).toBe(first.leaseToken);
+    expect(throttledRenewal.lease.owner?.acquiredAt).toBe(1_000);
+  });
+
   it('grants one owner and exposes only sanitized public identity metadata', () => {
     const registry = createRuntimeOwnerLeaseRegistry({
       ttlMs: 10_000,
@@ -77,6 +94,79 @@ describe('runtime owner lease registry', () => {
         owner: { label: '直播总控', acquiredAt: 11_000 },
       },
     });
+  });
+
+  it('lets the OBS overlay preempt a control room but never the reverse', () => {
+    let tokenNumber = 0;
+    const registry = createRuntimeOwnerLeaseRegistry({
+      ttlMs: 10_000,
+      createToken: () => `token-${++tokenNumber}`,
+    });
+    const control = registry.claim(
+      { ownerId: 'control', label: 'control', role: 'control-room' },
+      1_000,
+    );
+    const obs = registry.claim(
+      { ownerId: 'obs', label: 'OBS', role: 'obs-overlay' },
+      2_000,
+    );
+
+    expect(obs).toMatchObject({
+      owns: true,
+      leaseToken: 'token-2',
+      lease: {
+        owner: {
+          label: 'OBS',
+          role: 'obs-overlay',
+          acquiredAt: 2_000,
+        },
+      },
+    });
+    expect(obs.leaseToken).not.toBe(control.leaseToken);
+    expect(
+      registry.claim(
+        { ownerId: 'control', label: 'control', role: 'control-room' },
+        3_000,
+      ),
+    ).toMatchObject({
+      owns: false,
+      lease: { owner: { role: 'obs-overlay' } },
+    });
+  });
+
+  it('lets a freshly connected OBS overlay replace its previous browser instance', () => {
+    let tokenNumber = 0;
+    const registry = createRuntimeOwnerLeaseRegistry({
+      ttlMs: 120_000,
+      createToken: () => `token-${++tokenNumber}`,
+    });
+    const previous = registry.claim(
+      { ownerId: 'obs-old', role: 'obs-overlay' },
+      1_000,
+    );
+    const replacement = registry.claim(
+      {
+        ownerId: 'obs-new',
+        role: 'obs-overlay',
+        replaceExistingRole: true,
+      },
+      2_000,
+    );
+
+    expect(replacement).toMatchObject({
+      owns: true,
+      leaseToken: 'token-2',
+      lease: {
+        owner: {
+          role: 'obs-overlay',
+          acquiredAt: 2_000,
+        },
+      },
+    });
+    expect(replacement.leaseToken).not.toBe(previous.leaseToken);
+    expect(
+      registry.claim({ ownerId: 'obs-old', role: 'obs-overlay' }, 3_000).owns,
+    ).toBe(false);
   });
 
   it('releases only for the current owner and expires ownership checks', () => {

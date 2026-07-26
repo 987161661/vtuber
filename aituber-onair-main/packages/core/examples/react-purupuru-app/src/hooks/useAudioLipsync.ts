@@ -1,4 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
+import {
+  releaseAudioGraphResource,
+  type AudioGraphResource,
+} from '../lib/audioNodeLifecycle';
 
 /** Number of mouth animation levels (0-4) */
 const MOUTH_LEVELS = 5;
@@ -39,8 +43,8 @@ export function useAudioLipsync() {
 
   const ctxRef = useRef<AudioContext | null>(null);
   const analyserRef = useRef<AnalyserNode | null>(null);
-  const sourceRef = useRef<AudioBufferSourceNode | null>(null);
-  const queuedSourcesRef = useRef<Set<AudioBufferSourceNode>>(new Set());
+  const activeSourceRef = useRef<AudioGraphResource | null>(null);
+  const queuedSourcesRef = useRef<Set<AudioGraphResource>>(new Set());
   const queueTimersRef = useRef<Set<number>>(new Set());
   const queueEndTimeRef = useRef(0);
   const queueHasAudioRef = useRef(false);
@@ -99,22 +103,23 @@ export function useAudioLipsync() {
   const stopCurrent = useCallback(() => {
     playbackGenerationRef.current += 1;
     // Stop the currently playing source
-    if (sourceRef.current) {
+    if (activeSourceRef.current) {
+      const resource = activeSourceRef.current;
       try {
-        sourceRef.current.stop();
+        resource.source.stop();
       } catch {
         // already stopped
       }
-      sourceRef.current.disconnect();
-      sourceRef.current = null;
+      releaseAudioGraphResource(resource);
+      activeSourceRef.current = null;
     }
-    for (const source of queuedSourcesRef.current) {
+    for (const resource of queuedSourcesRef.current) {
       try {
-        source.stop();
+        resource.source.stop();
       } catch {
         // already stopped
       }
-      source.disconnect();
+      releaseAudioGraphResource(resource);
     }
     queuedSourcesRef.current.clear();
     for (const timer of queueTimersRef.current) {
@@ -192,13 +197,18 @@ export function useAudioLipsync() {
 
       const gain = ctx.createGain();
       gain.gain.value = SPEECH_VOLUME_GAIN;
+      const resource: AudioGraphResource = {
+        source,
+        gain,
+        released: false,
+      };
 
       const analyser = ensureAnalyser(ctx);
 
       source.connect(gain);
       gain.connect(analyser);
 
-      sourceRef.current = source;
+      activeSourceRef.current = resource;
       analyserRef.current = analyser;
       setIsSpeaking(true);
 
@@ -224,7 +234,10 @@ export function useAudioLipsync() {
           setMouthLevel(0);
           setSmoothedValue(0);
           setIsSpeaking(false);
-          sourceRef.current = null;
+          if (activeSourceRef.current === resource) {
+            activeSourceRef.current = null;
+          }
+          releaseAudioGraphResource(resource);
           resolve();
         };
         source.onended = finish;
@@ -279,7 +292,12 @@ export function useAudioLipsync() {
       gain.gain.value = SPEECH_VOLUME_GAIN;
       source.connect(gain);
       gain.connect(ensureAnalyser(ctx));
-      queuedSourcesRef.current.add(source);
+      const resource: AudioGraphResource = {
+        source,
+        gain,
+        released: false,
+      };
+      queuedSourcesRef.current.add(resource);
 
       const addTimer = (callback: () => void, delayMs: number) => {
         const timer = window.setTimeout(
@@ -301,8 +319,8 @@ export function useAudioLipsync() {
 
       const ended = new Promise<void>((resolve) => {
         source.onended = () => {
-          queuedSourcesRef.current.delete(source);
-          source.disconnect();
+          queuedSourcesRef.current.delete(resource);
+          releaseAudioGraphResource(resource);
           resolve();
         };
       });
@@ -323,6 +341,10 @@ export function useAudioLipsync() {
       window.setTimeout(resolve, remainingMs + 20),
     );
     if (generation !== playbackGenerationRef.current) return;
+    for (const resource of queuedSourcesRef.current) {
+      releaseAudioGraphResource(resource);
+    }
+    queuedSourcesRef.current.clear();
     queueHasAudioRef.current = false;
     queueEndTimeRef.current = 0;
     if (rafRef.current) {

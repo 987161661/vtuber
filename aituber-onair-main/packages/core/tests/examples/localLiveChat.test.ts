@@ -3,11 +3,16 @@ import {
   buildLocalLiveChatRequest,
   classifyLocalReplyContract,
   enforceLocalReplyContract,
+  LOCAL_LIVE_CHAT_TIMEOUT_MS,
   parseLocalLiveChatResponse,
   requestLocalLiveChat,
 } from '../../examples/react-purupuru-app/server/localLiveChat';
 
 describe('local live chat', () => {
+  it('allows the warmed local model enough time to produce a short reply', () => {
+    expect(LOCAL_LIVE_CHAT_TIMEOUT_MS).toBeGreaterThanOrEqual(10_000);
+  });
+
   it('builds a bounded non-thinking conversational request', () => {
     const request = buildLocalLiveChatRequest({
       text: '你是机器人吗？',

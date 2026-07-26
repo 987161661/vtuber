@@ -12,7 +12,10 @@ import { spawn } from 'node:child_process';
 import { dirname, resolve } from 'node:path';
 import { createInterface } from 'node:readline';
 import { fileURLToPath } from 'node:url';
-import { LiveEventHub, splitLiveChatText } from './live-platform-gateway-common.mjs';
+import {
+  LiveEventHub,
+  splitLiveChatText,
+} from './live-platform-gateway-common.mjs';
 
 const DEFAULT_PORT = 8197;
 const DEFAULT_SEND_INTERVAL_MS = 1600;
@@ -20,7 +23,8 @@ const OUTBOUND_ECHO_TTL_MS = 30_000;
 const BILIBILI_HISTORY_POLL_MS = 2_000;
 const BILIBILI_HISTORY_HEALTH_TTL_MS = BILIBILI_HISTORY_POLL_MS * 5;
 const RADAR_CITY_EVENT_URL =
-  process.env.RADAR_CITY_EVENT_URL || 'http://127.0.0.1:3038/api/live-city-events';
+  process.env.RADAR_CITY_EVENT_URL ||
+  'http://127.0.0.1:3038/api/live-city-events';
 const HOST_EXTERNAL_CHAT_URL =
   process.env.LINGLAN_EXTERNAL_CHAT_URL ||
   'http://127.0.0.1:5173/api/external-chat';
@@ -32,19 +36,44 @@ const runtimeRoot = resolve(workspaceRoot, '.runtime', 'live-connectors');
 const configFile = resolve(runtimeRoot, 'ordinaryroad.json');
 const credentialRoot = resolve(runtimeRoot, 'credentials', 'ordinaryroad');
 const legacyAuthFile =
-  process.env.BILIBILI_AUTH_FILE || resolve(workspaceRoot, '.runtime', 'bilibili-auth.json');
+  process.env.BILIBILI_AUTH_FILE ||
+  resolve(workspaceRoot, '.runtime', 'bilibili-auth.json');
 const legacyRoomFile = resolve(appRoot, 'config', 'bilibili-room.txt');
 const bridgeJar =
   process.env.ORDINARYROAD_GATEWAY_JAR ||
-  resolve(appRoot, 'tools', 'ordinaryroad-gateway', 'target', 'ordinaryroad-gateway.jar');
+  resolve(
+    appRoot,
+    'tools',
+    'ordinaryroad-gateway',
+    'target',
+    'ordinaryroad-gateway.jar',
+  );
 const runtimeAuditUrl =
   process.env.LINGLAN_RUNTIME_AUDIT_URL ||
   'http://127.0.0.1:5173/api/live-runtime-events';
 
 const PLATFORM_MANIFEST = [
-  { id: 'bilibili', label: '哔哩哔哩', inbound: true, outbound: true, credential: true },
-  { id: 'douyu', label: '斗鱼', inbound: true, outbound: true, credential: true },
-  { id: 'huya', label: '虎牙', inbound: true, outbound: true, credential: true },
+  {
+    id: 'bilibili',
+    label: '哔哩哔哩',
+    inbound: true,
+    outbound: true,
+    credential: true,
+  },
+  {
+    id: 'douyu',
+    label: '斗鱼',
+    inbound: true,
+    outbound: true,
+    credential: true,
+  },
+  {
+    id: 'huya',
+    label: '虎牙',
+    inbound: true,
+    outbound: true,
+    credential: true,
+  },
   {
     id: 'douyin',
     label: '抖音',
@@ -53,7 +82,13 @@ const PLATFORM_MANIFEST = [
     credential: false,
     note: 'OrdinaryRoad 当前只保证接收，文字回写尚未稳定实现。',
   },
-  { id: 'kuaishou', label: '快手', inbound: true, outbound: true, credential: true },
+  {
+    id: 'kuaishou',
+    label: '快手',
+    inbound: true,
+    outbound: true,
+    credential: true,
+  },
 ];
 const PLATFORM_IDS = new Set(PLATFORM_MANIFEST.map((item) => item.id));
 const SELF_VIEWER_IDS = new Set(
@@ -62,7 +97,8 @@ const SELF_VIEWER_IDS = new Set(
     .map((value) => value.trim())
     .filter(Boolean),
 );
-const RADAR_CITY_COMMAND = /^@\s*[\u3400-\u9fff]{2,16}[\s,，。！？!？、:：;；#]?$/u;
+const RADAR_CITY_COMMAND =
+  /^@\s*[\u3400-\u9fff]{2,16}[\s,，。！？!？、:：;；#]?$/u;
 
 export function shouldSuppressConfiguredSelfEvent(
   event,
@@ -72,19 +108,31 @@ export function shouldSuppressConfiguredSelfEvent(
   if (!viewerId || !selfViewerIds.has(viewerId)) return false;
   if (
     event?.type === 'comment' &&
-    RADAR_CITY_COMMAND.test(String(event.text || '').trim().normalize('NFKC'))
+    RADAR_CITY_COMMAND.test(
+      String(event.text || '')
+        .trim()
+        .normalize('NFKC'),
+    )
   ) {
     return false;
   }
   return true;
 }
 
+export function shouldUseHostCommentFallback(connectedClients) {
+  return Math.max(0, Number(connectedClients) || 0) === 0;
+}
+
 function log(level, message, details = {}) {
-  process.stdout.write(`${JSON.stringify({ at: Date.now(), level, message, ...details })}\n`);
+  process.stdout.write(
+    `${JSON.stringify({ at: Date.now(), level, message, ...details })}\n`,
+  );
 }
 
 function safeError(error) {
-  return String(error instanceof Error ? error.message : error || 'unknown_error')
+  return String(
+    error instanceof Error ? error.message : error || 'unknown_error',
+  )
     .replace(
       /((?:SESSDATA|bili_jct|cookie|authorization|token|credential)\s*[:=]\s*)([^;\s,}]+)/gi,
       '$1[REDACTED]',
@@ -179,11 +227,7 @@ export function shouldRetryFailedPlatformConnection(config, status) {
   );
 }
 
-export function effectivePlatformStatus(
-  status,
-  config,
-  now = Date.now(),
-) {
+export function effectivePlatformStatus(status, config, now = Date.now()) {
   const snapshot = structuredClone(status);
   const fallbackHealthy =
     snapshot.platformId === 'bilibili' &&
@@ -236,7 +280,11 @@ function loadCredential(platformId) {
 }
 
 function cookieValue(cookie, name) {
-  return String(cookie || '').match(new RegExp(`(?:^|;\\s*)${name}=([^;]+)`))?.[1]?.trim() || '';
+  return (
+    String(cookie || '')
+      .match(new RegExp(`(?:^|;\\s*)${name}=([^;]+)`))?.[1]
+      ?.trim() || ''
+  );
 }
 
 function legacyRoomId() {
@@ -323,7 +371,10 @@ class OrdinaryRoadProcess {
           this.pending.delete(message.commandId);
           clearTimeout(pending.timer);
           if (message.ok) pending.resolve(message);
-          else pending.reject(new Error(message.error || 'ordinaryroad_send_failed'));
+          else
+            pending.reject(
+              new Error(message.error || 'ordinaryroad_send_failed'),
+            );
         }
       }
       this.onMessage(message);
@@ -348,7 +399,8 @@ class OrdinaryRoadProcess {
   }
 
   command(payload) {
-    if (!this.process?.stdin?.writable) throw new Error('ordinaryroad_not_ready');
+    if (!this.process?.stdin?.writable)
+      throw new Error('ordinaryroad_not_ready');
     this.process.stdin.write(`${JSON.stringify(payload)}\n`);
   }
 
@@ -357,7 +409,8 @@ class OrdinaryRoadProcess {
   }
 
   disconnect(connectionId) {
-    if (this.process?.stdin?.writable) this.command({ action: 'disconnect', connectionId });
+    if (this.process?.stdin?.writable)
+      this.command({ action: 'disconnect', connectionId });
   }
 
   send(connectionId, message) {
@@ -367,7 +420,11 @@ class OrdinaryRoadProcess {
         this.pending.delete(commandId);
         rejectSend(new Error('ordinaryroad_send_timeout'));
       }, 25_000);
-      this.pending.set(commandId, { resolve: resolveSend, reject: rejectSend, timer });
+      this.pending.set(commandId, {
+        resolve: resolveSend,
+        reject: rejectSend,
+        timer,
+      });
       try {
         this.command({ action: 'send', commandId, connectionId, message });
       } catch (error) {
@@ -406,8 +463,12 @@ class LivePlatformGateway {
         {
           platformId: manifest.id,
           roomId: this.config.platforms[manifest.id]?.roomId || '',
-          state: this.config.platforms[manifest.id]?.enabled ? 'starting' : 'disabled',
-          credentialState: loadCredential(manifest.id) ? 'configured' : 'missing',
+          state: this.config.platforms[manifest.id]?.enabled
+            ? 'starting'
+            : 'disabled',
+          credentialState: loadCredential(manifest.id)
+            ? 'configured'
+            : 'missing',
           inbound: manifest.inbound,
           outbound: manifest.outbound,
           normalizedEvents: 0,
@@ -419,7 +480,9 @@ class LivePlatformGateway {
         },
       ]),
     );
-    this.bridge = new OrdinaryRoadProcess({ onMessage: (message) => this.handleBridgeMessage(message) });
+    this.bridge = new OrdinaryRoadProcess({
+      onMessage: (message) => this.handleBridgeMessage(message),
+    });
   }
 
   connectionId(platformId) {
@@ -447,7 +510,8 @@ class LivePlatformGateway {
     const reservations = this.pendingOutboundEchoes.get(reservation.key);
     if (!reservations) return;
     const remaining = reservations.filter((item) => item.id !== reservation.id);
-    if (remaining.length) this.pendingOutboundEchoes.set(reservation.key, remaining);
+    if (remaining.length)
+      this.pendingOutboundEchoes.set(reservation.key, remaining);
     else this.pendingOutboundEchoes.delete(reservation.key);
   }
 
@@ -498,7 +562,10 @@ class LivePlatformGateway {
         this.syncConnections();
       }
     }, 4_000);
-    this.authTimer = setInterval(() => void this.refreshCredentialStates(), 60_000);
+    this.authTimer = setInterval(
+      () => void this.refreshCredentialStates(),
+      60_000,
+    );
     // OrdinaryRoad emits only live-status changes.  A gateway started after
     // the stream has begun would otherwise retain the initial false value and
     // suppress quiet-room dialogue for the entire session.
@@ -517,7 +584,8 @@ class LivePlatformGateway {
     clearInterval(this.authTimer);
     clearInterval(this.liveStatusTimer);
     clearInterval(this.bilibiliHistoryTimer);
-    for (const timer of this.connectionRetryTimers.values()) clearTimeout(timer);
+    for (const timer of this.connectionRetryTimers.values())
+      clearTimeout(timer);
     this.connectionRetryTimers.clear();
     this.bridge.stop();
   }
@@ -647,22 +715,29 @@ class LivePlatformGateway {
   async refreshCredentialStates() {
     for (const manifest of PLATFORM_MANIFEST) {
       const cookie = loadCredential(manifest.id);
-      this.platforms[manifest.id].credentialState = cookie ? 'configured' : 'missing';
+      this.platforms[manifest.id].credentialState = cookie
+        ? 'configured'
+        : 'missing';
     }
     const cookie = loadCredential('bilibili');
     if (!cookie) return;
     try {
-      const response = await fetch('https://api.bilibili.com/x/web-interface/nav', {
-        headers: {
-          Cookie: cookie,
-          Referer: 'https://www.bilibili.com/',
-          'User-Agent': 'Mozilla/5.0 Chrome/136 Safari/537.36',
+      const response = await fetch(
+        'https://api.bilibili.com/x/web-interface/nav',
+        {
+          headers: {
+            Cookie: cookie,
+            Referer: 'https://www.bilibili.com/',
+            'User-Agent': 'Mozilla/5.0 Chrome/136 Safari/537.36',
+          },
+          signal: AbortSignal.timeout(8000),
         },
-        signal: AbortSignal.timeout(8000),
-      });
+      );
       const payload = await response.json();
       this.platforms.bilibili.credentialState =
-        response.ok && payload?.code === 0 && payload?.data?.isLogin ? 'valid' : 'invalid';
+        response.ok && payload?.code === 0 && payload?.data?.isLogin
+          ? 'valid'
+          : 'invalid';
     } catch {
       this.platforms.bilibili.credentialState = 'unknown';
     }
@@ -692,7 +767,9 @@ class LivePlatformGateway {
         status.normalizedEvents += 1;
         status.lastEventAt = Date.now();
         void forwardCityCommentToRadar(message.event, platformId);
-        void forwardLiveCommentToHost(message.event, platformId);
+        if (shouldUseHostCommentFallback(this.hub.clients.size)) {
+          void forwardLiveCommentToHost(message.event, platformId);
+        }
       }
       return;
     }
@@ -738,8 +815,11 @@ class LivePlatformGateway {
   }
 
   updatePlatform(platformId, update) {
-    if (!PLATFORM_IDS.has(platformId)) throw new Error('ordinaryroad_platform_unsupported');
-    const roomId = String(update.roomId ?? this.config.platforms[platformId].roomId).trim();
+    if (!PLATFORM_IDS.has(platformId))
+      throw new Error('ordinaryroad_platform_unsupported');
+    const roomId = String(
+      update.roomId ?? this.config.platforms[platformId].roomId,
+    ).trim();
     const enabled = update.enabled === true;
     if (enabled && !roomId) throw new Error('live_room_id_required');
     this.config.platforms[platformId] = { enabled, roomId };
@@ -756,10 +836,14 @@ class LivePlatformGateway {
   }
 
   async updateCredential(platformId, cookie) {
-    if (!PLATFORM_IDS.has(platformId)) throw new Error('ordinaryroad_platform_unsupported');
+    if (!PLATFORM_IDS.has(platformId))
+      throw new Error('ordinaryroad_platform_unsupported');
     const value = String(cookie || '').trim();
     if (!value) throw new Error('credential_empty');
-    writeJsonAtomic(credentialPath(platformId), { cookie: value, updatedAt: Date.now() });
+    writeJsonAtomic(credentialPath(platformId), {
+      cookie: value,
+      updatedAt: Date.now(),
+    });
     await this.refreshCredentialStates();
     if (this.config.platforms[platformId]?.enabled) this.syncConnections();
     emitAudit({
@@ -771,8 +855,12 @@ class LivePlatformGateway {
   }
 
   clearCredential(platformId) {
-    if (!PLATFORM_IDS.has(platformId)) throw new Error('ordinaryroad_platform_unsupported');
-    writeJsonAtomic(credentialPath(platformId), { cookie: '', updatedAt: Date.now() });
+    if (!PLATFORM_IDS.has(platformId))
+      throw new Error('ordinaryroad_platform_unsupported');
+    writeJsonAtomic(credentialPath(platformId), {
+      cookie: '',
+      updatedAt: Date.now(),
+    });
     this.platforms[platformId].credentialState = 'missing';
     if (this.config.platforms[platformId]?.enabled) this.syncConnections();
   }
@@ -780,19 +868,27 @@ class LivePlatformGateway {
   async sendDanmu(platformId, message, idempotencyKey) {
     const manifest = PLATFORM_MANIFEST.find((item) => item.id === platformId);
     if (!manifest) throw new Error('ordinaryroad_platform_unsupported');
-    if (!manifest.outbound) throw new Error('ordinaryroad_platform_receive_only');
+    if (!manifest.outbound)
+      throw new Error('ordinaryroad_platform_receive_only');
     const config = this.config.platforms[platformId];
-    if (!config?.enabled || !config.roomId) throw new Error('ordinaryroad_platform_not_enabled');
+    if (!config?.enabled || !config.roomId)
+      throw new Error('ordinaryroad_platform_not_enabled');
     const key = String(idempotencyKey || '').trim();
     if (!key) throw new Error('ordinaryroad_idempotency_key_invalid');
-    const chunks = splitLiveChatText(message, platformId === 'bilibili' ? 20 : 50);
+    const chunks = splitLiveChatText(
+      message,
+      platformId === 'bilibili' ? 20 : 50,
+    );
     if (!chunks.length) throw new Error('ordinaryroad_message_empty');
     if (chunks.length > 8) throw new Error('ordinaryroad_message_too_long');
     const compoundKey = `${platformId}:${key}`;
-    const fingerprint = createHash('sha256').update(chunks.join('\n')).digest('hex');
+    const fingerprint = createHash('sha256')
+      .update(chunks.join('\n'))
+      .digest('hex');
     const existing = this.idempotency.get(compoundKey);
     if (existing) {
-      if (existing.fingerprint !== fingerprint) throw new Error('ordinaryroad_idempotency_key_conflict');
+      if (existing.fingerprint !== fingerprint)
+        throw new Error('ordinaryroad_idempotency_key_conflict');
       if (existing.result) return { ...existing.result, duplicate: true };
       return existing.promise;
     }
@@ -802,8 +898,15 @@ class LivePlatformGateway {
     const operation = (async () => {
       let chunksSent = 0;
       for (const chunk of chunks) {
-        if (chunksSent) await new Promise((resolveDelay) => setTimeout(resolveDelay, DEFAULT_SEND_INTERVAL_MS));
-        const echoReservation = this.reserveOutboundEcho(platformId, chunk, key);
+        if (chunksSent)
+          await new Promise((resolveDelay) =>
+            setTimeout(resolveDelay, DEFAULT_SEND_INTERVAL_MS),
+          );
+        const echoReservation = this.reserveOutboundEcho(
+          platformId,
+          chunk,
+          key,
+        );
         try {
           await this.bridge.send(this.connectionId(platformId), chunk);
         } catch (error) {
@@ -825,13 +928,18 @@ class LivePlatformGateway {
       if (stored) stored.result = result;
       return result;
     })();
-    this.idempotency.set(compoundKey, { fingerprint, promise: operation, result: null });
+    this.idempotency.set(compoundKey, {
+      fingerprint,
+      promise: operation,
+      result: null,
+    });
     return operation;
   }
 }
 
 export async function forwardCityCommentToRadar(event, platform, options = {}) {
-  if (event?.type !== 'comment' || !String(event.text || '').trim()) return false;
+  if (event?.type !== 'comment' || !String(event.text || '').trim())
+    return false;
   const fetcher = options.fetcher || fetch;
   const timeoutMs = Number(options.timeoutMs) || 3_000;
   const retryDelaysMs = options.retryDelaysMs || [250, 1_000, 2_500];
@@ -844,12 +952,17 @@ export async function forwardCityCommentToRadar(event, platform, options = {}) {
     viewerName: String(event.author?.name || ''),
     platform: String(platform || event.metadata?.platformId || 'live'),
     followEvidence: 'unknown',
-    receivedAt: Number(event.metadata?.receivedAt) || Number(event.timestamp) || Date.now(),
+    receivedAt:
+      Number(event.metadata?.receivedAt) ||
+      Number(event.timestamp) ||
+      Date.now(),
   };
   let lastError = null;
   for (let attempt = 0; attempt <= retryDelaysMs.length; attempt += 1) {
     if (attempt > 0) {
-      await new Promise((resolveRetry) => setTimeout(resolveRetry, retryDelaysMs[attempt - 1]));
+      await new Promise((resolveRetry) =>
+        setTimeout(resolveRetry, retryDelaysMs[attempt - 1]),
+      );
     }
     try {
       const response = await fetcher(RADAR_CITY_EVENT_URL, {
@@ -890,6 +1003,11 @@ export async function forwardLiveCommentToHost(event, platform, options = {}) {
     viewerId: String(event.author?.id || ''),
     viewerName: String(event.author?.name || ''),
     requestedAt: Number(event.timestamp) || Date.now(),
+    source: String(platform || 'live'),
+    sourceLabel:
+      PLATFORM_MANIFEST.find((item) => item.id === platform)?.label ||
+      String(platform || 'live'),
+    sourcesSeen: [String(platform || 'live')],
   };
   let lastError = null;
   for (let attempt = 0; attempt <= retryDelaysMs.length; attempt += 1) {
@@ -940,7 +1058,10 @@ function readRequestJson(request, maxSize = 16_384) {
 }
 
 function createGatewayServer(gateway, port) {
-  const allowedOrigins = new Set(['http://127.0.0.1:5173', 'http://localhost:5173']);
+  const allowedOrigins = new Set([
+    'http://127.0.0.1:5173',
+    'http://localhost:5173',
+  ]);
   const server = createServer((request, response) => {
     const requestUrl = new URL(request.url, `http://127.0.0.1:${port}`);
     response.setHeader('Cache-Control', 'no-store');
@@ -952,10 +1073,20 @@ function createGatewayServer(gateway, port) {
       return;
     }
     if (requestUrl.pathname === '/manifest' && request.method === 'GET') {
-      response.end(JSON.stringify({ id: 'ordinaryroad', label: 'OrdinaryRoad', platforms: PLATFORM_MANIFEST }));
+      response.end(
+        JSON.stringify({
+          id: 'ordinaryroad',
+          label: 'OrdinaryRoad',
+          platforms: PLATFORM_MANIFEST,
+        }),
+      );
       return;
     }
-    if ((requestUrl.pathname === '/status' || requestUrl.pathname === '/health') && request.method === 'GET') {
+    if (
+      (requestUrl.pathname === '/status' ||
+        requestUrl.pathname === '/health') &&
+      request.method === 'GET'
+    ) {
       response.end(JSON.stringify(gateway.safeStatus()));
       return;
     }
@@ -967,25 +1098,41 @@ function createGatewayServer(gateway, port) {
       });
       gateway.hub.add(
         response,
-        String(request.headers['last-event-id'] || requestUrl.searchParams.get('lastEventId') || ''),
+        String(
+          request.headers['last-event-id'] ||
+            requestUrl.searchParams.get('lastEventId') ||
+            '',
+        ),
         String(requestUrl.searchParams.get('client') || ''),
         gateway.safeStatus(),
       );
-      const keepAlive = setInterval(() => response.write(': keepalive\n\n'), 15_000);
+      const keepAlive = setInterval(
+        () => response.write(': keepalive\n\n'),
+        15_000,
+      );
       request.on('close', () => {
         clearInterval(keepAlive);
         gateway.hub.remove(response);
       });
       return;
     }
-    const platformRoute = requestUrl.pathname.match(/^\/platforms\/([^/]+)\/(config|credential)$/);
+    const platformRoute = requestUrl.pathname.match(
+      /^\/platforms\/([^/]+)\/(config|credential)$/,
+    );
     if (platformRoute) {
       const platformId = decodeURIComponent(platformRoute[1]);
       const resource = platformRoute[2];
       void (async () => {
         try {
           if (resource === 'config' && request.method === 'PUT') {
-            response.end(JSON.stringify(gateway.updatePlatform(platformId, await readRequestJson(request))));
+            response.end(
+              JSON.stringify(
+                gateway.updatePlatform(
+                  platformId,
+                  await readRequestJson(request),
+                ),
+              ),
+            );
             return;
           }
           if (resource === 'credential' && request.method === 'PUT') {
@@ -1014,9 +1161,16 @@ function createGatewayServer(gateway, port) {
         try {
           payload = await readRequestJson(request);
           const platformId = String(payload.platformId || 'bilibili');
-          const result = await gateway.sendDanmu(platformId, payload.message, payload.idempotencyKey);
+          const result = await gateway.sendDanmu(
+            platformId,
+            payload.message,
+            payload.idempotencyKey,
+          );
           emitAudit({
-            eventId: String(payload.idempotencyKey || '').replace(/^speech:/, ''),
+            eventId: String(payload.idempotencyKey || '').replace(
+              /^speech:/,
+              '',
+            ),
             stage: 'live_platform_delivery_succeeded',
             connectorId: 'ordinaryroad',
             platformId,
@@ -1060,7 +1214,11 @@ async function main() {
   process.once('SIGTERM', shutdown);
 }
 
-if (process.argv[1] && import.meta.url === new URL(`file:///${process.argv[1].replace(/\\/g, '/')}`).href) {
+if (
+  process.argv[1] &&
+  import.meta.url ===
+    new URL(`file:///${process.argv[1].replace(/\\/g, '/')}`).href
+) {
   main().catch((error) => {
     log('error', 'Live-platform gateway failed', { error: safeError(error) });
     process.exitCode = 1;

@@ -21,6 +21,9 @@ export function resolveEffectiveLiveRoomStatus(
   const nestedOnlineCount = platformOnlineCounts.length
     ? Math.max(...platformOnlineCounts)
     : undefined;
+  const platformIsLive = Object.values(status.platforms || {}).some(
+    (platform) => platform.isLive === true,
+  );
   const onlineCount =
     nestedOnlineCount === undefined
       ? status.onlineCount
@@ -30,7 +33,7 @@ export function resolveEffectiveLiveRoomStatus(
     authority.obsOverlayActive &&
     authority.autoBroadcastEnabled;
 
-  const isLive = status.isLive === true || obsRuntimeIsLive;
+  const isLive = status.isLive === true || platformIsLive || obsRuntimeIsLive;
   if (status.isLive === isLive && status.onlineCount === onlineCount)
     return status;
   return { ...status, isLive, onlineCount };

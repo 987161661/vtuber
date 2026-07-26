@@ -1,5 +1,8 @@
 export const LOCAL_LIVE_CHAT_MODEL = 'qwen3:8b';
-export const LOCAL_LIVE_CHAT_TIMEOUT_MS = 3_000;
+// The local 8B model takes about 7 seconds for a short warmed reply on the
+// broadcast machine, and a cold load can add roughly 9 seconds. This is only
+// a cancellation ceiling; it does not delay replies that finish sooner.
+export const LOCAL_LIVE_CHAT_TIMEOUT_MS = 20_000;
 
 export type LocalLiveChatInput = {
   text: string;

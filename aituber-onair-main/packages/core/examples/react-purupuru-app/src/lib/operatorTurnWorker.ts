@@ -23,6 +23,8 @@ export type OperatorTurnWorkPlan = {
   speak: OperatorQueueItem | null;
 };
 
+const MAX_RECONNECT_PENDING_AGE_MS = 15 * 60_000;
+
 export function coordinatorGenerationStagesForReadyTurn(
   activeTurnEventId: string | undefined,
   readyEventId: string,
@@ -39,10 +41,17 @@ function belongsToOwner(item: OperatorQueueItem, ownerId: string): boolean {
 function enteredCurrentScope(
   item: OperatorQueueItem,
   scopeActivatedAt: number,
+  now: number,
 ): boolean {
   return (
     item.createdAt >= scopeActivatedAt ||
-    item.finishReason === 'lease_expired_requeued'
+    (item.status === 'ready' &&
+      (item.preparedAt ?? item.updatedAt) >= scopeActivatedAt) ||
+    item.finishReason === 'lease_expired_requeued' ||
+    (item.status === 'pending' &&
+      Boolean(item.scope) &&
+      now - Math.max(item.createdAt, item.updatedAt) <=
+        MAX_RECONNECT_PENDING_AGE_MS)
   );
 }
 
@@ -62,7 +71,7 @@ export function planOperatorTurnWork(
       ? (queue.find(
           (item) =>
             item.status === 'pending' &&
-            enteredCurrentScope(item, runtime.scopeActivatedAt) &&
+            enteredCurrentScope(item, runtime.scopeActivatedAt, now) &&
             belongsToOwner(item, runtime.ownerId),
         ) ?? null)
       : null;
@@ -73,7 +82,8 @@ export function planOperatorTurnWork(
     ? (queue.find(
         (item) =>
           isStaleReadyReply(item, now) &&
-          enteredCurrentScope(item, runtime.scopeActivatedAt) &&
+          (enteredCurrentScope(item, runtime.scopeActivatedAt, now) ||
+            Boolean(item.scope)) &&
           belongsToOwner(item, runtime.ownerId),
       ) ?? null)
     : null;
@@ -83,7 +93,7 @@ export function planOperatorTurnWork(
           (item) =>
             item.status === 'ready' &&
             Boolean(item.preparedReply) &&
-            item.createdAt >= runtime.scopeActivatedAt &&
+            enteredCurrentScope(item, runtime.scopeActivatedAt, now) &&
             belongsToOwner(item, runtime.ownerId),
         ) ?? null)
       : null;

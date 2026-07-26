@@ -1,5 +1,10 @@
 import { createHash, randomBytes } from 'node:crypto';
 
+// OBS/Chromium can throttle timers in a hidden browser source to roughly one
+// wake-up every 30-40 seconds. Keep enough headroom to renew without rotating
+// the mutation-fence token and re-running expensive runtime recovery.
+export const RUNTIME_OWNER_LEASE_TTL_MS = 120_000;
+
 export type RuntimeOwnerRole =
   | 'control-room'
   | 'obs-overlay'
@@ -10,6 +15,7 @@ export type RuntimeOwnerLeaseClaim = {
   ownerId: string;
   label?: string;
   role?: RuntimeOwnerRole;
+  replaceExistingRole?: boolean;
 };
 
 export type RuntimeOwnerLeaseSnapshot = {
@@ -136,17 +142,35 @@ export function createRuntimeOwnerLeaseRegistry(options: {
     claim(claim, at = now()) {
       const normalized = normalizeClaim(claim);
       prune(at);
-      if (activeLease && activeLease.ownerId !== normalized.ownerId) {
+      const replacingOwner =
+        Boolean(activeLease) && activeLease?.ownerId !== normalized.ownerId;
+      const obsMayPreemptControlRoom =
+        replacingOwner &&
+        normalized.role === 'obs-overlay' &&
+        (activeLease?.role === 'control-room' ||
+          activeLease?.role === 'unknown');
+      const obsReconnectMayReplacePreviousInstance =
+        replacingOwner &&
+        claim.replaceExistingRole === true &&
+        normalized.role === 'obs-overlay' &&
+        activeLease?.role === 'obs-overlay';
+      if (
+        replacingOwner &&
+        !obsMayPreemptControlRoom &&
+        !obsReconnectMayReplacePreviousInstance
+      ) {
         return { owns: false, lease: snapshot(at) };
       }
       activeLease = {
         ownerId: normalized.ownerId,
         label: normalized.label,
         role: normalized.role,
-        acquiredAt: activeLease?.acquiredAt ?? at,
+        acquiredAt: replacingOwner ? at : (activeLease?.acquiredAt ?? at),
         renewedAt: at,
         expiresAt: at + options.ttlMs,
-        leaseToken: activeLease?.leaseToken ?? createToken(),
+        leaseToken: replacingOwner
+          ? createToken()
+          : (activeLease?.leaseToken ?? createToken()),
       };
       return {
         owns: true,
