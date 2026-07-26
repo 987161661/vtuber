@@ -33,9 +33,12 @@ export function classifyOperatorGenerationFailure(
   return {
     reason,
     error: errorMessage,
-    retryable:
-      reason !== 'generation_auth_failed' &&
-      reason !== 'generation_truncated',
+    // A captured provider failure has already exhausted the retry owned by
+    // the MiniMax gateway. Replaying it here would reuse the same eventId in
+    // the Soul decision/projection pipeline, whose reservation is deliberately
+    // idempotent. That second pass can collide with the first reservation
+    // (legacy migration HTTP 409) and stall the runtime-owner heartbeat.
+    retryable: false,
   };
 }
 
