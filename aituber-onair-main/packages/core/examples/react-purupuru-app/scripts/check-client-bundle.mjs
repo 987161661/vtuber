@@ -7,11 +7,9 @@ const assetsDirectory = fileURLToPath(
 );
 const maximumChunkBytes = 500 * 1024;
 const requiredLazyChunks = [
-  'ControlRoom-',
-  'SettingsPanel-',
-  'VoiceEngineFactory-',
+  'control-room-',
+  'settings-panel-',
   'SimulatorRoomConsole-',
-  'LiveConnectorConsole-',
   'BroadcastTopologyPanel-',
   'SoulInspectorPanel-',
 ];

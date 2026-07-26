@@ -118,6 +118,30 @@ describe('live runtime event request handler', () => {
     ]);
   });
 
+  it('uses server receipt time for liveness even when the browser clock drifts', async () => {
+    const { handleRequest, monitor } = createHarness();
+    const rawBody = JSON.stringify({
+      stage: 'runtime-owner-heartbeat',
+      ownerId: 'owner-a',
+      at: 1,
+      availableForStress: true,
+      ttsConfigured: true,
+    });
+
+    await handleRequest({
+      rawBody,
+      byteLength: Buffer.byteLength(rawBody),
+      headers: {},
+    });
+
+    expect(monitor.healthSnapshot(2_000).runtimeOwner).toEqual({
+      active: true,
+      available: true,
+      ttsConfigured: true,
+    });
+    expect(monitor.healthSnapshot(2_000).lastEventAt).toBe(2_000);
+  });
+
   it('rejects oversized input and audits the failure without the raw body', async () => {
     const { attestEvent, audits, handleRequest, logs, monitor } =
       createHarness();

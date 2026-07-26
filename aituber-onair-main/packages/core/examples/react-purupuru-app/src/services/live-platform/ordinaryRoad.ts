@@ -8,6 +8,26 @@ import type {
 } from './types';
 
 const DEFAULT_ENDPOINT = '/api/live-connectors/ordinaryroad';
+const DEFAULT_PLATFORM_QR_AUTH_ENDPOINT =
+  '/api/live-connectors/platform-auth';
+
+export type PlatformQrAuthState =
+  | 'idle'
+  | 'waiting-scan'
+  | 'waiting-confirmation'
+  | 'authenticated'
+  | 'expired'
+  | 'error';
+
+export interface PlatformQrAuthSession {
+  id?: string;
+  platformId?: string;
+  platformLabel?: string;
+  state: PlatformQrAuthState;
+  qrDataUrl?: string;
+  expiresAt?: number;
+  detail?: string;
+}
 
 function endpoint(value?: string) {
   return value?.trim().replace(/\/$/, '') || DEFAULT_ENDPOINT;
@@ -94,6 +114,36 @@ export async function clearOrdinaryRoadCredential(
     `${endpoint(gatewayUrl)}/platforms/${encodeURIComponent(platformId)}/credential`,
     { method: 'DELETE' },
   );
+}
+
+async function requestPlatformQrAuth(
+  platformId: string,
+  path: string,
+  init?: RequestInit,
+): Promise<PlatformQrAuthSession> {
+  const response = await fetch(
+    `${DEFAULT_PLATFORM_QR_AUTH_ENDPOINT}/platforms/${encodeURIComponent(platformId)}${path}`,
+    { cache: 'no-store', ...init },
+  );
+  const payload = (await response.json().catch(() => null)) as
+    | PlatformQrAuthSession
+    | null;
+  if (!response.ok || !payload) {
+    throw new Error(payload?.detail || `bilibili_qr_auth_http_${response.status}`);
+  }
+  return payload;
+}
+
+export function startPlatformQrAuth(platformId: string) {
+  return requestPlatformQrAuth(platformId, '/start', { method: 'POST' });
+}
+
+export function fetchPlatformQrAuthStatus(platformId: string) {
+  return requestPlatformQrAuth(platformId, '/status');
+}
+
+export function cancelPlatformQrAuth(platformId: string) {
+  return requestPlatformQrAuth(platformId, '/cancel', { method: 'DELETE' });
 }
 
 export async function sendOrdinaryRoadReply(

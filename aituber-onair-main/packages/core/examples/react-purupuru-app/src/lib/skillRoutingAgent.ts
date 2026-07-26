@@ -8,13 +8,17 @@ const SPECIALIST_ROUTE_SIGNAL =
 
 const DEDICATED_TYPHOON_SOURCE =
   /(?:\u53f0\u98ce.*\u96f7\u8fbe|typhoon.*radar)/iu;
+const RADAR_CITY_DIALOG_SOURCE = /(?:\u53f0\u98ce\u96f7\u8fbe\u5bf9\u8bdd)/u;
+const EXPLICIT_TYPHOON_FACT_QUERY =
+  /(?:\u540e\u9762|\u63a5\u4e0b\u6765|\u8fd8\u6709|\u53e6\u4e00\u4e2a).{0,12}\u53f0\u98ce|\u53f0\u98ce.{0,12}(?:\u5230\u54ea|\u5728\u54ea|\u600e\u4e48\u6837|\u4ec0\u4e48\u60c5\u51b5|\u8def\u5f84|\u767b\u9646)/u;
 const TYPHOON_ROOM_ENTITY_STATUS =
   /^(?!\u4f60|\u6211|\u4ed6|\u5979|\u5927\u5bb6|\u4e3b\u64ad|\u76f4\u64ad\u95f4)[\p{Script=Han}A-Za-z0-9\-\u00b7]{1,16}(?:[\s\uff0c\u3001\uff1f?]*(?:\u4ed6|\u5b83|\u5979))?(?:\u73b0\u5728)?(?:\u600e\u4e48\u6837\u4e86?|\u600e\u6837\u4e86?|\u4ec0\u4e48\u60c5\u51b5\u4e86?|\u5230\u54ea(?:\u91cc)?\u4e86?|\u5728\u54ea(?:\u91cc)?)(?:[\s\uff0c\u3002\uff01\uff1f,.!?]*)$/u;
+const RADAR_CITY_STATUS =
+  /^(?<location>[\p{Script=Han}]{1,10}(?:\u5e02|\u5dde|\u53bf|\u533a|\u7701|\u65d7|\u76df|\u4eac|\u6d25|\u6caa|\u6e1d|\u5733|\u839e|\u6c49|\u95e8|\u6c99|\u5b81|\u9633|\u5c71|\u6d77))(?:\u73b0\u5728)?(?:\u600e\u4e48\u6837\u4e86?|\u600e\u6837\u4e86?|\u4ec0\u4e48\u60c5\u51b5\u4e86?)(?:[\s\uff0c\u3002\uff01\uff1f,.!?]*)$/u;
 const WEATHER_HAZARD_SIGNAL =
   /(?:\u96e8\u707e|\u6c34\u707e|\u6d2a\u6c34|\u5185\u6d9d|\u79ef\u6c34|\u5c71\u6d2a|\u6ce5\u77f3\u6d41|\u6df9\u6c34|\u5012\u704c)/u;
 const WEATHER_ROLE_IDENTITY_SIGNAL =
   /(?:\u5929\u6c14\u4e3b\u64ad|\u6c14\u8c61\u4e3b\u64ad|\u5929\u6c14\u9884\u62a5\u5458|\u6c14\u8c61\u9884\u62a5\u5458)/u;
-
 export function isDedicatedTyphoonRoomStatusQuestion(
   text: string,
   sourceLabel?: string,
@@ -23,6 +27,22 @@ export function isDedicatedTyphoonRoomStatusQuestion(
     sourceLabel &&
       DEDICATED_TYPHOON_SOURCE.test(sourceLabel.normalize('NFKC')) &&
       TYPHOON_ROOM_ENTITY_STATUS.test(text.normalize('NFKC').trim()),
+  );
+}
+
+function extractRadarCityStatusLocation(
+  text: string,
+  sourceLabel?: string,
+): string | null {
+  if (
+    !sourceLabel ||
+    !RADAR_CITY_DIALOG_SOURCE.test(sourceLabel.normalize('NFKC'))
+  ) {
+    return null;
+  }
+  return (
+    text.normalize('NFKC').trim().match(RADAR_CITY_STATUS)?.groups?.location ??
+    null
   );
 }
 
@@ -170,6 +190,11 @@ const TYPHOON_ROOM_STATUS_FAST_PATH: SkillRoutingDecision = {
   moderation: 'none',
 };
 
+const EXPLICIT_TYPHOON_FACT_FAST_PATH: SkillRoutingDecision = {
+  ...TYPHOON_ROOM_STATUS_FAST_PATH,
+  reason: 'explicit_typhoon_fact_route',
+};
+
 const WEATHER_HAZARD_FAST_PATH: SkillRoutingDecision = {
   inheritTyphoon: true,
   reason: 'weather_hazard_fact_route',
@@ -224,8 +249,21 @@ export function routeSoulSkillDeterministically(input: {
   if (WEATHER_HAZARD_SIGNAL.test(normalized)) {
     return { ...WEATHER_HAZARD_FAST_PATH };
   }
+  if (EXPLICIT_TYPHOON_FACT_QUERY.test(normalized)) {
+    return { ...EXPLICIT_TYPHOON_FACT_FAST_PATH };
+  }
   const weatherLocation = extractWeatherLocation(input.text);
   if (weatherLocation) return cityWeatherFastPath(weatherLocation);
+  const radarCityLocation = extractRadarCityStatusLocation(
+    input.text,
+    input.sourceLabel,
+  );
+  if (radarCityLocation) {
+    return {
+      ...cityWeatherFastPath(radarCityLocation),
+      reason: 'radar_city_status_fact_route',
+    };
+  }
   const contextualWeatherLocation = recentViewerWeatherLocation(input);
   if (contextualWeatherLocation) {
     return {
@@ -248,10 +286,17 @@ export function routeSoulSkillDeterministically(input: {
 
 export async function routeTyphoonSkillWithAgent(input: {
   text: string;
+  eventId?: string;
   viewerId?: string;
   viewerName?: string;
   sourceLabel?: string;
   turns: RecentLiveTurn[];
+  host?: {
+    speaking: boolean;
+    interruptible: boolean;
+    currentMode?: 'companion' | 'weather' | 'urgent' | 'variety';
+    currentTopic?: string;
+  };
 }): Promise<SkillRoutingDecision> {
   if (input.text.includes('<viewer_entry_welcome>')) {
     return {
@@ -288,8 +333,22 @@ export async function routeTyphoonSkillWithAgent(input: {
   if (WEATHER_HAZARD_SIGNAL.test(input.text.normalize('NFKC'))) {
     return { ...WEATHER_HAZARD_FAST_PATH };
   }
+  const normalized = input.text.normalize('NFKC');
+  if (EXPLICIT_TYPHOON_FACT_QUERY.test(normalized)) {
+    return { ...EXPLICIT_TYPHOON_FACT_FAST_PATH };
+  }
   const weatherLocation = extractWeatherLocation(input.text);
   if (weatherLocation) return cityWeatherFastPath(weatherLocation);
+  const radarCityLocation = extractRadarCityStatusLocation(
+    input.text,
+    input.sourceLabel,
+  );
+  if (radarCityLocation) {
+    return {
+      ...cityWeatherFastPath(radarCityLocation),
+      reason: 'radar_city_status_fact_route',
+    };
+  }
   const contextualWeatherLocation = recentViewerWeatherLocation(input);
   if (contextualWeatherLocation) {
     return {
@@ -309,6 +368,7 @@ export async function routeTyphoonSkillWithAgent(input: {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
+        eventId: input.eventId,
         text: input.text,
         speaker: {
           id: input.viewerId,
@@ -316,6 +376,7 @@ export async function routeTyphoonSkillWithAgent(input: {
           source: input.sourceLabel,
         },
         turns: input.turns.slice(-16),
+        host: input.host,
       }),
     });
     if (!response.ok) throw new Error(`skill_router_http_${response.status}`);

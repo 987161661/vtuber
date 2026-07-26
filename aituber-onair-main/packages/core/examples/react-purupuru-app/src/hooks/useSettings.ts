@@ -5,13 +5,14 @@ import {
   getDefaultXaiReasoningEffort,
   refreshOpenRouterFreeModels,
 } from '@aituber-onair/core';
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   LINGLAN_COMPANION_MEMORY,
   LINGLAN_COMPANION_PERSONA,
   LINGLAN_PROFILE,
   LINGLAN_VISION_PROMPT,
 } from '../config/characterProfile';
+import { FAN_ENTRY_WELCOME_SKILL_ID } from '../content-skills/registry';
 import type {
   AppSettings,
   DigitalHumanProfile,
@@ -34,6 +35,23 @@ import {
   sanitizeRuntimeSettingsForBrowser,
   sanitizeRuntimeSettingsForBrowserStorage,
 } from '../lib/runtimeSettingsSecurity';
+import {
+  assessOperatorSetup,
+  exportOperatorConfigurationProfile,
+  importOperatorConfigurationProfile,
+} from '../lib/operatorConfigurationProfile';
+import {
+  createOperatorPreflightSession,
+  createBrowserPreflightAdapter,
+  reduceOperatorPreflightSession,
+  runOperatorPreflight as executeOperatorPreflight,
+  type OperatorPreflightCheckId,
+} from '../lib/operatorPreflight';
+import {
+  DEFAULT_IDLE_MAX_INTERVAL_MS,
+  DEFAULT_IDLE_MIN_INTERVAL_MS,
+  normalizeIdleCadence,
+} from '../lib/idleThoughtComposer';
 
 type ApiKeyProvider = Exclude<ChatProviderOption, 'gemini-nano'>;
 
@@ -362,13 +380,15 @@ function migrateLinglanCompanionProfile(
     installedSkillIds: Array.from(
       new Set([
         ...(profile.installedSkillIds || []),
-        ...(profile.id === LINGLAN_PROFILE.id ? ['typhoon-boss-radar'] : []),
+        ...(profile.id === LINGLAN_PROFILE.id
+          ? ['typhoon-boss-radar', FAN_ENTRY_WELCOME_SKILL_ID]
+          : []),
       ]),
     ),
   };
 }
 
-function getDefaultSettings(): AppSettings {
+export function getDefaultSettings(): AppSettings {
   return {
     digitalHumans: {
       activeId: LINGLAN_PROFILE.id,
@@ -383,7 +403,7 @@ function getDefaultSettings(): AppSettings {
           enabled: true,
           persona: LINGLAN_COMPANION_PERSONA,
           memory: LINGLAN_COMPANION_MEMORY,
-          installedSkillIds: ['typhoon-boss-radar'],
+          installedSkillIds: ['typhoon-boss-radar', FAN_ENTRY_WELCOME_SKILL_ID],
         },
       ],
     },
@@ -427,6 +447,9 @@ function getDefaultSettings(): AppSettings {
       geminiTtsModel: DEFAULT_GEMINI_TTS_MODEL,
       geminiTtsLanguageCode: DEFAULT_GEMINI_TTS_LANGUAGE_CODE,
       geminiTtsPrompt: '',
+      voicevoxApiUrl: '',
+      voicepeakApiUrl: '',
+      aivisSpeechApiUrl: '',
       aivisCloudApiKey: '',
       aivisCloudModelUuid: DEFAULT_AIVIS_CLOUD_MODEL_UUID,
       aivisCloudSpeakerUuid: '',
@@ -564,10 +587,10 @@ function getDefaultSettings(): AppSettings {
       scheduleEnabled: false,
       scheduleStartHour: 0,
       scheduleEndHour: 0,
-      minIntervalMs: 2 * 60_000,
-      maxIntervalMs: 2 * 60_000,
+      minIntervalMs: DEFAULT_IDLE_MIN_INTERVAL_MS,
+      maxIntervalMs: DEFAULT_IDLE_MAX_INTERVAL_MS,
       proactiveCooldownMs: 2 * 60_000,
-      maxProactiveTurns: 12,
+      maxProactiveTurns: 100,
       maxSentences: 2,
       behaviorStrategies: DEFAULT_EMPTY_ROOM_BEHAVIOR_STRATEGIES,
       interfaceWeight: 40,
@@ -789,24 +812,38 @@ function loadSettings(allowTransientCredentialMigration = false): AppSettings {
             ...defaults.emptyRoomAwareness,
             ...saved.emptyRoomAwareness,
           };
-          const minIntervalMs = Math.max(
-            2 * 60_000,
-            normalizePositiveInteger(merged.minIntervalMs, 2 * 60_000),
+          const cadence = normalizeIdleCadence(
+            {
+              minIntervalMs: normalizePositiveInteger(
+                merged.minIntervalMs,
+                DEFAULT_IDLE_MIN_INTERVAL_MS,
+              ),
+              maxIntervalMs: normalizePositiveInteger(
+                merged.maxIntervalMs,
+                DEFAULT_IDLE_MAX_INTERVAL_MS,
+              ),
+            },
+            {
+              migratePreviousDefault:
+                saved.emptyRoomAwareness?.minIntervalMs === 3 * 60_000 &&
+                saved.emptyRoomAwareness?.maxIntervalMs === 11 * 60_000,
+            },
           );
           return {
             ...merged,
-            minIntervalMs,
-            maxIntervalMs: Math.max(
-              minIntervalMs,
-              normalizePositiveInteger(merged.maxIntervalMs, 2 * 60_000),
-            ),
+            ...cadence,
             proactiveCooldownMs: clampNumber(
               normalizePositiveInteger(merged.proactiveCooldownMs, 2 * 60_000),
               30_000,
               60 * 60_000,
             ),
             maxProactiveTurns: clampNumber(
-              normalizePositiveInteger(merged.maxProactiveTurns, 12),
+              normalizePositiveInteger(
+                saved.emptyRoomAwareness?.maxProactiveTurns === 12
+                  ? 100
+                  : merged.maxProactiveTurns,
+                100,
+              ),
               1,
               100,
             ),
@@ -888,6 +925,10 @@ export function useSettings(runtimeRole: RuntimeSettingsRole = 'standalone') {
     isRefreshingOpenRouterFreeModels,
     setIsRefreshingOpenRouterFreeModels,
   ] = useState(false);
+  const [operatorPreflightSession, setOperatorPreflightSession] = useState(
+    createOperatorPreflightSession,
+  );
+  const operatorPreflightRequestRef = useRef(0);
   const openRouterDynamicModels = useMemo(
     () => settings.llm.openRouterDynamicFreeModels?.models || EMPTY_MODEL_IDS,
     [settings.llm.openRouterDynamicFreeModels?.models],
@@ -906,6 +947,71 @@ export function useSettings(runtimeRole: RuntimeSettingsRole = 'standalone') {
     }
     return [DEFAULT_OPENAI_COMPATIBLE_MODEL];
   }, [settings.llm.provider, settings.llm.model, openRouterDynamicModels]);
+  const operatorSetupAssessment = useMemo(
+    () => assessOperatorSetup(settings),
+    [settings],
+  );
+  const exportConfigurationProfile = useCallback(
+    (name?: string) =>
+      exportOperatorConfigurationProfile(
+        settings,
+        name ||
+          `${settings.digitalHumans.profiles.find((profile) => profile.id === settings.digitalHumans.activeId)?.displayName || 'AI 主播'}配置`,
+      ),
+    [settings],
+  );
+  const importConfigurationProfile = useCallback(
+    (serialized: string) => {
+      const result = importOperatorConfigurationProfile(serialized, settings);
+      if (result.ok) setSettings(result.settings);
+      return result;
+    },
+    [settings],
+  );
+  const runOperatorPreflight = useCallback(
+    async (only?: OperatorPreflightCheckId) => {
+      const requestId = operatorPreflightRequestRef.current + 1;
+      operatorPreflightRequestRef.current = requestId;
+      const previousReport = operatorPreflightSession.report;
+      setOperatorPreflightSession((session) =>
+        reduceOperatorPreflightSession(session, { type: 'start' }),
+      );
+      try {
+        const report = await executeOperatorPreflight(
+          settings,
+          createBrowserPreflightAdapter(),
+          {
+            only,
+            previousReport: only ? previousReport : null,
+          },
+        );
+        if (operatorPreflightRequestRef.current === requestId) {
+          setOperatorPreflightSession((session) =>
+            reduceOperatorPreflightSession(session, {
+              type: 'complete',
+              report,
+            }),
+          );
+        }
+        return report;
+      } catch (error) {
+        if (operatorPreflightRequestRef.current === requestId) {
+          setOperatorPreflightSession((session) =>
+            reduceOperatorPreflightSession(session, { type: 'fail' }),
+          );
+        }
+        throw error;
+      }
+    },
+    [operatorPreflightSession.report, settings],
+  );
+
+  useEffect(() => {
+    operatorPreflightRequestRef.current += 1;
+    setOperatorPreflightSession((session) =>
+      reduceOperatorPreflightSession(session, { type: 'invalidate' }),
+    );
+  }, [settings]);
 
   // Browser persistence is always public. A producer can transiently hold a
   // newly entered credential only until this same-origin handoff completes.
@@ -2136,32 +2242,28 @@ export function useSettings(runtimeRole: RuntimeSettingsRole = 'standalone') {
     (update: Partial<AppSettings['emptyRoomAwareness']>) => {
       setSettings((prev) => {
         const merged = { ...prev.emptyRoomAwareness, ...update };
-        const minIntervalMs = clampNumber(
-          normalizePositiveInteger(merged.minIntervalMs, 2 * 60_000),
-          2 * 60_000,
-          60 * 60_000,
-        );
-        const maxIntervalMs = Math.max(
-          minIntervalMs,
-          clampNumber(
-            normalizePositiveInteger(merged.maxIntervalMs, 2 * 60_000),
-            60_000,
-            60 * 60_000,
+        const cadence = normalizeIdleCadence({
+          minIntervalMs: normalizePositiveInteger(
+            merged.minIntervalMs,
+            DEFAULT_IDLE_MIN_INTERVAL_MS,
           ),
-        );
+          maxIntervalMs: normalizePositiveInteger(
+            merged.maxIntervalMs,
+            DEFAULT_IDLE_MAX_INTERVAL_MS,
+          ),
+        });
         return {
           ...prev,
           emptyRoomAwareness: {
             ...merged,
-            minIntervalMs,
-            maxIntervalMs,
+            ...cadence,
             proactiveCooldownMs: clampNumber(
               normalizePositiveInteger(merged.proactiveCooldownMs, 2 * 60_000),
               30_000,
               60 * 60_000,
             ),
             maxProactiveTurns: clampNumber(
-              normalizePositiveInteger(merged.maxProactiveTurns, 12),
+              normalizePositiveInteger(merged.maxProactiveTurns, 100),
               1,
               100,
             ),
@@ -2224,6 +2326,11 @@ export function useSettings(runtimeRole: RuntimeSettingsRole = 'standalone') {
 
   return {
     settings,
+    operatorSetupAssessment,
+    operatorPreflightSession,
+    runOperatorPreflight,
+    exportConfigurationProfile,
+    importConfigurationProfile,
     availableModels,
     updateLLMProvider,
     updateLLMModel,

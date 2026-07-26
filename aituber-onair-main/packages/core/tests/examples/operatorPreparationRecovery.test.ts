@@ -81,11 +81,11 @@ describe('operator preparation recovery', () => {
       retryable: false,
     });
     expect(
-      classifyOperatorGenerationFailure(new Error('provider disconnected')),
+      classifyOperatorGenerationFailure(new Error('HTTP 502: Bad Gateway')),
     ).toEqual({
       reason: 'generation_failed',
-      error: 'provider disconnected',
-      retryable: true,
+      error: 'HTTP 502: Bad Gateway',
+      retryable: false,
     });
   });
 
@@ -169,6 +169,45 @@ describe('operator preparation recovery', () => {
     expect(effects.wait).not.toHaveBeenCalled();
     expect(turns.get('event-1')?.state).toBe('failed');
     expect(effects.dispatchLiveHostEvent).toHaveBeenCalledOnce();
+  });
+
+  it('does not replay an upstream 502 through the Soul event pipeline', async () => {
+    const queueItem = item();
+    const turns = turnStore(queueItem);
+    const effects = ports(queueItem);
+
+    const result = await recoverOperatorPreparation(
+      {
+        item: queueItem,
+        ownerId: 'owner-1',
+        turns,
+        failure: {
+          kind: 'no-draft',
+          chatAccepted: false,
+          captured: classifyOperatorGenerationFailure(
+            new Error('HTTP 502: Bad Gateway'),
+          ),
+        },
+      },
+      effects,
+    );
+
+    expect(result).toEqual({
+      status: 'failed',
+      reason: 'generation_failed',
+    });
+    expect(effects.mutateQueue).toHaveBeenCalledWith('event-1', 'fail', {
+      attemptId: 'event-1:attempt:1',
+      ownerId: 'owner-1',
+      reason: 'generation_failed',
+    });
+    expect(effects.mutateQueue).not.toHaveBeenCalledWith(
+      'event-1',
+      'retry',
+      expect.anything(),
+    );
+    expect(effects.recoverRuntime).not.toHaveBeenCalled();
+    expect(effects.wait).not.toHaveBeenCalled();
   });
 
   it('ignores a no-draft callback after another attempt owns the queue item', async () => {

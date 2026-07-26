@@ -21,7 +21,12 @@ import {
   SoulReflectionReviewError,
   type SoulReflectionReviewRecordV1,
 } from './reflection.js';
-import { deepClone, hashValue, stableStringify } from './utils.js';
+import {
+  deepClone,
+  hashValue,
+  matchesHashValue,
+  stableStringify,
+} from './utils.js';
 
 export type SoulLedgerKind =
   | 'event'
@@ -179,7 +184,7 @@ export function verifySoulLedgerExport(source: SoulLedgerExportV1): void {
       throw new Error(`Ledger chain mismatch at ${entry.id}`);
     }
     const { hash, ...entryWithoutHash } = entry;
-    if (hashValue(entryWithoutHash) !== hash) {
+    if (!matchesHashValue(entryWithoutHash, hash)) {
       throw new Error(`Ledger hash mismatch at ${entry.id}`);
     }
     previousHash = hash;
@@ -313,5 +318,5 @@ export function createSoulSnapshot(
 }
 
 export function verifySoulSnapshot(snapshot: SoulSnapshotV1): boolean {
-  return hashSoulState(snapshot.state) === snapshot.stateHash;
+  return matchesHashValue(snapshot.state, snapshot.stateHash);
 }

@@ -10,6 +10,7 @@ $appPath = Join-Path $PSScriptRoot 'packages\core\examples\react-purupuru-app'
 $logPath = Join-Path $PSScriptRoot 'logs'
 $flashHeadLauncher = Join-Path (Split-Path $PSScriptRoot -Parent) 'FlashHead-bridge\Start-FlashHead-Service.ps1'
 $gatewayLauncher = Join-Path $PSScriptRoot 'Ensure-Live-Platform-Gateway.ps1'
+$qrAuthScript = Join-Path $PSScriptRoot 'scripts\bilibili-qr-auth-server.mjs'
 $controlRoomUrl = if ($UseMuseTalkFallback) {
   'http://127.0.0.1:5173/?listener=1&speakEngine=musetalk'
 } else {
@@ -67,13 +68,42 @@ if (Test-Path -LiteralPath $baseLauncher -PathType Leaf) {
   & $flashHeadLauncher
   if (-not (Get-NetTCPConnection -LocalPort 5173 -State Listen -ErrorAction SilentlyContinue)) {
     New-Item -ItemType Directory -Path $logPath -Force | Out-Null
-    Start-Process -FilePath 'npm.cmd' `
-      -ArgumentList @('run', 'dev', '--', '--host', '127.0.0.1') `
+    $distIndex = Join-Path $appPath 'dist\index.html'
+    Write-Host 'Building the stable Linglan control-room bundle...'
+    Push-Location $appPath
+    try {
+      & npm.cmd run build
+      if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $distIndex -PathType Leaf)) {
+        throw 'The stable Linglan control-room build failed.'
+      }
+    } finally {
+      Pop-Location
+    }
+
+    # Serve the compiled bundle so the OBS browser source is not exposed to
+    # Vite HMR reloads or development-server module failures during a broadcast.
+    Start-Process -FilePath 'cmd.exe' `
+      -ArgumentList @('/d', '/c', 'set "NODE_OPTIONS=--max-old-space-size=8192" && npm.cmd run preview -- --host 127.0.0.1 --port 5173 --strictPort') `
       -WorkingDirectory $appPath `
       -WindowStyle Hidden `
-      -RedirectStandardOutput (Join-Path $logPath 'vite.out.log') `
-      -RedirectStandardError (Join-Path $logPath 'vite.err.log')
+      -RedirectStandardOutput (Join-Path $logPath 'vite-preview.out.log') `
+      -RedirectStandardError (Join-Path $logPath 'vite-preview.err.log')
   }
+}
+
+# The QR authorization companion stays outside the live gateway so credential
+# refresh never requires interrupting an active stream.
+if (
+  (Test-Path -LiteralPath $qrAuthScript -PathType Leaf) -and
+  -not (Get-NetTCPConnection -LocalPort 8198 -State Listen -ErrorAction SilentlyContinue)
+) {
+  New-Item -ItemType Directory -Path $logPath -Force | Out-Null
+  Start-Process -FilePath 'node.exe' `
+    -ArgumentList @($qrAuthScript) `
+    -WorkingDirectory $PSScriptRoot `
+    -WindowStyle Hidden `
+    -RedirectStandardOutput (Join-Path $logPath 'bilibili-qr-auth.out.log') `
+    -RedirectStandardError (Join-Path $logPath 'bilibili-qr-auth.err.log')
 }
 
 $response = $null
@@ -82,17 +112,15 @@ do {
   try {
     $response = Invoke-WebRequest -UseBasicParsing -TimeoutSec 2 `
       'http://127.0.0.1:5173/'
-    $appModule = Invoke-WebRequest -UseBasicParsing -TimeoutSec 8 `
-      'http://127.0.0.1:5173/src/App.tsx'
-    if ($response.StatusCode -eq 200 -and $appModule.StatusCode -eq 200) { break }
+    if ($response.StatusCode -eq 200) { break }
   } catch {
     $response = $null
     Start-Sleep -Milliseconds 500
   }
 } while ((Get-Date) -lt $deadline)
 
-if (-not $response -or $response.StatusCode -ne 200 -or $appModule.StatusCode -ne 200) {
-  throw 'Digital-human control room did not become ready on http://127.0.0.1:5173/ within 30 seconds. Check logs\vite.err.log for module import failures.'
+if (-not $response -or $response.StatusCode -ne 200) {
+  throw 'Digital-human control room did not become ready on http://127.0.0.1:5173/ within 30 seconds. Check logs\vite-preview.err.log for startup failures.'
 }
 
 if (-not $NoBrowser) {

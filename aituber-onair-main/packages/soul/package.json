@@ -41,6 +41,10 @@
     "url": "https://github.com/shinshin86/aituber-onair.git",
     "directory": "packages/soul"
   },
+  "dependencies": {
+    "@noble/hashes": "^1.8.0",
+    "ajv": "^8.17.1"
+  },
   "devDependencies": {
     "@biomejs/biome": "1.9.4",
     "@types/node": "^18.15.0",

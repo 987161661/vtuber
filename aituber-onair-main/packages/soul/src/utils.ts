@@ -29,6 +29,21 @@ export function stableStringify(value: unknown): string {
 
 export function hashValue(value: unknown): string {
   const input = stableStringify(value);
+  return `sha256:${bytesToHex(sha256(utf8ToBytes(input)))}`;
+}
+
+/**
+ * Accepts the legacy FNV digest only while validating already persisted data.
+ * All newly written integrity records use SHA-256.
+ */
+export function matchesHashValue(value: unknown, expected: string): boolean {
+  if (expected.startsWith('sha256:')) return hashValue(value) === expected;
+  if (expected.startsWith('fnv1a32:')) return legacyHashValue(value) === expected;
+  return false;
+}
+
+function legacyHashValue(value: unknown): string {
+  const input = stableStringify(value);
   let hash = 0x811c9dc5;
   for (let index = 0; index < input.length; index += 1) {
     hash ^= input.charCodeAt(index);
@@ -53,3 +68,5 @@ function sortForSerialization(value: unknown): unknown {
   }
   return value;
 }
+import { sha256 } from '@noble/hashes/sha256';
+import { bytesToHex, utf8ToBytes } from '@noble/hashes/utils';

@@ -27,7 +27,7 @@ async function fetchCityWeatherPayload(
     try {
       const response = await fetch(
         `/api/city-weather?location=${encodeURIComponent(query)}`,
-        { cache: 'no-store', signal: AbortSignal.timeout(6_000) },
+        { cache: 'no-store', signal: AbortSignal.timeout(24_000) },
       );
       const payload = (await response.json()) as CityWeatherPayload;
       if (!response.ok || payload.error) {

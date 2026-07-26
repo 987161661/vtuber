@@ -103,6 +103,15 @@ export function createReplyLatencyTracker(options: {
         : null;
     },
 
+    setLlm(llm: ReplyModelTrace['llm']): void {
+      if (trace) {
+        trace.models = {
+          ...trace.models,
+          llm: { ...llm },
+        };
+      }
+    },
+
     record(event: ReplyLatencyEvent): boolean {
       if (!trace) return false;
       const at = event.at ?? options.now();

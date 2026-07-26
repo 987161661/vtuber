@@ -182,6 +182,57 @@ describe('LiveHostCoordinator', () => {
     });
   });
 
+  it('admits likes at a bounded cadence while preserving higher-value engagement', () => {
+    const coordinator = new LiveHostCoordinator({
+      likeResponseCooldownMs: 120_000,
+    });
+    coordinator.dispatch({ type: 'stream-state', at: 0, isLive: true });
+
+    expect(
+      coordinator.dispatch({
+        type: 'engagement',
+        at: 1_000,
+        eventId: 'like-1',
+        viewerId: 'viewer-1',
+        engagementKind: 'like',
+      })[0],
+    ).toMatchObject({ kind: 'queue-audience-turn', eventId: 'like-1' });
+
+    expect(
+      coordinator.dispatch({
+        type: 'engagement',
+        at: 60_000,
+        eventId: 'like-2',
+        viewerId: 'viewer-2',
+        engagementKind: 'like',
+      })[0],
+    ).toMatchObject({
+      kind: 'drop',
+      eventId: 'like-2',
+      reasonCode: 'like_response_cooldown',
+    });
+
+    expect(
+      coordinator.dispatch({
+        type: 'engagement',
+        at: 61_000,
+        eventId: 'gift-1',
+        viewerId: 'viewer-2',
+        engagementKind: 'gift',
+      })[0],
+    ).toMatchObject({ kind: 'queue-audience-turn', eventId: 'gift-1' });
+
+    expect(
+      coordinator.dispatch({
+        type: 'engagement',
+        at: 121_000,
+        eventId: 'like-3',
+        viewerId: 'viewer-3',
+        engagementKind: 'like',
+      })[0],
+    ).toMatchObject({ kind: 'queue-audience-turn', eventId: 'like-3' });
+  });
+
   it('takes over immediately and freezes new work until resume', () => {
     const coordinator = new LiveHostCoordinator();
     coordinator.dispatch({ type: 'stream-state', at: 0, isLive: true });

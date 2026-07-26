@@ -9,6 +9,11 @@ import type {
   LiveHostSnapshot,
   LiveHostTurn,
 } from './types.js';
+import {
+  NOOP_LIVE_TELEMETRY,
+  createLiveTelemetryRecord,
+  type LiveTelemetrySink,
+} from './telemetry.js';
 
 type PendingTurnStage = 'queued' | 'generating' | 'ready';
 
@@ -28,6 +33,7 @@ export const DEFAULT_LIVE_HOST_POLICY: LiveHostPolicy = {
   quietThresholdMs: 120_000,
   proactiveCooldownMs: 120_000,
   maxProactiveTurns: 12,
+  likeResponseCooldownMs: 120_000,
 };
 
 /**
@@ -55,10 +61,16 @@ export class LiveHostCoordinator {
   private currentBeatIndex?: number;
   private currentBeatInterruptible = false;
   private lastDecisionReason = 'initial_state';
+  private lastQueuedLikeAt?: number;
   private readonly policy: LiveHostPolicy;
+  private readonly telemetry: LiveTelemetrySink;
 
-  constructor(policy: Partial<LiveHostPolicy> = {}) {
+  constructor(
+    policy: Partial<LiveHostPolicy> = {},
+    telemetry: LiveTelemetrySink = NOOP_LIVE_TELEMETRY,
+  ) {
     this.policy = { ...DEFAULT_LIVE_HOST_POLICY, ...policy };
+    this.telemetry = telemetry;
   }
 
   updatePolicy(policy: Partial<LiveHostPolicy>) {
@@ -71,7 +83,15 @@ export class LiveHostCoordinator {
     if (decisions.length) {
       this.lastDecisionReason = decisions[decisions.length - 1].reasonCode;
     }
-    return this.toActions(event, decisions);
+    const actions = this.toActions(event, decisions);
+    try {
+      this.telemetry.record(
+        createLiveTelemetryRecord(event, actions, this.snapshot()),
+      );
+    } catch {
+      // Observability must never become a second failure path for the host.
+    }
+    return actions;
   }
 
   snapshot(): LiveHostSnapshot {
@@ -277,6 +297,20 @@ export class LiveHostCoordinator {
 
     if (event.type === 'engagement') {
       this.lastAudienceActivityAt = event.at;
+      if (
+        event.engagementKind === 'like' &&
+        this.lastQueuedLikeAt !== undefined &&
+        event.at - this.lastQueuedLikeAt < this.policy.likeResponseCooldownMs
+      ) {
+        return [
+          {
+            kind: 'drop',
+            eventId: event.eventId,
+            reasonCode: 'like_response_cooldown',
+          },
+        ];
+      }
+      if (event.engagementKind === 'like') this.lastQueuedLikeAt = event.at;
       const turn: LiveHostTurn = {
         eventId: event.eventId,
         kind: 'engagement',
@@ -871,5 +905,6 @@ export class LiveHostCoordinator {
     this.reservedProactiveOpportunityIds.clear();
     this.finalizedSpeechEventIds.clear();
     this.recoveryCount = 0;
+    this.lastQueuedLikeAt = undefined;
   }
 }

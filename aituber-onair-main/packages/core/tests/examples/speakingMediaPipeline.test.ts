@@ -1,5 +1,6 @@
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
+  createSpeakingAvatarHttpRenderer,
   createSpeakingMediaPipeline,
   type SpeakingMediaPipelineOptions,
 } from '../../examples/react-purupuru-app/src/lib/speakingMediaPipeline';
@@ -8,9 +9,7 @@ function bytes(...values: number[]): ArrayBuffer {
   return new Uint8Array(values).buffer;
 }
 
-function createHarness(
-  overrides: Partial<SpeakingMediaPipelineOptions> = {},
-) {
+function createHarness(overrides: Partial<SpeakingMediaPipelineOptions> = {}) {
   const played: number[][] = [];
   const queued: number[][] = [];
   const released: string[] = [];
@@ -60,6 +59,11 @@ function createHarness(
 }
 
 describe('speaking media pipeline', () => {
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+  });
+
   it('plays renderer-aligned media through the full-audio entry point', async () => {
     const renderer = {
       render: vi.fn(async () => ({
@@ -118,5 +122,249 @@ describe('speaking media pipeline', () => {
     );
     expect(harness.options.playback.finishQueue).toHaveBeenCalledOnce();
     expect(harness.lifecycle.onFinished).toHaveBeenCalledOnce();
+  });
+
+  it('keeps enough startup headroom for a slow FlashHead fragment', async () => {
+    let releaseStream!: () => void;
+    const streamMayContinue = new Promise<void>((resolve) => {
+      releaseStream = resolve;
+    });
+    let startupDeadline: (() => void) | undefined;
+    let startupDelayMs = 0;
+    const renderer = {
+      render: vi
+        .fn()
+        .mockResolvedValueOnce({
+          audioBuffer: bytes(10),
+          videoUrl: 'blob:first-video',
+          durationSeconds: 0.4,
+        })
+        .mockResolvedValueOnce({
+          audioBuffer: bytes(20),
+          videoUrl: 'blob:second-video',
+          durationSeconds: 0.5,
+        })
+        .mockResolvedValueOnce(null),
+    };
+    const harness = createHarness({
+      renderer,
+      flashHeadStartBufferSeconds: 2.5,
+      scheduler: {
+        set: vi.fn((callback, delayMs) => {
+          startupDeadline = callback;
+          startupDelayMs = delayMs;
+          return 1;
+        }),
+        clear: vi.fn(),
+      },
+    });
+    async function* stream() {
+      yield bytes(1);
+      await streamMayContinue;
+      yield bytes(2);
+    }
+
+    const playing = harness.pipeline.playStream(stream());
+    await vi.waitFor(() => expect(renderer.render).toHaveBeenCalledOnce());
+
+    expect(harness.queued).toEqual([]);
+    expect(startupDeadline).toBeTypeOf('function');
+    expect(startupDelayMs).toBeGreaterThanOrEqual(12_000);
+
+    startupDeadline?.();
+    await vi.waitFor(() => expect(harness.queued).toEqual([[10]]));
+
+    releaseStream();
+    await playing;
+
+    expect(harness.queued).toEqual([[10], [20]]);
+    expect(harness.lifecycle.onPlaybackStarted).toHaveBeenCalledOnce();
+  });
+
+  it('flushes staged rendered audio before falling back from a later fragment', async () => {
+    const renderer = {
+      render: vi
+        .fn()
+        .mockResolvedValueOnce({
+          audioBuffer: bytes(10),
+          videoUrl: 'blob:first-video',
+          durationSeconds: 1,
+        })
+        .mockResolvedValueOnce({
+          fallbackAudioBuffer: bytes(2),
+          failureReason: 'flashhead render timeout',
+        }),
+    };
+    const harness = createHarness({ renderer });
+    async function* stream() {
+      yield bytes(1);
+      yield bytes(2);
+      yield bytes(3);
+    }
+
+    await harness.pipeline.playStream(stream());
+
+    expect(harness.queued).toEqual([[10], [2, 3]]);
+    expect(harness.lifecycle.onPlaybackStarted).toHaveBeenCalledOnce();
+  });
+
+  it('preserves a middle source chunk when its FlashHead render fails', async () => {
+    const emit = vi.fn();
+    const renderer = {
+      render: vi
+        .fn()
+        .mockResolvedValueOnce({
+          audioBuffer: bytes(10),
+          videoUrl: 'blob:first-video',
+          durationSeconds: 1,
+        })
+        .mockResolvedValueOnce({
+          fallbackAudioBuffer: bytes(2),
+          failureReason: 'flashhead returned 500',
+        })
+        .mockResolvedValueOnce(null),
+    };
+    const harness = createHarness({
+      renderer,
+      emit,
+      flashHeadStartBufferSeconds: 0,
+    });
+    async function* stream() {
+      yield bytes(1);
+      yield bytes(2);
+      yield bytes(3);
+    }
+
+    await harness.pipeline.playStream(stream());
+
+    expect(harness.queued).toEqual([[10], [2, 3]]);
+    expect(renderer.render).toHaveBeenCalledTimes(2);
+    expect(emit).toHaveBeenCalledWith(
+      expect.objectContaining({
+        stage: 'flashhead_stream_degraded',
+        reason: 'flashhead returned 500',
+      }),
+    );
+  });
+
+  it('recovers from one transient FlashHead proxy 500', async () => {
+    const request = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(
+        new Response('proxy connection failed', {
+          status: 500,
+          headers: { 'Content-Type': 'text/plain' },
+        }),
+      )
+      .mockResolvedValueOnce(new Response(null, { status: 204 }));
+    vi.stubGlobal('fetch', request);
+    vi.stubGlobal('window', { setTimeout, clearTimeout });
+    const emit = vi.fn();
+    const renderer = createSpeakingAvatarHttpRenderer({
+      enabled: true,
+      engine: 'flashhead',
+      getTrace: () => null,
+      getEventId: () => 'event-1',
+      emit,
+      onFirstFrame: vi.fn(),
+    });
+
+    await expect(
+      renderer.render(bytes(1, 2, 3), { reset: true, sequence: 0 }),
+    ).resolves.toBeNull();
+
+    expect(request).toHaveBeenCalledTimes(2);
+    expect(emit).toHaveBeenCalledWith(
+      expect.objectContaining({
+        stage: 'flashhead_render_retry',
+        status: 500,
+      }),
+    );
+    expect(emit).not.toHaveBeenCalledWith(
+      expect.objectContaining({ stage: 'flashhead_render_failed' }),
+    );
+  });
+
+  it('does not retry a FlashHead service-side render failure', async () => {
+    const request = vi.fn<typeof fetch>().mockResolvedValueOnce(
+      new Response(
+        JSON.stringify({
+          detail: 'FlashHead render failed: RuntimeError: CUDA failure',
+        }),
+        {
+          status: 500,
+          headers: { 'Content-Type': 'application/json' },
+        },
+      ),
+    );
+    vi.stubGlobal('fetch', request);
+    vi.stubGlobal('window', { setTimeout, clearTimeout });
+    const emit = vi.fn();
+    const renderer = createSpeakingAvatarHttpRenderer({
+      enabled: true,
+      engine: 'flashhead',
+      getTrace: () => null,
+      getEventId: () => 'event-2',
+      emit,
+      onFirstFrame: vi.fn(),
+    });
+
+    await expect(
+      renderer.render(bytes(1, 2, 3), { sequence: 1 }),
+    ).resolves.toEqual({
+      fallbackAudioBuffer: bytes(1, 2, 3),
+      failureReason: expect.stringContaining('CUDA failure'),
+    });
+
+    expect(request).toHaveBeenCalledOnce();
+    expect(emit).toHaveBeenCalledWith(
+      expect.objectContaining({
+        stage: 'flashhead_render_failed',
+        reason: expect.stringContaining('CUDA failure'),
+      }),
+    );
+  });
+
+  it('does not abort a healthy FlashHead render at the old six-second boundary', async () => {
+    vi.useFakeTimers();
+    const request = vi.fn<typeof fetch>(
+      async (_input, init) =>
+        new Promise<Response>((resolve, reject) => {
+          const timer = setTimeout(
+            () => resolve(new Response(null, { status: 204 })),
+            7_000,
+          );
+          init?.signal?.addEventListener(
+            'abort',
+            () => {
+              clearTimeout(timer);
+              reject(new DOMException('aborted', 'AbortError'));
+            },
+            { once: true },
+          );
+        }),
+    );
+    vi.stubGlobal('fetch', request);
+    vi.stubGlobal('window', { setTimeout, clearTimeout });
+    const emit = vi.fn();
+    const renderer = createSpeakingAvatarHttpRenderer({
+      enabled: true,
+      engine: 'flashhead',
+      getTrace: () => null,
+      getEventId: () => 'event-slow-healthy',
+      emit,
+      onFirstFrame: vi.fn(),
+    });
+
+    const rendering = renderer.render(bytes(1, 2, 3), {
+      reset: true,
+      sequence: 0,
+    });
+    await vi.advanceTimersByTimeAsync(7_000);
+
+    await expect(rendering).resolves.toBeNull();
+    expect(emit).not.toHaveBeenCalledWith(
+      expect.objectContaining({ stage: 'flashhead_render_failed' }),
+    );
   });
 });

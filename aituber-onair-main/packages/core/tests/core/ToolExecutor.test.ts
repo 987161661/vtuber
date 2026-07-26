@@ -117,6 +117,7 @@ describe('ToolExecutor', () => {
       {
         name: 'deepwiki',
         url: 'https://mcp.example.com',
+        tool_configuration: { allowed_tools: ['search'] },
       },
     ] as any);
 
@@ -152,12 +153,103 @@ describe('ToolExecutor', () => {
     ]);
   });
 
+  it('denies MCP tools by default when no explicit capability is granted', async () => {
+    const exec = new ToolExecutor();
+    exec.setMCPServers([
+      { name: 'private', url: 'https://mcp.example.com' },
+    ] as any);
+    const fetchMock = vi.fn();
+    vi.stubGlobal('fetch', fetchMock);
+
+    const result = await exec.run([
+      { type: 'tool_use', id: 'deny-1', name: 'mcp_private_read', input: {} },
+    ] as any);
+
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(result[0]?.content).toMatch(/not granted/i);
+  });
+
+  it('requires explicit approval for side-effecting MCP tools', async () => {
+    const exec = new ToolExecutor();
+    exec.setMCPServers([
+      {
+        name: 'platform',
+        url: 'https://mcp.example.com',
+        tool_configuration: {
+          allowed_tools: ['post_reply'],
+          tool_permissions: {
+            post_reply: { effect: 'write', require_approval: true },
+          },
+        },
+      },
+    ] as any);
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: vi.fn().mockResolvedValue({ delivered: true }),
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    const block = {
+      type: 'tool_use',
+      id: 'write-1',
+      name: 'mcp_platform_post_reply',
+      input: { text: 'hello' },
+    } as any;
+
+    expect((await exec.run([block]))[0]?.content).toMatch(/approval/i);
+    expect(fetchMock).not.toHaveBeenCalled();
+
+    await exec.run([block], { approvedToolCalls: ['platform/post_reply'] });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('strips inbound credential fields instead of passing tokens through', async () => {
+    const exec = new ToolExecutor();
+    exec.setMCPServers([
+      {
+        name: 'safe',
+        url: 'https://mcp.example.com',
+        authorization_token: 'server-owned-token',
+        tool_configuration: { allowed_tools: ['lookup'] },
+      },
+    ] as any);
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: vi.fn().mockResolvedValue({ ok: true }),
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    await exec.run([
+      {
+        type: 'tool_use',
+        id: 'safe-1',
+        name: 'mcp_safe_lookup',
+        input: {
+          query: 'weather',
+          authorization: 'Bearer user-token',
+          nested: { access_token: 'user-token', safe: true },
+        },
+      },
+    ] as any);
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      'https://mcp.example.com/tools/lookup',
+      expect.objectContaining({
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: 'Bearer server-owned-token',
+        },
+        body: '{"query":"weather","nested":{"safe":true}}',
+      }),
+    );
+  });
+
   it('returns MCP tool error result when server responds non-ok', async () => {
     const exec = new ToolExecutor();
     exec.setMCPServers([
       {
         name: 'deepwiki',
         url: 'https://mcp.example.com',
+        tool_configuration: { allowed_tools: ['search'] },
       },
     ] as any);
 

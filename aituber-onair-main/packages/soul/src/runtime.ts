@@ -33,8 +33,7 @@ import {
   type SoulReflectionCommitInputV1,
   type SoulReflectionCommitResultV1,
 } from './reflection.js';
-import { deepClone } from './utils.js';
-import { hashValue } from './utils.js';
+import { deepClone, matchesHashValue } from './utils.js';
 
 export class SoulSnapshotRestoreError extends Error {
   constructor(message: string) {
@@ -127,7 +126,7 @@ export function validateSoulSnapshotCompatibility(
       `Snapshot profile ${snapshot.state.profileId} does not match ${profile.id}`,
     );
   }
-  if (snapshot.state.profileHash !== hashValue(profile)) {
+  if (!matchesHashValue(profile, snapshot.state.profileHash)) {
     throw new SoulSnapshotRestoreError(
       'Snapshot profile hash does not match the active profile',
     );
@@ -137,7 +136,7 @@ export function validateSoulSnapshotCompatibility(
       'Snapshot constitution id does not match the active constitution',
     );
   }
-  if (snapshot.state.constitutionHash !== hashValue(constitution)) {
+  if (!matchesHashValue(constitution, snapshot.state.constitutionHash)) {
     throw new SoulSnapshotRestoreError(
       'Snapshot constitution hash does not match the active constitution',
     );
@@ -152,6 +151,37 @@ export function validateSoulSnapshotCompatibility(
       'Active profile references a different constitution',
     );
   }
+}
+
+/**
+ * Gives a stateful SoulRuntime one mutation writer. Rejections do not poison
+ * the queue, so later commands can continue after an isolated failure.
+ */
+export function serializeSoulRuntime(runtime: SoulRuntime): SoulRuntime {
+  let tail: Promise<void> = Promise.resolve();
+  const enqueue = <T>(operation: () => Promise<T>): Promise<T> => {
+    const result = tail.then(operation);
+    tail = result.then(
+      () => undefined,
+      () => undefined,
+    );
+    return result;
+  };
+
+  return {
+    getConstitution: () => runtime.getConstitution(),
+    getState: () => runtime.getState(),
+    observe: (event, proposal) =>
+      enqueue(() => runtime.observe(event, proposal)),
+    decide: (event, proposal, now) =>
+      enqueue(() => runtime.decide(event, proposal, now)),
+    reserve: (decision, now) => enqueue(() => runtime.reserve(decision, now)),
+    applyOutcome: (outcome) => enqueue(() => runtime.applyOutcome(outcome)),
+    commitReflection: (input) => enqueue(() => runtime.commitReflection(input)),
+    snapshot: (now) => enqueue(() => runtime.snapshot(now)),
+    replay: () => enqueue(() => runtime.replay()),
+    getLedger: () => runtime.getLedger(),
+  };
 }
 
 class DefaultSoulRuntime implements SoulRuntime {

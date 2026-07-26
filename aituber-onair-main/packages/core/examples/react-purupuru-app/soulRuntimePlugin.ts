@@ -24,6 +24,7 @@ import type {
   SoulTruthMode,
 } from '@aituber-onair/soul';
 import type { Plugin } from 'vite';
+import { resolveSoulAvailabilityFallback } from './src/lib/soulAvailabilityFallback';
 
 const FAST_MODEL_PROFILE_ID = 'minimax-m3-soul-fast-v1';
 const SLOW_MODEL_PROFILE_ID = 'minimax-m3-soul-reflect-v1';
@@ -120,8 +121,14 @@ export interface SoulRuntimePluginOptions {
   maxReflectBodyBytes?: number;
   maxLedgerBodyBytes?: number;
   maxSnapshotBodyBytes?: number;
+  authorizeClientMutation?: (fence: SoulClientMutationFence) => boolean;
   /** Disabled by default because these endpoints carry private viewer state. */
   allowRemoteRequests?: boolean;
+}
+
+export interface SoulClientMutationFence {
+  ownerId: string;
+  leaseToken: string;
 }
 
 export interface SoulFastRequestV1 {
@@ -245,6 +252,41 @@ class SoulProviderError extends Error {
     super(reason);
     this.reason = reason;
     this.name = 'SoulProviderError';
+  }
+}
+
+export function isSoulClientMutationAuthorized(
+  headers: Record<string, string | string[] | undefined>,
+  authorize?: SoulRuntimePluginOptions['authorizeClientMutation'],
+): boolean {
+  if (!authorize) return true;
+  const firstHeader = (name: string) => {
+    const value = headers[name];
+    return (Array.isArray(value) ? value[0] : value)?.trim() ?? '';
+  };
+  const ownerId = firstHeader('x-runtime-owner-id');
+  const leaseToken = firstHeader('x-runtime-lease-token');
+  return Boolean(
+    ownerId &&
+      leaseToken &&
+      authorize({
+        ownerId: ownerId.slice(0, 160),
+        leaseToken: leaseToken.slice(0, 256),
+      }),
+  );
+}
+
+function requireSoulClientMutationFence(
+  req: IncomingMessage,
+  options: SoulRuntimePluginOptions,
+): void {
+  if (
+    !isSoulClientMutationAuthorized(
+      req.headers,
+      options.authorizeClientMutation,
+    )
+  ) {
+    throw new SoulRequestError('soul_runtime_owner_fence_rejected', 409);
   }
 }
 
@@ -625,7 +667,8 @@ function assertCanonRevisionIdentity(
   ];
   if (
     immutableFields.some(
-      (field) => stableStringify(previous[field]) !== stableStringify(next[field]),
+      (field) =>
+        stableStringify(previous[field]) !== stableStringify(next[field]),
     )
   ) {
     throw new SoulRequestError('canon_revision_identity_changed', 409);
@@ -742,56 +785,53 @@ export function createSoulRuntimePlugin(
   ) => {
     const operation = ledgerMutation.then(() =>
       withSoulLedgerFileLock(options.paths.ledgerPath, async () => {
-      // Vite can briefly keep an old plugin instance alive while a config HMR
-      // replacement starts. Reload under a cross-instance file lock so a slow
-      // reflection from the old instance cannot append a stale sequence/hash.
-      const state = await loadLedger(options.paths.ledgerPath);
-      ledgerStatePromise = Promise.resolve(state);
-      const existing = state.byId.get(input.id);
-      if (existing) {
-        const comparable = {
-          id: existing.id,
-          kind: existing.kind,
-          scope: existing.scope,
-          occurredAt: existing.occurredAt,
-          payload: existing.payload,
-        };
-        if (stableStringify(comparable) !== stableStringify(input)) {
-          throw new SoulRequestError('ledger_id_conflict', 409);
+        // Vite can briefly keep an old plugin instance alive while a config HMR
+        // replacement starts. Reload under a cross-instance file lock so a slow
+        // reflection from the old instance cannot append a stale sequence/hash.
+        const state = await loadLedger(options.paths.ledgerPath);
+        ledgerStatePromise = Promise.resolve(state);
+        const existing = state.byId.get(input.id);
+        if (existing) {
+          const comparable = {
+            id: existing.id,
+            kind: existing.kind,
+            scope: existing.scope,
+            occurredAt: existing.occurredAt,
+            payload: existing.payload,
+          };
+          if (stableStringify(comparable) !== stableStringify(input)) {
+            throw new SoulRequestError('ledger_id_conflict', 409);
+          }
+          return { entry: existing, created: false };
         }
-        return { entry: existing, created: false };
-      }
-      validateLedgerWriteAuthority(input, state, authority);
-      const previous = state.entries[state.entries.length - 1];
-      const withoutHash = {
-        protocolVersion: '1.0' as const,
-        sequence: state.entries.length + 1,
-        ...input,
-        previousHash: previous?.hash ?? GENESIS_HASH,
-      };
-      const entry: SoulLedgerEntryV1 = {
-        ...withoutHash,
-        hash: hashLedgerEntry(withoutHash),
-      };
-      await mkdir(dirname(options.paths.ledgerPath), { recursive: true });
-      await appendFile(
-        options.paths.ledgerPath,
-        `${JSON.stringify(entry)}\n`,
-        'utf8',
-      );
-      state.entries.push(entry);
-      state.byId.set(entry.id, entry);
-      return { entry, created: true };
+        validateLedgerWriteAuthority(input, state, authority);
+        const previous = state.entries[state.entries.length - 1];
+        const withoutHash = {
+          protocolVersion: '1.0' as const,
+          sequence: state.entries.length + 1,
+          ...input,
+          previousHash: previous?.hash ?? GENESIS_HASH,
+        };
+        const entry: SoulLedgerEntryV1 = {
+          ...withoutHash,
+          hash: hashLedgerEntry(withoutHash),
+        };
+        await mkdir(dirname(options.paths.ledgerPath), { recursive: true });
+        await appendFile(
+          options.paths.ledgerPath,
+          `${JSON.stringify(entry)}\n`,
+          'utf8',
+        );
+        state.entries.push(entry);
+        state.byId.set(entry.id, entry);
+        return { entry, created: true };
       }),
     );
     ledgerMutation = operation.catch(() => undefined);
     return operation;
   };
 
-  const putSnapshot = (
-    snapshot: SoulSnapshotV1,
-    replaceStateHash?: string,
-  ) => {
+  const putSnapshot = (snapshot: SoulSnapshotV1, replaceStateHash?: string) => {
     const operation = snapshotMutation.then(async () => {
       const scopedPath = scopedSnapshotPath(
         options.paths.snapshotPath,
@@ -1208,6 +1248,7 @@ async function handleLedgerRequest(
     return;
   }
   requireMethod(req, res, 'POST');
+  requireSoulClientMutationFence(req, context.options);
   const body = await readJsonBody(req, context.maxLedgerBody);
   const input = validateLedgerInput(body);
   const result = await context.appendLedger(input);
@@ -1235,6 +1276,7 @@ async function handleSnapshotRequest(
     return;
   }
   requireMethod(req, res, 'PUT');
+  requireSoulClientMutationFence(req, context.options);
   const body = await readJsonBody(req, context.maxSnapshotBody);
   const sanitized = stripReasoningAndSecrets(body);
   if (stableStringify(body) !== stableStringify(sanitized)) {
@@ -1852,34 +1894,41 @@ function normalizeFallbackReason(
     : undefined;
 }
 
-export function createFastFallbackProposal(event: SoulEventV1): SemanticProposalV1 {
+export function createFastFallbackProposal(
+  event: SoulEventV1,
+): SemanticProposalV1 {
+  const availabilityFallback = resolveSoulAvailabilityFallback(event);
   const needsImmediateSafetyFallback =
     event.urgency === 'high' || event.urgency === 'urgent';
-  const text = boundedString(event.data.text ?? event.data.untrustedViewerText, 600);
+  const text = boundedString(
+    event.data.text ?? event.data.untrustedViewerText,
+    600,
+  );
   const relationalGrievance =
     /(?:^|[：，。！？\s])(?:我|人家)(?:呢|也|还|不|没|算)/u.test(text) &&
-    /(?:不是人|不算人|没算|漏掉|忘了|忽略|不理|没理|没看到|看不见|不存在|只顾|只回)/u.test(text);
+    /(?:不是人|不算人|没算|漏掉|忘了|忽略|不理|没理|没看到|看不见|不存在|只顾|只回)/u.test(
+      text,
+    );
   const action: SoulActionPrimitive = relationalGrievance
     ? 'repair'
-    : event.kind === 'gift'
-      ? 'acknowledge'
-      : needsImmediateSafetyFallback
-        ? 'acknowledge'
-        : 'delay';
-  const utterance = relationalGrievance
+    : availabilityFallback.action;
+  const specializedUtterance = relationalGrievance
     ? '刚才让你觉得被落下了，是我没接好。你在，我也听见了。'
     : event.kind === 'gift'
       ? '心意我收到了，谢谢你。你不用因此有任何压力。'
       : needsImmediateSafetyFallback
         ? '我先把安全放在前面，这条我会谨慎处理。'
         : undefined;
+  const utterance = specializedUtterance ?? availabilityFallback.utterance;
   return {
     protocolVersion: '1.0',
     eventId: event.id,
     scope: cloneScope(event.scope),
     modelProfileId: FAST_MODEL_PROFILE_ID,
-    confidence: relationalGrievance ? 0.72 : event.kind === 'gift' ? 0.55 : 0,
-    attribution: relationalGrievance || event.kind === 'gift' ? 'viewer' : 'unknown',
+    confidence: relationalGrievance ? 0.72 : availabilityFallback.confidence,
+    attribution: relationalGrievance
+      ? 'viewer'
+      : availabilityFallback.attribution,
     evidence: relationalGrievance
       ? [
           {
@@ -1903,7 +1952,11 @@ export function createFastFallbackProposal(event: SoulEventV1): SemanticProposal
         truthMode: 'literal',
         utterance,
         goalEffects: [],
-        relationshipBenefit: relationalGrievance ? 0.65 : event.kind === 'gift' ? 0.3 : 0,
+        relationshipBenefit: relationalGrievance
+          ? 0.65
+          : event.kind === 'gift'
+            ? 0.3
+            : 0,
         programValue: 0,
         novelty: 0,
         repetitionCost: 0,
@@ -1914,11 +1967,7 @@ export function createFastFallbackProposal(event: SoulEventV1): SemanticProposal
         reasonCodes: [
           relationalGrievance
             ? 'provider-unavailable-local-relationship-repair'
-            : event.kind === 'gift'
-              ? 'provider-unavailable-safe-support-acknowledgement'
-              : needsImmediateSafetyFallback
-            ? 'provider-unavailable-safety-realizer-required'
-            : 'provider-unavailable-delay',
+            : availabilityFallback.reasonCode,
         ],
       },
     ],
@@ -2028,7 +2077,9 @@ function normalizeCandidate(
     ),
     reasonCodes: [
       ...stringList(item.reasonCodes, 7, 120),
-      ...(missingRequiredUtterance ? ['missing-utterance-degraded-to-delay'] : []),
+      ...(missingRequiredUtterance
+        ? ['missing-utterance-degraded-to-delay']
+        : []),
     ],
   };
 }

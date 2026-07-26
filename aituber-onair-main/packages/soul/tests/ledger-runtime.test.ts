@@ -9,6 +9,8 @@ import {
   replaySoulLedger,
   verifySoulLedgerExport,
   verifySoulSnapshot,
+  serializeSoulRuntime,
+  hashValue,
 } from '../src/index.js';
 import {
   constitution,
@@ -20,6 +22,31 @@ import {
 } from './fixtures.js';
 
 describe('append-only ledger and cohesive runtime', () => {
+  it('uses a collision-resistant SHA-256 digest for new integrity records', () => {
+    const digest = hashValue({ answer: 42 });
+
+    expect(digest).toMatch(/^sha256:[0-9a-f]{64}$/);
+    expect(digest).toBe(hashValue({ answer: 42 }));
+    expect(digest).not.toBe(hashValue({ answer: 43 }));
+  });
+
+  it('serializes concurrent state mutations through one runtime writer', async () => {
+    const runtime = serializeSoulRuntime(
+      createSoulRuntime({ constitution, profile, scope, now: () => 2_000 }),
+    );
+    const first = makeEvent({ id: 'event-concurrent-a', occurredAt: 2_000 });
+    const second = makeEvent({ id: 'event-concurrent-b', occurredAt: 2_001 });
+
+    const [firstResult, secondResult] = await Promise.all([
+      runtime.observe(first, makeProposal(first)),
+      runtime.observe(second, makeProposal(second)),
+    ]);
+
+    expect(firstResult.state.version).toBe(1);
+    expect(secondResult.state.version).toBe(2);
+    expect(runtime.getState().version).toBe(2);
+  });
+
   it('maintains a portable append-chain integrity check', async () => {
     const ledger = new InMemorySoulLedger();
     const event = makeEvent();

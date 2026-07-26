@@ -29,6 +29,7 @@ export interface ProactiveTalkPlannerInput {
 }
 
 export class ProactiveTalkPlanner {
+  private readonly presence: LivePresenceTracker;
   private streamId?: string;
   private sequence = 0;
   private lastDeliveredAt?: number;
@@ -38,9 +39,10 @@ export class ProactiveTalkPlanner {
   private readonly policy: ProactiveTalkPolicy;
 
   constructor(
-    private readonly presence: LivePresenceTracker,
+    presence: LivePresenceTracker,
     policy: Partial<ProactiveTalkPolicy> = {},
   ) {
+    this.presence = presence;
     this.policy = { ...DEFAULT_PROACTIVE_TALK_POLICY, ...policy };
   }
 

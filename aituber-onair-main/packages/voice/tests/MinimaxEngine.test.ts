@@ -12,6 +12,42 @@ afterEach(() => {
 
 describe('MinimaxEngine', () => {
   describe('streaming chunking', () => {
+    it('retries a transient gateway failure before yielding any audio', async () => {
+      vi.useFakeTimers();
+      const engine = new MinimaxEngine();
+      const fetchMock = vi
+        .fn()
+        .mockResolvedValueOnce(new Response(null, { status: 502 }))
+        .mockResolvedValueOnce(
+          new Response(
+            `data: ${JSON.stringify({ data: { audio: '0a0b', status: 2 } })}\n\n`,
+            {
+              status: 200,
+              headers: { 'Content-Type': 'text/event-stream' },
+            },
+          ),
+        );
+      vi.stubGlobal('fetch', fetchMock);
+
+      const chunksPromise = (async () => {
+        const chunks: Uint8Array[] = [];
+        for await (const chunk of engine.fetchAudioStream(
+          { style: 'talk', message: 'test' },
+          'voice-id',
+          'api-key',
+        )) {
+          chunks.push(new Uint8Array(chunk));
+        }
+        return chunks;
+      })();
+      const assertion = expect(chunksPromise).resolves.toEqual([
+        new Uint8Array([10, 11]),
+      ]);
+      await vi.runAllTimersAsync();
+      await assertion;
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+    });
+
     it('splits oversized SSE audio payloads into bounded chunks', async () => {
       const engine = new MinimaxEngine();
       const audio = new Uint8Array(70_000);
@@ -562,8 +598,8 @@ describe('MinimaxEngine', () => {
         'api-key',
       );
 
-      const [bored, impatient, awkward] = fetchMock.mock.calls.map((call) =>
-        JSON.parse(call[1].body).voice_setting,
+      const [bored, impatient, awkward] = fetchMock.mock.calls.map(
+        (call) => JSON.parse(call[1].body).voice_setting,
       );
       expect(bored).toMatchObject({ emotion: 'neutral', pitch: 0 });
       expect(bored.speed).toBe(0.94);

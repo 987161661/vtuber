@@ -112,6 +112,9 @@ describe('conversation history delivery semantics', () => {
         deliveredReply: 'actually heard',
         partialTextVerified: true,
         ttsEndAt: 40,
+        engagementDecisionId: 'engagement:event-1',
+        engagementAction: 'invite-paid-support',
+        engagementDeliveryStatus: 'partial',
       }),
     ).toMatchObject({
       deliveryStatus: 'partial',
@@ -120,6 +123,9 @@ describe('conversation history delivery semantics', () => {
       partialTextVerified: true,
       ttsStartAt: 20,
       ttsEndAt: 40,
+      engagementDecisionId: 'engagement:event-1',
+      engagementAction: 'invite-paid-support',
+      engagementDeliveryStatus: 'partial',
     });
     expect(
       applyConversationDeliveryOutcome(

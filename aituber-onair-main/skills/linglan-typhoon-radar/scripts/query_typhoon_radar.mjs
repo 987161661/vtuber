@@ -5,6 +5,7 @@ const DEFAULT_ROOT = process.env.TYPHOON_RADAR_ROOT || 'D:/typhoon boss radar';
 const DEFAULT_BASE_URL = process.env.TYPHOON_RADAR_BASE_URL || 'http://127.0.0.1:3038';
 const DOCUMENT_NAME = '台风实时演进分析.md';
 const DOCUMENT_STALE_MS = 75 * 60_000;
+const TRACK_SNAPSHOT_MAX_AGE_MS = 15 * 60_000;
 
 const PLACE_ALIASES = new Map([
   ['北京', ['北京市', '北京']], ['天津', ['天津市', '天津']],
@@ -265,9 +266,33 @@ function parseDocument(content, modifiedAt) {
 }
 
 async function fetchJson(url) {
-  const response = await fetch(url, { cache: 'no-store', headers: { Accept: 'application/json' } });
+  const response = await fetch(url, {
+    cache: 'no-store',
+    headers: { Accept: 'application/json' },
+    signal: AbortSignal.timeout(12_000),
+  });
   if (!response.ok) throw new Error(`HTTP ${response.status}: ${url}`);
   return response.json();
+}
+
+export function buildStormFeedUrl(baseUrl) {
+  return `${String(baseUrl).replace(/\/$/, '')}/api/radar/snapshot`;
+}
+
+export function isUsableTrackSnapshot(payload, now = Date.now()) {
+  const fetchedAt = Date.parse(String(payload?.fetchedAt || ''));
+  return (
+    Array.isArray(payload?.storms) &&
+    Number.isFinite(fetchedAt) &&
+    now - fetchedAt >= 0 &&
+    now - fetchedAt <= TRACK_SNAPSHOT_MAX_AGE_MS
+  );
+}
+
+async function loadStormsPayload(root, baseUrl) {
+  const persisted = await readJsonFile(`${root}/.runtime/track-snapshot.json`, null);
+  if (isUsableTrackSnapshot(persisted)) return persisted;
+  return fetchJson(buildStormFeedUrl(baseUrl));
 }
 
 async function readJsonFile(filePath, fallback) {
@@ -342,7 +367,10 @@ function compactStorm(storm) {
   return {
     id: storm.id, nameZh: storm.nameZh, nameEn: storm.nameEn,
     stage: storm.stage, centerWindForceLevel: windForceFromSpeed(storm.maxWind),
-    maxWindMps: storm.maxWind, pressureHpa: storm.minPressure,
+    maxWindMps: storm.maxWind,
+    pressureHpa: Number.isFinite(storm.minPressure) && storm.minPressure > 0
+      ? storm.minPressure
+      : null,
     position: storm.position, moveDirection: storm.moveDirection,
     locationDescription:
       storm.locationDescription || latestTrackPoint?.locationDescription || null,
@@ -431,7 +459,12 @@ export function extractNamedTyphoonQuery(question) {
   const chinese = normalizedQuestion.match(
     /^\s*([\u4e00-\u9fff]{2,4}?)(?:啊|呀|呢)?(?:现在|目前|后来)?(?:怎么样|如何|去哪|到哪|在哪|还在|登陆|消散|降级|减弱|哪来(?:的)?|从哪来|是什么|是几号|几号台风|什么时候|何时|存在过|有过|在?\d{4}年)/,
   );
-  if (chinese?.[1]) return chinese[1];
+  if (
+    chinese?.[1] &&
+    !['台风', '风暴', '气旋', '低压'].includes(chinese[1])
+  ) {
+    return chinese[1];
+  }
   const english = normalizedQuestion.match(/\b([A-Za-z]{3,})\b/);
   return english?.[1] || null;
 }
@@ -535,7 +568,10 @@ export function buildRequiredAnswer(
     return `${localWind}${scope}${impact}。`;
   }
   if (storm) {
-    return `${storm.nameZh}最新实况为${storm.stage}，中心风速${storm.maxWindMps}米每秒、${storm.centerWindForceLevel}级，中心气压${storm.pressureHpa}百帕，时次${shortTime(storm.observedAt)}。`;
+    const pressure = Number.isFinite(storm.pressureHpa) && storm.pressureHpa > 0
+      ? `，中心气压${storm.pressureHpa}百帕`
+      : '，中心气压未提供';
+    return `${storm.nameZh}最新实况为${storm.stage}，中心风速${storm.maxWindMps}米每秒、${storm.centerWindForceLevel}级${pressure}，时次${shortTime(storm.observedAt)}。`;
   }
   if (asksForCurrentStormCount(question)) {
     return '当前活动台风列表是空的，也就是现在没有正在活动并被该信源持续编号的台风；这不代表2026年7月没有出现过台风。';
@@ -690,7 +726,7 @@ export async function queryTyphoonRadar(question, options = {}) {
     readFile(documentPath, 'utf8'),
     stat(documentPath),
     needsStormTrack
-      ? fetchJson(`${baseUrl}/api/storms/current`)
+      ? loadStormsPayload(root, baseUrl)
       : Promise.resolve({ storms: [] }),
     namedTyphoon
       ? fetchJson(`${baseUrl}/api/storms/entity?query=${encodeURIComponent(namedTyphoon)}`).catch(() => null)

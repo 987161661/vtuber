@@ -479,9 +479,12 @@ export function normalizeRoomEvent(payload) {
     const uid = interaction.uid || interaction.uinfo?.uid;
     const name = interaction.uname || interaction.uinfo?.base?.name;
     if (!uid && !name) return null;
+    const interactionType = Number(interaction.msg_type || 0);
+    if (![0, 1, 2].includes(interactionType)) return null;
+    const eventType = interactionType === 2 ? 'follow' : 'entry';
     return {
-      id: `entry:${uid || name}:${interaction.timestamp || Date.now()}`,
-      type: 'entry',
+      id: `${eventType}:${uid || name}:${interaction.timestamp || Date.now()}`,
+      type: eventType,
       text: '',
       timestamp: Number(interaction.timestamp || Date.now() / 1000) * 1000,
       author: {
@@ -489,7 +492,7 @@ export function normalizeRoomEvent(payload) {
         name: String(name || '观众'),
         avatarUrl: interaction.uinfo?.base?.face || undefined,
       },
-      metadata: { command },
+      metadata: { command, msgType: interactionType },
     };
   }
 
@@ -1252,7 +1255,10 @@ export function createLocalServer(supervisor, port = DEFAULT_PORT) {
       response.end();
       return;
     }
-    if (requestUrl.pathname === '/health') {
+    if (
+      requestUrl.pathname === '/health' ||
+      requestUrl.pathname === '/status'
+    ) {
       response.setHeader('Content-Type', 'application/json; charset=utf-8');
       response.end(
         JSON.stringify({

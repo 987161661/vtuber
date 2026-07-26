@@ -97,17 +97,26 @@ export function createLiveRuntimeMonitor(
     ownerHeartbeats.set(normalizedOwnerId, { seenAt: at, ...heartbeat });
   }
 
-  function ownerAvailability(at: number): RuntimeOwnerAvailability {
+  function ownerAvailability(
+    at: number,
+    ownerId?: string,
+  ): RuntimeOwnerAvailability {
     for (const [ownerId, heartbeat] of ownerHeartbeats) {
       if (at - heartbeat.seenAt <= ownerHeartbeatTtlMs) continue;
       ownerHeartbeats.delete(ownerId);
     }
+    const matchingHeartbeats = ownerId
+      ? [ownerHeartbeats.get(ownerId)].filter(
+          (heartbeat): heartbeat is RuntimeOwnerHeartbeat =>
+            Boolean(heartbeat),
+        )
+      : [...ownerHeartbeats.values()];
     return {
-      active: ownerHeartbeats.size > 0,
-      available: [...ownerHeartbeats.values()].some(
+      active: matchingHeartbeats.length > 0,
+      available: matchingHeartbeats.some(
         (heartbeat) => heartbeat.availableForStress,
       ),
-      ttsConfigured: [...ownerHeartbeats.values()].some(
+      ttsConfigured: matchingHeartbeats.some(
         (heartbeat) => heartbeat.ttsConfigured,
       ),
     };

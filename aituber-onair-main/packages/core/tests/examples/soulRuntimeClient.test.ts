@@ -44,9 +44,7 @@ function proposal(eventId: string): SemanticProposalV1 {
         truthMode: 'literal',
         utterance: '这句我听见了。',
         targetActorId: 'bilibili:viewer-1',
-        goalEffects: [
-          { goalId: 'build-reciprocal-connection', progress: 0.3 },
-        ],
+        goalEffects: [{ goalId: 'build-reciprocal-connection', progress: 0.3 }],
         relationshipBenefit: 0.5,
         programValue: 0.3,
         novelty: 0.2,
@@ -86,6 +84,54 @@ function createFetch(eventId: string) {
 }
 
 describe('browser soul runtime session', () => {
+  it('fences every client-side persistence mutation with its runtime lease', async () => {
+    const event = createLinglanSoulEvent({
+      id: 'fenced-message',
+      scope,
+      kind: 'audience-message',
+      occurredAt: 900,
+      receivedAt: 900,
+      evidenceLevel: 'synthetic',
+      provenance: 'unit-test',
+      data: { text: 'test fenced persistence' },
+    });
+    const fetchImpl = vi.fn(async (input: RequestInfo | URL) => {
+      if (String(input).endsWith('/fast')) {
+        return new Response(JSON.stringify({ proposal: proposal(event.id) }), {
+          status: 200,
+        });
+      }
+      return new Response(JSON.stringify({ stored: true }), { status: 200 });
+    }) as unknown as typeof fetch;
+    const session = new BrowserSoulRuntimeSession({
+      constitution: LINGLAN_SOUL_CONSTITUTION,
+      profile: LINGLAN_SOUL_PROFILE,
+      scope,
+      fetchImpl,
+      mutationFence: {
+        ownerId: 'runtime-owner-1',
+        leaseToken: 'lease-token-1',
+      },
+    });
+
+    await session.evaluate(event);
+
+    const mutationCalls = vi
+      .mocked(fetchImpl)
+      .mock.calls.filter(([input]) =>
+        /\/(?:ledger|snapshot)$/u.test(String(input)),
+      );
+    expect(mutationCalls.length).toBeGreaterThan(0);
+    for (const [, init] of mutationCalls) {
+      expect(new Headers(init?.headers).get('X-Runtime-Owner-Id')).toBe(
+        'runtime-owner-1',
+      );
+      expect(new Headers(init?.headers).get('X-Runtime-Lease-Token')).toBe(
+        'lease-token-1',
+      );
+    }
+  });
+
   it('reserves generated intent and commits it only after spoken outcome', async () => {
     let now = 1_000;
     const event = createLinglanSoulEvent({
@@ -126,7 +172,7 @@ describe('browser soul runtime session', () => {
     );
   });
 
-  it('uses a deterministic non-speaking fallback when the local gateway fails', async () => {
+  it('uses a deterministic speakable fallback when the local gateway fails', async () => {
     const event = createLinglanSoulEvent({
       id: 'message-2',
       scope,
@@ -151,8 +197,8 @@ describe('browser soul runtime session', () => {
 
     const evaluated = await runtime.evaluate(event);
     expect(evaluated.meta.fallback).toBe(true);
-    expect(evaluated.decision.action).toBe('delay');
-    expect(evaluated.decision.utterance).toBeUndefined();
+    expect(evaluated.decision.action).toBe('acknowledge');
+    expect(evaluated.decision.utterance?.trim()).not.toBe('');
   });
 
   it('restores a scope-isolated snapshot from reconstructed local ledger inputs', async () => {
@@ -174,16 +220,23 @@ describe('browser soul runtime session', () => {
       async (input: RequestInfo | URL, init?: RequestInit) => {
         const url = String(input);
         if (url.endsWith('/fast')) {
-          return new Response(JSON.stringify({ proposal: proposal(event.id) }), {
-            status: 200,
-            headers: { 'Content-Type': 'application/json' },
-          });
+          return new Response(
+            JSON.stringify({ proposal: proposal(event.id) }),
+            {
+              status: 200,
+              headers: { 'Content-Type': 'application/json' },
+            },
+          );
         }
         const body = JSON.parse(String(init?.body ?? '{}')) as
           | SoulLedgerInputV1
           | SoulSnapshotV1;
         if (url.endsWith('/ledger')) {
-          if (!ledgerInputs.some((entry) => entry.id === (body as SoulLedgerInputV1).id)) {
+          if (
+            !ledgerInputs.some(
+              (entry) => entry.id === (body as SoulLedgerInputV1).id,
+            )
+          ) {
             ledgerInputs.push(body as SoulLedgerInputV1);
           }
         } else if (url.endsWith('/snapshot')) {
@@ -275,27 +328,24 @@ describe('browser soul runtime session', () => {
       provenance: 'unit-test',
       data: { text: 'test persistence reporting' },
     });
-    const fetchImpl = vi.fn(
-      async (input: RequestInfo | URL) => {
-        const url = String(input);
-        if (url.endsWith('/fast')) {
-          return new Response(
-            JSON.stringify({ proposal: proposal(event.id) }),
-            { status: 200 },
-          );
-        }
-        if (url.endsWith('/ledger')) {
-          return new Response(JSON.stringify({ stored: true }), { status: 200 });
-        }
-        if (url.endsWith('/snapshot')) {
-          return new Response(
-            JSON.stringify({ error: 'snapshot_version_regression' }),
-            { status: 409 },
-          );
-        }
-        throw new Error(`unexpected request: ${url}`);
-      },
-    ) as unknown as typeof fetch;
+    const fetchImpl = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith('/fast')) {
+        return new Response(JSON.stringify({ proposal: proposal(event.id) }), {
+          status: 200,
+        });
+      }
+      if (url.endsWith('/ledger')) {
+        return new Response(JSON.stringify({ stored: true }), { status: 200 });
+      }
+      if (url.endsWith('/snapshot')) {
+        return new Response(
+          JSON.stringify({ error: 'snapshot_version_regression' }),
+          { status: 409 },
+        );
+      }
+      throw new Error(`unexpected request: ${url}`);
+    }) as unknown as typeof fetch;
     const session = new BrowserSoulRuntimeSession({
       constitution: LINGLAN_SOUL_CONSTITUTION,
       profile: LINGLAN_SOUL_PROFILE,
@@ -420,10 +470,13 @@ describe('browser soul runtime session', () => {
       async (input: RequestInfo | URL, init?: RequestInit) => {
         const url = String(input);
         if (url.endsWith('/fast')) {
-          return new Response(JSON.stringify({ proposal: proposal(event.id) }), {
-            status: 200,
-            headers: { 'Content-Type': 'application/json' },
-          });
+          return new Response(
+            JSON.stringify({ proposal: proposal(event.id) }),
+            {
+              status: 200,
+              headers: { 'Content-Type': 'application/json' },
+            },
+          );
         }
         const body = JSON.parse(String(init?.body ?? '{}')) as
           | SoulLedgerInputV1
@@ -487,12 +540,12 @@ describe('browser soul runtime session', () => {
     expect(committed.applied).toBe(true);
     expect(committed.persistenceOk).toBe(true);
     expect(committed.record.recordType).toBe('reflection-review');
-    expect(
-      original.getState().beliefs['strategy:short-opening'],
-    ).toMatchObject({
-      kind: 'strategy',
-      epistemicStatus: 'hypothesis',
-    });
+    expect(original.getState().beliefs['strategy:short-opening']).toMatchObject(
+      {
+        kind: 'strategy',
+        epistemicStatus: 'hypothesis',
+      },
+    );
     expect(
       ledgerInputs.filter(
         (entry) =>

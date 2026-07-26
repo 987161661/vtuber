@@ -8,6 +8,10 @@ import {
   retractCanonRevision,
   validateCanonCandidate,
 } from '@aituber-onair/soul';
+import {
+  soulMutationHeaders,
+  type SoulMutationFence,
+} from './soulMutationFence';
 
 const CANON_LEDGER_ENDPOINT = '/api/soul/ledger';
 const LEDGER_PAGE_SIZE = 1_000;
@@ -56,6 +60,7 @@ export interface SoulCanonRepositoryOptions {
   fetchImpl?: typeof fetch;
   now?: () => number;
   createRevisionId?: () => string;
+  mutationFence?: SoulMutationFence;
 }
 
 interface CanonLedgerEntryV1 {
@@ -85,6 +90,7 @@ export class SoulCanonRepository {
   private readonly fetchImpl: typeof fetch;
   private readonly now: () => number;
   private readonly createRevisionToken: () => string;
+  private readonly mutationFence?: Readonly<SoulMutationFence>;
   private readonly revisions = new Map<string, RevisionProjection>();
   private loaded = false;
   private lastSequence = 0;
@@ -96,10 +102,15 @@ export class SoulCanonRepository {
     }
     this.scope = structuredClone(options.scope);
     this.constitution = structuredClone(options.constitution);
-    this.fetchImpl =
-      options.fetchImpl ?? globalThis.fetch.bind(globalThis);
+    this.fetchImpl = options.fetchImpl ?? globalThis.fetch.bind(globalThis);
     this.now = options.now ?? Date.now;
     this.createRevisionToken = options.createRevisionId ?? defaultRevisionToken;
+    this.mutationFence = options.mutationFence
+      ? Object.freeze({
+          ownerId: options.mutationFence.ownerId.trim(),
+          leaseToken: options.mutationFence.leaseToken.trim(),
+        })
+      : undefined;
   }
 
   async load(): Promise<SoulCanonProjectionV1> {
@@ -490,7 +501,7 @@ export class SoulCanonRepository {
     }
     const response = await this.fetchImpl(CANON_LEDGER_ENDPOINT, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: soulMutationHeaders(this.mutationFence),
       body: JSON.stringify({
         id: ledgerId,
         kind: 'canon',

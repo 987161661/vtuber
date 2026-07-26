@@ -199,7 +199,11 @@ def encode_transparent_webm(frames_rgb: np.ndarray, fps: int) -> bytes:
         "-vf",
         (
             "chromakey=0x00FF00:0.24:0.08,despill=green:mix=0.40,"
-            "scale=1024:1024:flags=lanczos,"
+            # FlashHead natively produces 512x512 frames. Upscaling every
+            # short VP9 fragment to 1024x1024 adds no model detail, but it
+            # quadruples the browser's decode/compositing surface and can
+            # stall the OBS CEF runtime while the next audio fragment waits.
+            "scale=512:512:flags=lanczos,"
             "unsharp=5:5:0.55:3:3:0.15,format=yuva420p"
         ),
         "-c:v", "libvpx-vp9", "-deadline", "realtime", "-cpu-used", "8",
@@ -386,7 +390,9 @@ async def render(request: Request, reset: bool = False, end: bool = False) -> Re
     if (not data and not end) or len(data) > MAX_AUDIO_BYTES:
         raise HTTPException(status_code=400, detail="Audio payload is empty or too large")
 
+    received_at = time.perf_counter()
     async with render_lock:
+        lock_wait_ms = (time.perf_counter() - received_at) * 1000
         try:
             video, audio, frame_count, elapsed_ms = await asyncio.to_thread(
                 runtime.render, data, reset, end
@@ -416,6 +422,7 @@ async def render(request: Request, reset: bool = False, end: bool = False) -> Re
         "reset": reset,
         "end": end,
         "frames": frame_count,
+        "lock_wait_ms": round(lock_wait_ms),
         "render_ms": round(elapsed_ms),
         "mp3_frames": runtime.decoder.decoded_frames,
         "discarded_bytes": runtime.decoder.discarded_bytes,
@@ -423,10 +430,10 @@ async def render(request: Request, reset: bool = False, end: bool = False) -> Re
     }
     await asyncio.to_thread(write_render_trace, trace)
     logger.info(
-        "render_ok request_id=%s sequence=%s caller=%s bytes=%d sha=%s id3=%d reset=%s end=%s frames=%d render_ms=%.0f mp3_frames=%d discarded=%d",
+        "render_ok request_id=%s sequence=%s caller=%s bytes=%d sha=%s id3=%d reset=%s end=%s frames=%d lock_wait_ms=%.0f render_ms=%.0f mp3_frames=%d discarded=%d",
         trace["request_id"], trace["sequence"], trace["caller"],
         len(data), audio_sha, data.count(b"ID3"),
-        reset, end, frame_count, elapsed_ms,
+        reset, end, frame_count, lock_wait_ms, elapsed_ms,
         runtime.decoder.decoded_frames, runtime.decoder.discarded_bytes,
     )
     if not video:

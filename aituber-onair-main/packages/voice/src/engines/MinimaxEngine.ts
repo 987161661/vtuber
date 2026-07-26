@@ -82,6 +82,16 @@ async function readJsonWithDeadline<T>(
   }
 }
 
+const MINIMAX_STREAM_MAX_ATTEMPTS = 3;
+const MINIMAX_STREAM_RETRY_BASE_DELAY_MS = 250;
+const MINIMAX_STREAM_RETRYABLE_STATUS = new Set([
+  408, 425, 429, 500, 502, 503, 504,
+]);
+
+function waitForRetry(delayMs: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, delayMs));
+}
+
 /**
  * MiniMax TTS voice synthesis engine
  */
@@ -529,32 +539,67 @@ export class MinimaxEngine implements VoiceEngine {
       input.emotionIntensity,
       input.prosody,
     );
-    const streamController = new AbortController();
-    const requestTimer = setTimeout(() => streamController.abort(), 30_000);
-    const response = await fetchWithTimeout(this.getTtsApiUrl(), {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${apiKey}`,
-      },
-      body: JSON.stringify({
-        model: this.model,
-        text,
-        stream: true,
-        voice_setting: this.buildVoiceSetting(
-          speaker || this.defaultVoiceId,
-          voiceSettings,
-        ),
-        audio_setting: { ...this.buildAudioSetting(), format: 'mp3' },
-        language_boost: this.language,
-        subtitle_enable: false,
-      }),
-      signal: streamController.signal,
-    }).finally(() => {
-      clearTimeout(requestTimer);
+    const requestBody = JSON.stringify({
+      model: this.model,
+      text,
+      stream: true,
+      voice_setting: this.buildVoiceSetting(
+        speaker || this.defaultVoiceId,
+        voiceSettings,
+      ),
+      audio_setting: { ...this.buildAudioSetting(), format: 'mp3' },
+      language_boost: this.language,
+      subtitle_enable: false,
     });
-    if (!response.ok || !response.body) {
-      throw new Error(`MiniMax streaming TTS failed: HTTP ${response.status}`);
+    let streamController = new AbortController();
+    let response: Response | undefined;
+    let lastRequestError: unknown;
+    for (
+      let attempt = 1;
+      attempt <= MINIMAX_STREAM_MAX_ATTEMPTS;
+      attempt += 1
+    ) {
+      response = undefined;
+      streamController = new AbortController();
+      const requestTimer = setTimeout(() => streamController.abort(), 30_000);
+      try {
+        response = await fetchWithTimeout(this.getTtsApiUrl(), {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${apiKey}`,
+          },
+          body: requestBody,
+          signal: streamController.signal,
+        });
+        if (response.ok && response.body) break;
+        lastRequestError = new Error(
+          `MiniMax streaming TTS failed: HTTP ${response.status}`,
+        );
+        const retryable = MINIMAX_STREAM_RETRYABLE_STATUS.has(response.status);
+        if (!retryable || attempt === MINIMAX_STREAM_MAX_ATTEMPTS) {
+          throw lastRequestError;
+        }
+        void response.body?.cancel().catch(() => undefined);
+      } catch (error) {
+        lastRequestError = error;
+        const retryableResponse =
+          response && MINIMAX_STREAM_RETRYABLE_STATUS.has(response.status);
+        if (
+          (response && !retryableResponse) ||
+          attempt === MINIMAX_STREAM_MAX_ATTEMPTS
+        ) {
+          throw error;
+        }
+      } finally {
+        clearTimeout(requestTimer);
+      }
+      await waitForRetry(MINIMAX_STREAM_RETRY_BASE_DELAY_MS * attempt);
+    }
+    if (!response?.ok || !response.body) {
+      throw lastRequestError instanceof Error
+        ? lastRequestError
+        : new Error('MiniMax streaming TTS request failed');
     }
 
     // On quota/auth failures MiniMax returns a normal JSON object (HTTP 200)
@@ -770,9 +815,14 @@ export class MinimaxEngine implements VoiceEngine {
               normalizedEmotion === 'relaxed' ||
               normalizedEmotion === 'bored'
             ? 'neutral'
-            : ['happy', 'sad', 'angry', 'surprised', 'fearful', 'disgusted'].includes(
-                  normalizedEmotion,
-                )
+            : [
+                  'happy',
+                  'sad',
+                  'angry',
+                  'surprised',
+                  'fearful',
+                  'disgusted',
+                ].includes(normalizedEmotion)
               ? normalizedEmotion
               : 'neutral';
 

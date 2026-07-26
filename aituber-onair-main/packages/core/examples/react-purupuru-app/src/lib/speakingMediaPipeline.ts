@@ -8,6 +8,16 @@ export type RenderedSpeakingMedia = {
   durationSeconds: number;
 };
 
+export type FailedSpeakingMedia = {
+  fallbackAudioBuffer: ArrayBuffer;
+  failureReason: string;
+};
+
+export type SpeakingRenderResult =
+  | RenderedSpeakingMedia
+  | FailedSpeakingMedia
+  | null;
+
 export type SpeakingRenderOptions = {
   reset?: boolean;
   end?: boolean;
@@ -32,7 +42,7 @@ export type SpeakingMediaPipelineOptions = {
     render(
       audio: ArrayBuffer,
       options?: SpeakingRenderOptions,
-    ): Promise<RenderedSpeakingMedia | null>;
+    ): Promise<SpeakingRenderResult>;
   };
   playback: {
     play(audio: ArrayBuffer, callbacks?: PlaybackCallbacks): Promise<unknown>;
@@ -67,7 +77,12 @@ export type SpeakingMediaPipelineOptions = {
 };
 
 const DEFAULT_FLASHHEAD_START_BUFFER_SECONDS = 2.5;
-const DEFAULT_FLASHHEAD_PLAYBACK_START_WAIT_MS = 2_800;
+// Rendering normally stays below the duration of a 32 KiB speech fragment,
+// but a cold/busy CUDA pass can take several seconds. Starting a lone staged
+// fragment after 2.8 s lets playback outrun the renderer and produces an
+// audible gap before the next fragment is ready.
+const DEFAULT_FLASHHEAD_PLAYBACK_START_WAIT_MS = 15_000;
+const DEFAULT_SPEAKING_RENDER_TIMEOUT_MS = 12_000;
 
 export async function getAudioPlaybackTimeoutMs(audio: ArrayBuffer) {
   const url = URL.createObjectURL(new Blob([audio.slice(0)]));
@@ -107,6 +122,12 @@ function concatenate(chunks: ArrayBuffer[]): ArrayBuffer {
   return complete.buffer;
 }
 
+function isFailedSpeakingMedia(
+  result: SpeakingRenderResult,
+): result is FailedSpeakingMedia {
+  return result !== null && 'fallbackAudioBuffer' in result;
+}
+
 export function createSpeakingMediaPipeline(
   options: SpeakingMediaPipelineOptions,
 ) {
@@ -143,11 +164,15 @@ export function createSpeakingMediaPipeline(
     const sourceState = { firstAudioSeen: false };
     reportSourceChunk(sourceAudio.byteLength, sourceState);
     if (capture) await capture([sourceAudio.slice(0)]);
-    const rendered = await renderer.render(sourceAudio, {
+    const renderResult = await renderer.render(sourceAudio, {
       reset: true,
       end: true,
     });
-    const audio = rendered?.audioBuffer ?? sourceAudio;
+    const rendered = isFailedSpeakingMedia(renderResult) ? null : renderResult;
+    const fallbackAudio = isFailedSpeakingMedia(renderResult)
+      ? renderResult.fallbackAudioBuffer
+      : sourceAudio;
+    const audio = rendered?.audioBuffer ?? fallbackAudio;
     const videoUrl = rendered?.videoUrl ?? null;
     const timeoutMs = await playback.timeoutMs(audio);
     if (videoUrl && visual) {
@@ -195,6 +220,8 @@ export function createSpeakingMediaPipeline(
 
     const sourceState = { firstAudioSeen: false };
     const sourceChunks: ArrayBuffer[] = [];
+    let pendingSourceChunks: ArrayBuffer[] = [];
+    let degradedTailChunks: ArrayBuffer[] | null = null;
     const capturedChunks: ArrayBuffer[] = [];
     let sourceByteLength = 0;
     let playedByteLength = 0;
@@ -211,16 +238,14 @@ export function createSpeakingMediaPipeline(
     const acceptSourceChunk = (audio: ArrayBuffer) => {
       const copy = audio.slice(0);
       sourceChunks.push(copy);
+      pendingSourceChunks.push(copy.slice(0));
       if (capture) capturedChunks.push(copy.slice(0));
       chunkCount += 1;
       sourceByteLength += audio.byteLength;
       reportSourceChunk(audio.byteLength, sourceState);
     };
 
-    const enqueuePlayable = async (
-      audio: ArrayBuffer,
-      videoUrl?: string,
-    ) => {
+    const enqueuePlayable = async (audio: ArrayBuffer, videoUrl?: string) => {
       const isFirst = firstPlayable;
       if (videoUrl) generatedVideoUrls.push(videoUrl);
       await playback.enqueue(audio, {
@@ -264,7 +289,14 @@ export function createSpeakingMediaPipeline(
       await startStagedPlayback();
     };
 
-    const enqueueFallback = async (audio: ArrayBuffer) => {
+    const enqueueFallback = async (audio: ArrayBuffer, reason?: string) => {
+      // A later render can fail while earlier renderer-aligned media is still
+      // staged below the startup buffer threshold. Preserve and enqueue that
+      // successful media before the raw tail; otherwise the beginning of the
+      // sentence disappears exactly when FlashHead degrades.
+      if (!playbackStarted && stagedMedia.length > 0) {
+        await startStagedPlayback();
+      }
       if (!playbackStarted) {
         playbackStarted = true;
         if (startDeadlineTimer !== null) {
@@ -275,51 +307,88 @@ export function createSpeakingMediaPipeline(
       emit?.({
         stage: 'flashhead_audio_fallback',
         byteLength: audio.byteLength,
-        reason: 'renderer_returned_no_playable_media',
+        reason: reason || 'renderer_returned_no_playable_media',
       });
       await enqueuePlayable(audio);
     };
 
     acceptSourceChunk(current.value);
-    let renderPromise = renderer.render(current.value, {
-      reset: true,
-      sequence,
-    });
+    let renderPromise: Promise<SpeakingRenderResult> | null = renderer.render(
+      current.value,
+      {
+        reset: true,
+        sequence,
+      },
+    );
 
     while (!current.done) {
       const sourceAudio = current.value;
       const nextPromise = iterator.next();
-      const rendered = await renderPromise;
-      if (rendered) {
-        rendererProducedMedia = true;
-        await stageOrEnqueue(rendered);
-      } else if (sourceAudio.byteLength > 0) {
-        if (engine === 'flashhead') {
+      if (degradedTailChunks) {
+        degradedTailChunks.push(sourceAudio.slice(0));
+      } else {
+        const rendered = await renderPromise;
+        if (isFailedSpeakingMedia(rendered)) {
+          degradedTailChunks = pendingSourceChunks.map((chunk) =>
+            chunk.slice(0),
+          );
           emit?.({
-            stage: 'flashhead_fragment_deferred',
-            byteLength: sourceAudio.byteLength,
-            reason: 'renderer_session_will_flush_tail',
+            stage: 'flashhead_stream_degraded',
+            byteLength: rendered.fallbackAudioBuffer.byteLength,
+            reason: rendered.failureReason,
           });
-        } else {
-          await enqueueFallback(sourceAudio);
+        } else if (rendered) {
+          rendererProducedMedia = true;
+          pendingSourceChunks = [];
+          await stageOrEnqueue(rendered);
+        } else if (sourceAudio.byteLength > 0) {
+          if (engine === 'flashhead') {
+            emit?.({
+              stage: 'flashhead_fragment_deferred',
+              byteLength: sourceAudio.byteLength,
+              reason: 'renderer_session_will_flush_tail',
+            });
+          } else {
+            await enqueueFallback(sourceAudio);
+            pendingSourceChunks = [];
+          }
         }
       }
 
       const next = await nextPromise;
       if (!next.done) {
         acceptSourceChunk(next.value);
-        renderPromise = renderer.render(next.value, { sequence: ++sequence });
+        if (!degradedTailChunks) {
+          renderPromise = renderer.render(next.value, {
+            sequence: ++sequence,
+          });
+        } else {
+          renderPromise = null;
+        }
       }
       current = next;
     }
 
-    if (engine === 'flashhead') {
+    if (degradedTailChunks) {
+      await enqueueFallback(
+        concatenate(degradedTailChunks),
+        'renderer_failed_remaining_stream_preserved',
+      );
+    } else if (engine === 'flashhead') {
       const finalRendered = await renderer.render(new ArrayBuffer(0), {
         end: true,
         sequence: ++sequence,
       });
-      if (finalRendered) {
+      if (isFailedSpeakingMedia(finalRendered)) {
+        if (pendingSourceChunks.length > 0) {
+          await enqueueFallback(
+            concatenate(pendingSourceChunks),
+            finalRendered.failureReason,
+          );
+        }
+      } else if (finalRendered) {
         rendererProducedMedia = true;
+        pendingSourceChunks = [];
         await stageOrEnqueue(finalRendered, true);
       }
       if (!rendererProducedMedia && sourceChunks.length > 0) {
@@ -371,12 +440,12 @@ export function createSpeakingAvatarHttpRenderer(
     async render(
       audio: ArrayBuffer,
       renderOptions: SpeakingRenderOptions = {},
-    ): Promise<RenderedSpeakingMedia | null> {
+    ): Promise<SpeakingRenderResult> {
       if (!options.enabled) return null;
       const controller = new AbortController();
       const timeout = window.setTimeout(
         () => controller.abort(),
-        options.timeoutMs ?? 6_000,
+        options.timeoutMs ?? DEFAULT_SPEAKING_RENDER_TIMEOUT_MS,
       );
       const requestedAt = now();
       try {
@@ -407,27 +476,66 @@ export function createSpeakingAvatarHttpRenderer(
           reset: renderOptions.reset === true,
           end: renderOptions.end === true,
         });
-        const response = await fetch(
-          `/api/${options.engine}/render?${parameters.toString()}`,
-          {
+        const requestRender = (retryAttempt = 0) =>
+          fetch(`/api/${options.engine}/render?${parameters.toString()}`, {
             method: 'POST',
-            headers,
+            headers:
+              retryAttempt > 0
+                ? { ...headers, 'X-Avatar-Retry': String(retryAttempt) }
+                : headers,
             body: audio.slice(0),
             signal: controller.signal,
-          },
-        );
-        const headersAt = now();
-        options.emit({
-          eventId: options.getEventId(),
-          stage: `${options.engine}_render_headers`,
-          at: headersAt,
-          sequence: renderOptions.sequence ?? 0,
-          requestToHeadersMs: headersAt - requestedAt,
-          status: response.status,
-        });
+          });
+        const emitHeaders = (response: Response, retryAttempt: number) => {
+          const headersAt = now();
+          options.emit({
+            eventId: options.getEventId(),
+            stage: `${options.engine}_render_headers`,
+            at: headersAt,
+            sequence: renderOptions.sequence ?? 0,
+            requestToHeadersMs: headersAt - requestedAt,
+            status: response.status,
+            retryAttempt,
+          });
+        };
+        let response = await requestRender();
+        emitHeaders(response, 0);
+        if (!response.ok && response.status !== 204) {
+          const contentType = response.headers.get('content-type') || '';
+          const errorBody = await response.text().catch(() => '');
+          const isServiceFailure =
+            contentType.includes('application/json') &&
+            /FlashHead render failed/iu.test(errorBody);
+          const isTransientGatewayFailure =
+            [502, 503, 504].includes(response.status) ||
+            (response.status === 500 && !isServiceFailure);
+          if (isTransientGatewayFailure) {
+            options.emit({
+              eventId: options.getEventId(),
+              stage: `${options.engine}_render_retry`,
+              at: now(),
+              sequence: renderOptions.sequence ?? 0,
+              status: response.status,
+              reason: errorBody.slice(0, 160) || 'transient_gateway_failure',
+            });
+            response = await requestRender(1);
+            emitHeaders(response, 1);
+          } else {
+            throw new Error(
+              `${options.engine} returned ${response.status}: ${
+                errorBody.slice(0, 160) || 'render failed'
+              }`,
+            );
+          }
+        }
         if (response.status === 204) return null;
         if (!response.ok) {
-          throw new Error(`${options.engine} returned ${response.status}`);
+          const errorBody = await response.text().catch(() => '');
+          throw new Error(
+            `${options.engine} returned ${response.status}: ${
+              errorBody.slice(0, 160) || 'render failed after retry'
+            }`,
+          );
         }
         const payload = new Uint8Array(await response.arrayBuffer());
         options.emit({
@@ -449,11 +557,11 @@ export function createSpeakingAvatarHttpRenderer(
             new Blob([videoBuffer], { type: 'video/webm' }),
           ),
           durationSeconds:
-            Number.isFinite(frameCount) && frameCount > 0
-              ? frameCount / 25
-              : 0,
+            Number.isFinite(frameCount) && frameCount > 0 ? frameCount / 25 : 0,
         };
       } catch (error) {
+        const failureReason =
+          error instanceof Error ? error.message : String(error);
         console.warn(
           `${options.engine} unavailable; using the idle avatar.`,
           error,
@@ -462,9 +570,12 @@ export function createSpeakingAvatarHttpRenderer(
           eventId: options.getEventId(),
           stage: `${options.engine}_render_failed`,
           at: now(),
-          reason: error instanceof Error ? error.message : String(error),
+          reason: failureReason,
         });
-        return null;
+        return {
+          fallbackAudioBuffer: audio.slice(0),
+          failureReason,
+        };
       } finally {
         window.clearTimeout(timeout);
       }

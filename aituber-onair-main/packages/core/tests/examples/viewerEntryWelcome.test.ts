@@ -6,7 +6,7 @@ import {
 } from '../../examples/react-purupuru-app/src/lib/viewerEntryWelcome';
 
 describe('viewer entry welcome', () => {
-  it('welcomes every newly observed named viewer regardless of room size', () => {
+  it('welcomes ordinary viewers only in small rooms and fans at any size', () => {
     expect(
       shouldWelcomeViewerEntry({
         isNewPresence: true,
@@ -19,6 +19,14 @@ describe('viewer entry welcome', () => {
         isNewPresence: true,
         estimatedAudience: SMALL_ROOM_WELCOME_MAX_AUDIENCE + 1,
         recentEntryCount: 1,
+      }),
+    ).toBe(false);
+    expect(
+      shouldWelcomeViewerEntry({
+        isNewPresence: true,
+        estimatedAudience: SMALL_ROOM_WELCOME_MAX_AUDIENCE + 100,
+        recentEntryCount: 1,
+        isFan: true,
       }),
     ).toBe(true);
     expect(
@@ -58,6 +66,20 @@ describe('viewer entry welcome', () => {
 
     expect(prompt).toContain('平台提供的地域标签：北京');
     expect(prompt).toContain('不能凭城市刻板印象编天气');
+  });
+
+  it('changes warmth with relationship stage without exposing affinity', () => {
+    const prompt = buildViewerEntryWelcomePrompt({
+      viewerName: '老朋友',
+      platform: 'bilibili',
+      estimatedAudience: 200,
+      isFan: true,
+      relationship: { stage: 'close', affinity: 78 },
+    });
+
+    expect(prompt).toContain('平台证据已确认是本主播的粉丝');
+    expect(prompt).toContain('明显表达见到对方的高兴和珍惜');
+    expect(prompt).not.toContain('78');
   });
 
   it('does not fabricate a target when the platform has no display name', () => {

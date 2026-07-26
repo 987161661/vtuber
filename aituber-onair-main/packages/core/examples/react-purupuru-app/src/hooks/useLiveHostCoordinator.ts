@@ -7,6 +7,10 @@ import {
   type LiveHostSnapshot,
 } from '@aituber-onair/live-companion';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import {
+  filterUnacknowledgedActions,
+  rememberAcknowledgedActions,
+} from '../lib/liveHostActionAcknowledgement';
 
 export function useLiveHostCoordinator(
   policy: Partial<LiveHostPolicy>,
@@ -22,6 +26,7 @@ export function useLiveHostCoordinator(
     [scopeKey],
   );
   const speechPermissionsRef = useRef(new Set<string>());
+  const acknowledgedActionIdsRef = useRef(new Set<string>());
   const [pendingActions, setPendingActions] = useState<LiveHostAction[]>([]);
   const [snapshot, setSnapshot] = useState<LiveHostSnapshot>(() =>
     coordinator.snapshot(),
@@ -30,6 +35,7 @@ export function useLiveHostCoordinator(
   useEffect(() => {
     coordinator.updatePolicy(policy);
     speechPermissionsRef.current.clear();
+    acknowledgedActionIdsRef.current.clear();
     setPendingActions([]);
     setSnapshot(coordinator.snapshot());
   }, [coordinator, policy]);
@@ -49,12 +55,15 @@ export function useLiveHostCoordinator(
           speechPermissionsRef.current.delete(decision.eventId);
         }
       }
-      const deferred = decisions.filter((decision) =>
-        [
-          'emit-avatar-intent',
-          'enter-recovery',
-          'request-operator-attention',
-        ].includes(decision.kind),
+      const deferred = filterUnacknowledgedActions(
+        decisions.filter((decision) =>
+          [
+            'emit-avatar-intent',
+            'enter-recovery',
+            'request-operator-attention',
+          ].includes(decision.kind),
+        ),
+        acknowledgedActionIdsRef.current,
       );
       if (deferred.length > 0) {
         setPendingActions((current) => {
@@ -82,6 +91,11 @@ export function useLiveHostCoordinator(
 
   const acknowledgeActions = useCallback((actionIds: readonly string[]) => {
     if (actionIds.length === 0) return;
+    // Record the acknowledgement before scheduling React state. Coordinator
+    // callbacks can run again before the state update commits; without this
+    // synchronous fence, the same deterministic actionId is re-admitted and
+    // can flood the runtime event transport.
+    rememberAcknowledgedActions(acknowledgedActionIdsRef.current, actionIds);
     const acknowledged = new Set(actionIds);
     setPendingActions((current) =>
       current.filter((action) => !acknowledged.has(action.actionId)),

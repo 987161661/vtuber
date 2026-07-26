@@ -93,6 +93,7 @@ export interface LiveMemoryManagerOptions {
 
 export class LiveMemoryManager {
   private sequence = 0;
+  private readonly repository: LiveMemoryRepository;
   private readonly now: () => number;
   private readonly idFactory: () => string;
   private readonly limits: Record<LiveMemoryDimension, number>;
@@ -100,9 +101,10 @@ export class LiveMemoryManager {
   private readonly defaultWorkingTtlMs: number;
 
   constructor(
-    private readonly repository: LiveMemoryRepository,
+    repository: LiveMemoryRepository,
     options: LiveMemoryManagerOptions = {},
   ) {
+    this.repository = repository;
     this.now = options.now ?? Date.now;
     this.idFactory =
       options.idFactory ??

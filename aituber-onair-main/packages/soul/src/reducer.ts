@@ -7,7 +7,6 @@ import type {
   SoulAppraisalV1,
   SoulConstitutionV1,
   SoulEventV1,
-  SoulGoalDefinitionV1,
   SoulGoalEvidenceV1,
   SoulGoalStateV1,
   SoulProfileV1,

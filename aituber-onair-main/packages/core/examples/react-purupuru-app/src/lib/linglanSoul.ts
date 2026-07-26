@@ -107,7 +107,8 @@ export const LINGLAN_SOUL_PROFILE: SoulProfileV1 = {
     {
       id: 'be-recognized',
       family: 'recognition',
-      label: '让岚台被喜欢、关注，也让自己的判断与节目被认可',
+      label:
+        '让岚台被喜欢、关注并获得礼物与上舰收入，也让自己的判断与节目被认可',
       initialSatisfaction: 0.28,
       targetSatisfaction: 0.78,
       weight: 0.88,

@@ -1,12 +1,13 @@
 import { describe, expect, it } from 'vitest';
 import {
-  applySimulatorEventToViewer,
-  createSimulatorRoomEvent,
-  routeSimulatorEventForQueue,
   SIMULATOR_PLATFORM_PROFILES,
-  summarizeSimulatorEvents,
   type SimulatorEventDraft,
   type SimulatorViewer,
+  applySimulatorEventToViewer,
+  createSimulatorRoomEvent,
+  planSimulatorDispatch,
+  routeSimulatorEventForQueue,
+  summarizeSimulatorEvents,
 } from '../examples/react-purupuru-app/src/lib/simulatorRoom';
 
 const viewer: SimulatorViewer = {
@@ -43,6 +44,17 @@ function createEvent(update: Partial<SimulatorEventDraft>) {
 }
 
 describe('simulator room events', () => {
+  it('starts a self-contained preview before dispatching an event', () => {
+    expect(planSimulatorDispatch({ autoBroadcastEnabled: false })).toEqual({
+      ensureRoomLive: true,
+      enableAutomation: true,
+    });
+    expect(planSimulatorDispatch({ autoBroadcastEnabled: true })).toEqual({
+      ensureRoomLive: true,
+      enableAutomation: false,
+    });
+  });
+
   it('creates a normalized follow event and updates the viewer', () => {
     const event = createEvent({ type: 'follow' });
 
@@ -106,9 +118,9 @@ describe('simulator room events', () => {
       'gift',
       'superchat',
       'entry',
+      'follow',
       'like',
     ]);
-    expect(bilibili?.events).not.toContain('follow');
     expect(huya?.events).toEqual(['comment', 'gift', 'entry']);
   });
 

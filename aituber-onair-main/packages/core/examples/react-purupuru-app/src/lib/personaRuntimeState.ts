@@ -2,16 +2,17 @@ import type {
   EmptyRoomAwarenessContext,
   EmptyRoomMemoryCue,
 } from './emptyRoomAwareness';
-import {
-  PersonaDriveState,
-  type PersonaDriveId,
-} from './personaDriveState';
+import { PersonaDriveState, type PersonaDriveId } from './personaDriveState';
 import {
   PersonaEmotionStateMachine,
   type PersonaEmotionPreview,
   type PersonaEmotionSnapshot,
 } from './personaEmotionState';
 import type { PersonaInteractionPlanV1 } from './personaInteractionPlanner';
+import {
+  type IdleExpressionMode,
+  selectIdleExpressionShape,
+} from './idleThoughtComposer';
 import {
   inferTopicEntities,
   inferTopicFamily,
@@ -39,6 +40,8 @@ export interface ProactiveIntentPlanV1 {
   continuity: ProactiveContinuity;
   mustAdvance: string;
   mustAvoidTopics: string[];
+  expressionMode: IdleExpressionMode;
+  expressionInstruction: string;
   emotion: {
     label: string;
     delivery: string;
@@ -59,6 +62,10 @@ export interface PersonaRuntimeSnapshot {
   topics: PersonaTopicEntry[];
 }
 
+export interface PersonaRuntimeStateOptions {
+  topics?: readonly PersonaTopicEntry[];
+}
+
 type CandidateWithDrive = PersonaTopicCandidate & {
   source: ProactiveIntentSource;
   drives: PersonaDriveId[];
@@ -72,13 +79,18 @@ const DRIVE_EMOTION: Record<
   curiosity: { label: 'neutral', delivery: 'curious', intensity: [0.34, 0.5] },
   ambition: { label: 'happy', delivery: 'confident', intensity: [0.38, 0.56] },
   connection: { label: 'relaxed', delivery: 'warm', intensity: [0.34, 0.5] },
-  autonomy: { label: 'neutral', delivery: 'restrained', intensity: [0.34, 0.5] },
+  autonomy: {
+    label: 'neutral',
+    delivery: 'restrained',
+    intensity: [0.34, 0.5],
+  },
   play: { label: 'happy', delivery: 'teasing', intensity: [0.4, 0.58] },
 };
 
 function strategyDrives(strategyId: string): PersonaDriveId[] {
   if (strategyId.includes('viewer')) return ['connection', 'curiosity', 'play'];
-  if (strategyId.includes('memory')) return ['curiosity', 'connection', 'craft'];
+  if (strategyId.includes('memory'))
+    return ['curiosity', 'connection', 'craft'];
   if (strategyId.includes('quiet')) return ['connection', 'autonomy', 'play'];
   return ['craft', 'ambition', 'autonomy', 'play', 'curiosity'];
 }
@@ -97,7 +109,8 @@ function memoryCandidate(memory: EmptyRoomMemoryCue): CandidateWithDrive {
     entities: inferTopicEntities(text),
     source: 'memory',
     sourceRef: `${memory.title}：${memory.content}`.slice(0, 180),
-    mustAdvance: '从这条记忆生出一个新的当下判断，不复述档案，也不把道具当成人格本身',
+    mustAdvance:
+      '从这条记忆生出一个新的当下判断，不复述档案，也不把道具当成人格本身',
     drives: ['curiosity', 'connection', 'craft'],
   };
 }
@@ -140,11 +153,12 @@ function candidatesFor(
       entities: inferTopicEntities(text),
       source: 'interface',
       sourceRef: text.slice(0, 180),
-      mustAdvance: '只使用可确认的当前状态形成观察，不念界面字段，不虚构屏幕之外的细节',
+      mustAdvance:
+        '只使用可确认的当前状态形成观察，不念界面字段，不虚构屏幕之外的细节',
       drives: ['craft', 'curiosity'],
     });
   }
-  candidates.push(...context.memoryCues.slice(0, 4).map(memoryCandidate));
+  candidates.push(...context.memoryCues.slice(0, 12).map(memoryCandidate));
   return candidates;
 }
 
@@ -155,7 +169,11 @@ function uniqueRecentTopics(entries: PersonaTopicEntry[]) {
 export class PersonaRuntimeState {
   private readonly emotion = new PersonaEmotionStateMachine();
   private readonly drives = new PersonaDriveState();
-  private readonly topics = new PersonaTopicLedger();
+  private readonly topics: PersonaTopicLedger;
+
+  constructor(options: PersonaRuntimeStateOptions = {}) {
+    this.topics = new PersonaTopicLedger(12, 6, 30 * 60_000, options.topics);
+  }
 
   snapshot(at = Date.now()): PersonaRuntimeSnapshot {
     return {
@@ -184,19 +202,34 @@ export class PersonaRuntimeState {
     };
   }
 
-  planProactive(
+  tryPlanProactive(
     context: EmptyRoomAwarenessContext,
     strategyId: string,
     at = Date.now(),
-  ): ProactiveIntentPlanV1 {
+  ): ProactiveIntentPlanV1 | null {
     const allowedDrives = strategyDrives(strategyId);
-    const drive = this.drives.select(allowedDrives, at) ?? this.drives.select(undefined, at)!;
+    const drive =
+      this.drives.select(allowedDrives, at) ??
+      this.drives.select(undefined, at);
+    if (!drive) return null;
     const allCandidates = candidatesFor(context, drive.id, drive.goal);
     const compatible = allCandidates.filter((candidate) =>
       candidate.drives.includes(drive.id),
     );
     const preferredSources = strategySources(strategyId);
-    const ranked = (compatible.length ? compatible : allCandidates).sort(
+    const freshCompatible = compatible.filter(
+      (candidate) => !this.topics.isCooling(candidate, at),
+    );
+    const freshCandidates = allCandidates.filter(
+      (candidate) => !this.topics.isCooling(candidate, at),
+    );
+    const candidatePool = freshCompatible.length
+      ? freshCompatible
+      : freshCandidates.length
+        ? freshCandidates
+        : [];
+    if (!candidatePool.length) return null;
+    const ranked = candidatePool.sort(
       (left, right) =>
         this.topics.score(right, at) +
         (preferredSources.includes(right.source) ? 200 : 0) -
@@ -206,6 +239,9 @@ export class PersonaRuntimeState {
     const candidate = ranked[0];
     const emotion = DRIVE_EMOTION[drive.id];
     const currentTopics = this.topics.snapshot();
+    const expressionShape = selectIdleExpressionShape(
+      currentTopics.map((entry) => entry.expressionMode),
+    );
     return {
       version: 1,
       drive: drive.id,
@@ -217,6 +253,8 @@ export class PersonaRuntimeState {
       continuity: 'new',
       mustAdvance: candidate.mustAdvance,
       mustAvoidTopics: uniqueRecentTopics(currentTopics),
+      expressionMode: expressionShape.mode,
+      expressionInstruction: expressionShape.instruction,
       emotion: {
         ...emotion,
         socialMask:
@@ -228,6 +266,17 @@ export class PersonaRuntimeState {
       },
       reasonCode: `drive_${drive.id}:${candidate.source}`,
     };
+  }
+
+  planProactive(
+    context: EmptyRoomAwarenessContext,
+    strategyId: string,
+    at = Date.now(),
+  ): ProactiveIntentPlanV1 {
+    const plan = this.tryPlanProactive(context, strategyId, at);
+    if (plan) return plan;
+
+    throw new Error('No fresh proactive topic is currently available');
   }
 
   commitInteraction(transition: PersonaRuntimeTransition) {
@@ -244,6 +293,7 @@ export class PersonaRuntimeState {
       continuity: plan.continuity,
       spokenAt: at,
       audienceResponded: false,
+      expressionMode: plan.expressionMode,
     });
   }
 }
@@ -254,6 +304,7 @@ export function formatProactiveIntent(plan: ProactiveIntentPlanV1) {
 人格动力：${plan.drive}（${plan.driveGoal}）
 主题族：${plan.topicFamily}；来源=${plan.source}；连续性=${plan.continuity}${source}
 这一轮必须推进：${plan.mustAdvance}
+表达动作：${plan.expressionMode}；${plan.expressionInstruction}
 近期冷却主题：${plan.mustAvoidTopics.join('、') || '无'}。不得换句式重复这些主题；除非观众主动重开，否则不要延续。
 情绪表达：emotion=${plan.emotion.label}；delivery=${plan.emotion.delivery}；强度=${plan.emotion.intensity.join('-')}；表达遮罩=${plan.emotion.socialMask}
 只选择上述一个主来源，不拼接其他记忆，不把杯子、饮料或其他道具当作人格内容引擎。

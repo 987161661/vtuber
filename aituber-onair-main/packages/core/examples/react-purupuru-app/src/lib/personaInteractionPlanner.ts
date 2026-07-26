@@ -44,7 +44,8 @@ export type SocialMove =
   | 'set_boundary'
   | 'deescalate'
   | 'welcome'
-  | 'invite_room';
+  | 'invite_room'
+  | 'invite_support';
 
 export type PersonaProsodyTarget = Partial<{
   pace: number;
@@ -129,18 +130,21 @@ const LIVING_BEING_LOSS =
 function mentionsGrief(text: string): boolean {
   return EXPLICIT_LOSS.test(text) || LIVING_BEING_LOSS.test(text);
 }
-const DISTRESS = /(?:难受|想哭|撑不住|很痛苦|好痛|崩溃|失眠|睡不着|很糟|孤独|不开心|emo)/iu;
+const DISTRESS =
+  /(?:难受|想哭|撑不住|很痛苦|好痛|崩溃|失眠|睡不着|很糟|孤独|不开心|emo)/iu;
 const BOREDOM = /(?:好无聊|无聊死了|没意思|没劲|闲得慌)/u;
 const PRAISE = /(?:喜欢你|你好棒|真厉害|可爱|漂亮|声音好听|做得不错|主播真好)/u;
 const CORRECTION =
   /(?:(?:你|刚才|上一句).{0,4}(?:说错|记错|忘了)|不是这样的|刚才.*(?:没|不)|光张嘴|没声音|没听见)/u;
 const REJECTS_ADVICE =
   /(?:不想|不要|别|不用).{0,5}(?:建议|办法|方案|解决)|(?:只想|就想).{0,5}(?:陪|听我说|聊聊)/u;
-const DOMINATING = /(?:命令你|必须听|照我说|不许拒绝|现在立刻|叫我主人|按我要求)/u;
+const DOMINATING =
+  /(?:命令你|必须听|照我说|不许拒绝|现在立刻|叫我主人|按我要求)/u;
 const HOSTILE = /(?:滚|闭嘴|垃圾|废物|恶心|骗子|找打|弄死|打死)/u;
 const PLAYFUL = /(?:哈哈|笑死|逗你|开玩笑|狗头|hhh|233|~|～)/iu;
 const QUESTION = /[?？]|(?:为什么|怎么|什么|哪|多少|能不能|可以吗)/u;
-const FIRST_PERSON_REFERENCE = /(?:^|[:：，。！？\s])(?:我|人家)(?:呢|也|还|不|没|算)/u;
+const FIRST_PERSON_REFERENCE =
+  /(?:^|[:：，。！？\s])(?:我|人家)(?:呢|也|还|不|没|算)/u;
 const EXCLUSION_OR_NEGLECT =
   /(?:不是人|不算人|没算|漏掉|忘了|忽略|不理|没理|没看到|看不见|不存在|只顾|只回)/u;
 
@@ -203,7 +207,11 @@ function sceneFor(input: PersonaPlannerInput): {
     return { scene: 'praise', confidence: 0.92, reasonCode: 'clear_praise' };
   }
   if (CORRECTION.test(text)) {
-    return { scene: 'correction', confidence: 0.88, reasonCode: 'host_correction' };
+    return {
+      scene: 'correction',
+      confidence: 0.88,
+      reasonCode: 'host_correction',
+    };
   }
   if (expressesRelationalGrievance(text)) {
     return {
@@ -213,7 +221,11 @@ function sceneFor(input: PersonaPlannerInput): {
     };
   }
   if (DOMINATING.test(text)) {
-    return { scene: 'boundary', confidence: 0.94, reasonCode: 'dominating_request' };
+    return {
+      scene: 'boundary',
+      confidence: 0.94,
+      reasonCode: 'dominating_request',
+    };
   }
   if (HOSTILE.test(text) && PLAYFUL.test(text)) {
     return {
@@ -223,13 +235,21 @@ function sceneFor(input: PersonaPlannerInput): {
     };
   }
   if (HOSTILE.test(text) || input.routing.moderation === 'boundary') {
-    return { scene: 'boundary', confidence: 0.86, reasonCode: 'hostile_boundary' };
+    return {
+      scene: 'boundary',
+      confidence: 0.86,
+      reasonCode: 'hostile_boundary',
+    };
   }
   if (PLAYFUL.test(text)) {
     return { scene: 'banter', confidence: 0.84, reasonCode: 'playful_signal' };
   }
   if (QUESTION.test(text)) {
-    return { scene: 'question', confidence: 0.82, reasonCode: 'ordinary_question' };
+    return {
+      scene: 'question',
+      confidence: 0.82,
+      reasonCode: 'ordinary_question',
+    };
   }
   if (input.text.includes('<viewer_entry_welcome>')) {
     return { scene: 'welcome', confidence: 0.98, reasonCode: 'viewer_entry' };
@@ -291,18 +311,47 @@ export function shouldRequestPersonaAgent(
 }
 
 const SCENES = new Set<InteractionScene>([
-  'casual', 'banter', 'boredom', 'praise', 'grief', 'distress',
-  'correction', 'relationship_repair', 'advice_rejection', 'question', 'boundary',
-  'room_conflict', 'weather', 'urgent', 'variety', 'welcome', 'idle',
+  'casual',
+  'banter',
+  'boredom',
+  'praise',
+  'grief',
+  'distress',
+  'correction',
+  'relationship_repair',
+  'advice_rejection',
+  'question',
+  'boundary',
+  'room_conflict',
+  'weather',
+  'urgent',
+  'variety',
+  'welcome',
+  'idle',
 ]);
 const STANCES = new Set<PersonaStance>([
-  'cool_observer', 'playful_challenge', 'restrained_pride', 'quiet_support',
-  'accountable_softness', 'protective_boundary', 'professional_serious',
+  'cool_observer',
+  'playful_challenge',
+  'restrained_pride',
+  'quiet_support',
+  'accountable_softness',
+  'protective_boundary',
+  'professional_serious',
 ]);
 const MOVES = new Set<SocialMove>([
-  'acknowledge', 'answer', 'join_bit', 'offer_choice', 'leave_space',
-  'clarify', 'correct_self', 'repair', 'set_boundary', 'deescalate', 'welcome',
+  'acknowledge',
+  'answer',
+  'join_bit',
+  'offer_choice',
+  'leave_space',
+  'clarify',
+  'correct_self',
+  'repair',
+  'set_boundary',
+  'deescalate',
+  'welcome',
   'invite_room',
+  'invite_support',
 ]);
 
 export function applyAgentPersonaDecision(
@@ -321,7 +370,8 @@ export function applyAgentPersonaDecision(
       ? data.roomAction
       : 'none';
   const scene = data.scene as InteractionScene;
-  const policyBody = input && policy ? policy.planForScene(scene, input) : local;
+  const policyBody =
+    input && policy ? policy.planForScene(scene, input) : local;
   const memoryGuard = input
     ? withMemoryGuard(policyBody, input)
     : { mustDo: policyBody.mustDo, mustAvoid: policyBody.mustAvoid };
@@ -361,7 +411,12 @@ export function formatPersonaInteractionPlan(
   const lines = [
     '<persona_interaction>',
     room
-      ? `房间简报：近期至少${room.participantCount}位观众有互动证据${typeof room.platformAudienceEstimate === 'number' ? `；平台/本地估算在线${room.platformAudienceEstimate}人（非精确值）` : ''}；车道=${Object.entries(room.laneCounts).map(([lane, count]) => `${lane}:${count}`).join(',').slice(0, 120) || 'conversation'}；冲突=${room.conflictLevel}。只回应已选代表弹幕，不逐条复述；人数不是精确值，不得声称“只有谁”或“就咱俩”。`
+      ? `房间简报：近期至少${room.participantCount}位观众有互动证据${typeof room.platformAudienceEstimate === 'number' ? `；平台/本地估算在线${room.platformAudienceEstimate}人（非精确值）` : ''}；车道=${
+          Object.entries(room.laneCounts)
+            .map(([lane, count]) => `${lane}:${count}`)
+            .join(',')
+            .slice(0, 120) || 'conversation'
+        }；冲突=${room.conflictLevel}。只回应已选代表弹幕，不逐条复述；人数不是精确值，不得声称“只有谁”或“就咱俩”。`
       : '',
     `场景：${plan.scene}；立场：${plan.stance}；主要动作：${plan.primaryMove}${plan.secondaryMove ? `；次要动作：${plan.secondaryMove}` : ''}。`,
     `对象：${plan.audienceTarget === 'room' ? '直播间整体' : '当前观众'}；房间动作：${plan.roomAction}。`,

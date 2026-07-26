@@ -90,6 +90,20 @@ async function* closeAudioStreamAfterIdle(
   }
 }
 
+function createMinimaxSpeechEngine(): MinimaxEngine {
+  const engine = new MinimaxEngine();
+  engine.setApiEndpoint('/api/minimax-tts');
+  engine.setModel('speech-2.8-turbo');
+  engine.setLanguageBoost(LINGLAN_PROFILE.voice.languageBoost);
+  engine.setAudioSettings({
+    sampleRate: 44100,
+    bitrate: 128000,
+    format: 'mp3',
+    channel: 1,
+  });
+  return engine;
+}
+
 interface UseAituberCoreOptions {
   profile: CharacterProfile;
   onAudioPlay: (arrayBuffer: ArrayBuffer) => Promise<void>;
@@ -1404,15 +1418,12 @@ export function useAituberCore({
       // ChatServiceFactory uses its static `this.providers` registry. Calling
       // an extracted method loses that receiver and crashes with
       // "Cannot read properties of undefined (reading 'providers')".
-      const service = createStatelessChatService(
-        settings.llm.provider,
-        {
-          apiKey: llmApiKey.trim(),
-          model: resolvedModel,
-          tools: [],
-          ...isolatedProviderOptions,
-        } as ChatServiceOptions,
-      );
+      const service = createStatelessChatService(settings.llm.provider, {
+        apiKey: llmApiKey.trim(),
+        model: resolvedModel,
+        tools: [],
+        ...isolatedProviderOptions,
+      } as ChatServiceOptions);
       const timeoutMs = Math.max(2_000, options.timeoutMs ?? 12_000);
       let timer: ReturnType<typeof setTimeout> | undefined;
       try {
@@ -1448,6 +1459,118 @@ export function useAituberCore({
       resolvedModel,
       settings.llm.provider,
     ],
+  );
+
+  const generateLocalConversationReply = useCallback(
+    async (
+      text: string,
+      options: ProcessChatOptions & { recentContext?: string },
+    ): Promise<boolean> => {
+      const displayText = (options.displayText ?? text).trim();
+      if (!displayText) return false;
+      const startedAt = Date.now();
+      emitRuntimeTrace({
+        eventId: options.eventId,
+        stage: 'model_request',
+        at: startedAt,
+        provider: 'ollama-local',
+        model: 'qwen3:8b',
+        viewerInput: displayText,
+        source: options.source ?? 'chat',
+        sourceLabel: options.sourceLabel,
+      });
+      try {
+        const response = await fetch('/api/local-live-chat', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            text: displayText,
+            viewerName: options.viewerName,
+            recentContext: options.recentContext,
+          }),
+        });
+        if (!response.ok) return false;
+        const payload = (await response.json()) as { reply?: unknown };
+        if (typeof payload.reply !== 'string' || !payload.reply.trim()) {
+          return false;
+        }
+        const guarded = guardViewerResponse(payload.reply, options.factGuard);
+        const localPlan = buildSpeechPlanV2(
+          guarded.text,
+          options.speechPlanHints,
+        );
+        const speechPlan: PreparedSpeechPlan = {
+          version: 2,
+          beats: localPlan.beats.map((beat) => ({
+            ...beat,
+            text: sanitizeSpeechText(beat.text),
+            ttsText: formatTtsSpeechScript(beat.text),
+            prosody: beat.prosody
+              ? Object.fromEntries(Object.entries(beat.prosody))
+              : undefined,
+          })),
+        };
+        const reply = speechPlan.beats
+          .map((beat) => beat.text)
+          .join(' ')
+          .trim();
+        if (!reply) return false;
+        emitRuntimeTrace({
+          eventId: options.eventId,
+          stage: 'model_output',
+          at: Date.now(),
+          provider: 'ollama-local',
+          model: 'qwen3:8b',
+          finalText: reply,
+          durationMs: Date.now() - startedAt,
+        });
+        if (options.showInput !== false) {
+          setMessages((current) => [
+            ...current,
+            {
+              id: createMessageId(),
+              role: 'user',
+              content: displayText,
+              timestamp: startedAt,
+              sourceLabel: options.sourceLabel,
+            },
+            {
+              id: createMessageId(),
+              role: 'assistant',
+              content: reply,
+              timestamp: Date.now(),
+              sourceLabel: options.sourceLabel,
+            },
+          ]);
+        }
+        onAssistantResponseRef.current?.(displayText, reply, {
+          viewerId: options.viewerId,
+          viewerName: options.viewerName,
+          source: options.source,
+          eventId: options.eventId,
+          attemptId: options.attemptId,
+          commentAt: options.commentAt,
+          receivedAt: options.receivedAt,
+          queuedAt: options.queuedAt,
+          selectedAt: options.selectedAt,
+          processingAt: options.processingAt,
+          sourcesSeen: options.sourcesSeen,
+          sourceLabel: options.sourceLabel,
+          persistInteraction: options.persistInteraction,
+        });
+        options.onPrepared?.(reply, speechPlan);
+        return true;
+      } catch (error) {
+        emitRuntimeTrace({
+          eventId: options.eventId,
+          stage: 'local_model_fallback',
+          at: Date.now(),
+          reason: error instanceof Error ? error.message : String(error),
+        });
+        return false;
+      }
+    },
+    [createMessageId],
   );
 
   const processVisionChat = useCallback(
@@ -1505,17 +1628,7 @@ export function useAituberCore({
               bridge: 'minimax-stream',
             };
             activeChunk = chunk;
-            const engine = new MinimaxEngine();
-            engine.setApiEndpoint('/api/minimax-tts');
-            engine.setModel('speech-2.8-turbo');
-            engine.setLanguageBoost(LINGLAN_PROFILE.voice.languageBoost);
-            engine.setAudioSettings({
-              sampleRate: 44100,
-              bitrate: 128000,
-              format: 'mp3',
-              channel: 1,
-            });
-            const audioStream = engine.fetchAudioStream(
+            const audioStream = createMinimaxSpeechEngine().fetchAudioStream(
               {
                 style: ([
                   'talk',
@@ -1533,7 +1646,7 @@ export function useAituberCore({
                 ].includes(beat.emotion || '')
                   ? beat.emotion
                   : 'talk') as TalkStyle,
-                message: beat.ttsText || text,
+                message: formatTtsSpeechScript(beat.ttsText || text),
                 delivery: beat.delivery,
                 emotionIntensity: beat.emotionIntensity,
                 prosody: beat.prosody,
@@ -1591,9 +1704,12 @@ export function useAituberCore({
         return;
       }
       if (!coreRef.current) return;
-      await coreRef.current.speakTextWithOptions(spokenText, {
-        enableAnimation: true,
-      });
+      await coreRef.current.speakTextWithOptions(
+        formatTtsSpeechScript(spokenText),
+        {
+          enableAnimation: true,
+        },
+      );
     },
     [settings.tts.engine, settings.tts.speaker, ttsApiKey],
   );
@@ -1626,6 +1742,7 @@ export function useAituberCore({
     partialResponse,
     processChat,
     generateIsolatedReply,
+    generateLocalConversationReply,
     speakPrepared,
     processVisionChat,
     isCoreReady,

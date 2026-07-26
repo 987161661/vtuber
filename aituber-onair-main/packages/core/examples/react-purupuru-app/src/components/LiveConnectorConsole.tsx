@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import type {
   LiveConnectorId,
   LiveConnectorSettings,
@@ -13,10 +13,13 @@ import {
   transferPlatformOwnership,
 } from '../services/live-platform/connectors';
 import {
+  cancelPlatformQrAuth,
   clearOrdinaryRoadCredential,
-  saveOrdinaryRoadCredential,
+  fetchPlatformQrAuthStatus,
   saveOrdinaryRoadPlatformConfig,
+  startPlatformQrAuth,
 } from '../services/live-platform/ordinaryRoad';
+import type { PlatformQrAuthSession } from '../services/live-platform/ordinaryRoad';
 import type { StreamBusHealth } from '../hooks/useSocialStreamBus';
 
 interface LiveConnectorConsoleProps {
@@ -103,10 +106,11 @@ export function LiveConnectorConsole(props: LiveConnectorConsoleProps) {
     ordinaryroad: 'bilibili',
     'social-stream-ninja': '',
   });
-  const [credentialDraft, setCredentialDraft] = useState('');
   const [customSource, setCustomSource] = useState('');
   const [notice, setNotice] = useState('');
   const [busy, setBusy] = useState(false);
+  const [qrAuth, setQrAuth] = useState<PlatformQrAuthSession | null>(null);
+  const [qrBusy, setQrBusy] = useState(false);
 
   const ordinary = props.settings.ordinaryRoad;
   const social = props.settings.socialStreamNinja;
@@ -141,10 +145,55 @@ export function LiveConnectorConsole(props: LiveConnectorConsoleProps) {
   const connectorEnabled = currentConnector.enabled;
 
   const choosePlatform = (platformId: string) => {
+    if (qrAuth?.platformId && qrAuth.state !== 'authenticated') {
+      void cancelPlatformQrAuth(qrAuth.platformId).catch(() => {});
+    }
     setSelectedByTab((current) => ({ ...current, [tab]: platformId }));
-    setCredentialDraft('');
+    setQrAuth(null);
     setNotice('');
   };
+
+  useEffect(() => {
+    if (
+      !qrAuth?.id ||
+      qrAuth.state === 'authenticated' ||
+      qrAuth.state === 'expired' ||
+      qrAuth.state === 'error'
+    ) {
+      return;
+    }
+
+    let cancelled = false;
+    let timer: number | undefined;
+    const poll = async () => {
+      try {
+        const next = await fetchPlatformQrAuthStatus(
+          qrAuth.platformId || selectedPlatform,
+        );
+        if (cancelled) return;
+        setQrAuth(next);
+        if (next.state === 'authenticated') {
+          setNotice('扫码授权成功，登录态已安全保存，直播网关正在恢复回写。');
+          return;
+        }
+        if (next.state === 'expired' || next.state === 'error') return;
+        timer = window.setTimeout(() => void poll(), 1500);
+      } catch (error) {
+        if (cancelled) return;
+        setQrAuth((current) => ({
+          ...current,
+          state: 'error',
+          detail: error instanceof Error ? error.message : '授权服务不可用',
+        }));
+      }
+    };
+
+    timer = window.setTimeout(() => void poll(), 1500);
+    return () => {
+      cancelled = true;
+      if (timer !== undefined) window.clearTimeout(timer);
+    };
+  }, [qrAuth?.id, qrAuth?.platformId, qrAuth?.state, selectedPlatform]);
 
   const saveOrdinaryConfig = async (
     platformId: string,
@@ -235,23 +284,18 @@ export function LiveConnectorConsole(props: LiveConnectorConsoleProps) {
     setCustomSource('');
   };
 
-  const submitCredential = async () => {
-    if (!selectedPlatform || !credentialDraft.trim()) return;
-    setBusy(true);
+  const beginPlatformQrAuth = async () => {
+    if (!selectedPlatform) return;
+    setQrBusy(true);
+    setNotice('');
     try {
-      await saveOrdinaryRoadCredential(
-        ordinary.gatewayUrl,
-        selectedPlatform,
-        credentialDraft,
-      );
-      setNotice('凭据已提交给本地网关；输入框已清空。');
+      setQrAuth(await startPlatformQrAuth(selectedPlatform));
     } catch (error) {
-      setNotice(
-        `凭据提交失败：${error instanceof Error ? error.message : '未知错误'}`,
-      );
+      const detail = error instanceof Error ? error.message : '授权服务不可用';
+      setQrAuth({ platformId: selectedPlatform, state: 'error', detail });
+      setNotice(`扫码授权启动失败：${detail}`);
     } finally {
-      setCredentialDraft('');
-      setBusy(false);
+      setQrBusy(false);
     }
   };
 
@@ -401,24 +445,27 @@ export function LiveConnectorConsole(props: LiveConnectorConsoleProps) {
                     />
                   </label>
                   {manifest?.capabilities.credential && (
-                    <div className="credential-field">
-                      <label>
-                        Cookie / 登录凭据
-                        <input
-                          type="password"
-                          autoComplete="off"
-                          value={credentialDraft}
-                          onChange={(event) =>
-                            setCredentialDraft(event.target.value)
-                          }
-                          placeholder={`状态：${credentialLabel(platformStatus?.credentialState)}`}
-                        />
-                      </label>
+                    <div className="qr-credential-field">
+                      <div className="credential-summary">
+                        <span>登录授权</span>
+                        <strong>
+                          {qrAuth?.state === 'authenticated'
+                            ? '已授权'
+                            : credentialLabel(
+                                platformStatus?.credentialState,
+                              )}
+                        </strong>
+                        <small>扫码后自动保存到本机网关</small>
+                      </div>
                       <button
-                        disabled={!credentialDraft.trim() || busy}
-                        onClick={() => void submitCredential()}
+                        disabled={qrBusy || busy}
+                        onClick={() => void beginPlatformQrAuth()}
                       >
-                        安全保存
+                        {qrBusy
+                          ? '正在生成…'
+                          : qrAuth
+                            ? '重新授权'
+                            : '扫码授权'}
                       </button>
                       <button
                         className="secondary"
@@ -428,14 +475,65 @@ export function LiveConnectorConsole(props: LiveConnectorConsoleProps) {
                             ordinary.gatewayUrl,
                             selectedPlatform,
                           )
-                            .then(() => setNotice('本地凭据已清除。'))
+                            .then(() => {
+                              setQrAuth(null);
+                              setNotice(`${manifest.label}登录授权已清除。`);
+                            })
                             .catch((error) =>
                               setNotice(`清除失败：${String(error)}`),
                             );
                         }}
                       >
-                        清除
+                        清除授权
                       </button>
+
+                      {qrAuth && (
+                        <div
+                          className={`qr-auth-inline state-${qrAuth.state}`}
+                          role="status"
+                        >
+                          <div className="qr-auth-visual">
+                            {qrAuth.qrDataUrl &&
+                            qrAuth.state !== 'authenticated' ? (
+                              <img
+                                src={qrAuth.qrDataUrl}
+                                alt={`${manifest.label}登录授权二维码`}
+                              />
+                            ) : (
+                              <span aria-hidden="true">✓</span>
+                            )}
+                          </div>
+                          <div className="qr-auth-copy">
+                            <span>MOBILE HANDSHAKE · {selectedPlatform}</span>
+                            <strong>
+                              {qrAuth.state === 'waiting-scan' &&
+                                `用${manifest.label} App 扫一扫`}
+                              {qrAuth.state === 'waiting-confirmation' &&
+                                '已扫码，请在手机上确认'}
+                              {qrAuth.state === 'authenticated' &&
+                                '授权成功，正在恢复回写'}
+                              {qrAuth.state === 'expired' && '二维码已过期'}
+                              {qrAuth.state === 'error' && '授权未完成'}
+                            </strong>
+                            <p>
+                              {qrAuth.detail ||
+                                (qrAuth.state === 'waiting-scan'
+                                  ? '登录态不会显示在页面中，确认后会直接写入本机直播网关。'
+                                  : '请保持此配置页打开。')}
+                            </p>
+                            {(qrAuth.state === 'expired' ||
+                              qrAuth.state === 'error') && (
+                              <button
+                                className="secondary"
+                                disabled={qrBusy}
+                                onClick={() => void beginPlatformQrAuth()}
+                              >
+                                生成新二维码
+                              </button>
+                            )}
+                          </div>
+                        </div>
+                      )}
                     </div>
                   )}
                 </div>

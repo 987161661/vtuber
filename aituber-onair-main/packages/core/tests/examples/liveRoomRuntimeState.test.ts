@@ -30,6 +30,25 @@ describe('live room runtime authority', () => {
     ).toBe(6);
   });
 
+  it('promotes an authoritative per-platform live signal', () => {
+    expect(
+      resolveEffectiveLiveRoomStatus(
+        {
+          state: 'online',
+          platforms: {
+            bilibili: {
+              platformId: 'bilibili',
+              roomId: '21573209',
+              state: 'online',
+              isLive: true,
+            },
+          },
+        },
+        { obsOverlayActive: true, autoBroadcastEnabled: false },
+      ).isLive,
+    ).toBe(true);
+  });
+
   it('does not promote a preview page or an offline bridge', () => {
     expect(
       resolveEffectiveLiveRoomStatus(

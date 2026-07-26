@@ -2,6 +2,8 @@ import { describe, expect, it } from 'vitest';
 import {
   buildMemoryContext,
   isNonAttributableViewerCommand,
+  selectRelevantMemories,
+  suppressViewerMemoriesForOptOut,
 } from '../../examples/react-purupuru-app/src/lib/streamerMemory';
 import type { StreamerMemoryRecord } from '../../examples/react-purupuru-app/src/types/memory';
 
@@ -74,5 +76,79 @@ describe('streamer memory grounding', () => {
     );
     expect(context).toContain('我住在乌鲁木齐');
     expect(context).toContain('只有“我住在/我来自/我喜欢”等明确自述');
+  });
+
+  it('does not inject unrelated private memories into a new topic', () => {
+    const catMemory: StreamerMemoryRecord = {
+      ...viewerTrace('我家的猫上次在床上捣乱了'),
+      status: 'confirmed',
+      memoryTier: 'long_term',
+      phase: 'long_term',
+    };
+    const context = buildMemoryContext(
+      [catMemory],
+      '你到底是真人还是机器人',
+      'xiaoyu',
+      1_500,
+      undefined,
+      'linglan',
+    );
+
+    expect(context).not.toContain('猫');
+    expect(context).not.toContain('床上');
+  });
+
+  it('uses the same relevance rule for persona signals during relationship repair', () => {
+    const catMemory: StreamerMemoryRecord = {
+      ...viewerTrace('溜溜那只猫上次在床上捣乱了'),
+      status: 'confirmed',
+      memoryTier: 'long_term',
+      phase: 'long_term',
+    };
+
+    const selected = selectRelevantMemories(
+      [catMemory],
+      '主播睡着了，都不理我',
+      {
+        viewerId: 'xiaoyu',
+        digitalHumanId: 'linglan',
+      },
+    );
+
+    expect(selected).toEqual([]);
+  });
+
+  it('turns a viewer opt-out into a durable suppression instead of another callback', () => {
+    const catMemory: StreamerMemoryRecord = {
+      ...viewerTrace('我家的猫上次在床上捣乱了'),
+      status: 'confirmed',
+      memoryTier: 'long_term',
+      phase: 'long_term',
+    };
+    const input = '那只猫只是偶然说过，别再提这件事了';
+    const context = buildMemoryContext(
+      [catMemory],
+      input,
+      'xiaoyu',
+      1_500,
+      undefined,
+      'linglan',
+    );
+    const suppressed = suppressViewerMemoriesForOptOut(
+      [catMemory],
+      input,
+      'xiaoyu',
+      10_000,
+    );
+
+    expect(context).toContain('明确要求停止提及旧话题');
+    expect(context).not.toContain('我家的猫上次在床上捣乱了');
+    expect(suppressed).toHaveLength(1);
+    expect(suppressed[0]).toMatchObject({
+      id: catMemory.id,
+      status: 'suppressed',
+      phase: 'dormant',
+      updatedAt: 10_000,
+    });
   });
 });

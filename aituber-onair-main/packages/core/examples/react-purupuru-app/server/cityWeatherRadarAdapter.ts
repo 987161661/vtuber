@@ -44,14 +44,22 @@ export async function fetchRadarCityWeather(options: {
   const endpoint = `${options.baseUrl.replace(/\/$/, '')}/api/city-briefing?city=${encodeURIComponent(options.location)}`;
   const response = await fetcher(endpoint, {
     cache: 'no-store',
-    signal: AbortSignal.timeout(options.timeoutMs ?? 5_000),
+    // A cold radar city briefing may legitimately spend its bounded provider
+    // budgets before returning an observed city point. Do not abort just
+    // before that useful response arrives and replace it with "no data".
+    signal: AbortSignal.timeout(options.timeoutMs ?? 20_000),
   });
   const payload = (await response.json()) as RadarCityBriefing;
   const current = payload.current;
   const cityName =
     text(payload.city?.administrativePath?.city) ?? text(payload.city?.name);
   const province = text(payload.city?.province);
-  if (!response.ok || payload.status !== 'available' || !current || !cityName) {
+  if (
+    !response.ok ||
+    !['available', 'degraded'].includes(String(payload.status)) ||
+    !current ||
+    !cityName
+  ) {
     throw new Error('radar_city_weather_unavailable');
   }
 

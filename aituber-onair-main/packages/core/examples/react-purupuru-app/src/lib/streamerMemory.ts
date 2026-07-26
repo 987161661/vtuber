@@ -12,6 +12,7 @@ import type {
   MemoryScope,
   StreamerMemoryRecord,
 } from '../types/memory';
+import { classifyConversationRelevance } from './conversationRelevance';
 
 export type {
   MemoryDimension,
@@ -29,6 +30,8 @@ const DB_VERSION = 3;
 const DAY = 86_400_000;
 const SANITIZER_MIGRATION_VERSION = 2;
 const ARCHIVE_SCHEMA_VERSION = 3;
+const VIEWER_MEMORY_OPT_OUT =
+  /(?:别|不要|不用|不想).{0,10}(?:再)?(?:提|说|聊|记)|(?:别|不要)(?:老|总是?|每次)?(?:提|说|聊)|每次都(?:要)?提/u;
 let migrationPromise: Promise<void> | undefined;
 
 function openDatabase(
@@ -408,6 +411,120 @@ export function isNonAttributableViewerCommand(
   );
 }
 
+function hasMemoryRecallOverlap(input: string, recordText: string): boolean {
+  return classifyConversationRelevance(input, recordText) !== 'none';
+}
+
+export function isViewerMemoryOptOut(input: string): boolean {
+  return VIEWER_MEMORY_OPT_OUT.test(input.normalize('NFKC'));
+}
+
+/**
+ * Convert a viewer's explicit topic veto into durable memory state. The caller
+ * persists the returned replacements through its existing memory adapter.
+ */
+export function suppressViewerMemoriesForOptOut(
+  records: readonly StreamerMemoryRecord[],
+  input: string,
+  viewerId: string | undefined,
+  at = Date.now(),
+): StreamerMemoryRecord[] {
+  if (!viewerId || !isViewerMemoryOptOut(input)) return [];
+  return records
+    .filter(
+      (record) =>
+        record.subjectId === viewerId &&
+        !record.protected &&
+        !['suppressed', 'archived'].includes(record.status) &&
+        hasMemoryRecallOverlap(input, `${record.title} ${record.content}`),
+    )
+    .map((record) => ({
+      ...record,
+      status: 'suppressed' as const,
+      phase: 'dormant' as const,
+      activation: Math.min(record.activation, 0.08),
+      disputation: record.disputation + 1,
+      updatedAt: at,
+    }));
+}
+
+export type RelevantMemorySelectionOptions = {
+  viewerId?: string;
+  activeCoreRecordId?: string;
+  digitalHumanId?: string;
+  maxRecords?: number;
+  now?: number;
+};
+
+/**
+ * The one retrieval seam for prompt context and persona signals. Viewer
+ * identity grants access and a ranking boost, but never creates relevance.
+ */
+export function selectRelevantMemories(
+  records: readonly StreamerMemoryRecord[],
+  input: string,
+  options: RelevantMemorySelectionOptions = {},
+): StreamerMemoryRecord[] {
+  const now = options.now ?? Date.now();
+  const viewerOptOut = isViewerMemoryOptOut(input);
+  const terms = input
+    .normalize('NFKC')
+    .toLowerCase()
+    .split(/[\s，。！？、]+/u)
+    .filter((term) => term.length >= 2);
+  const isSameViewerPrivateMemory = (record: StreamerMemoryRecord) =>
+    record.visibility === 'private' &&
+    Boolean(options.viewerId) &&
+    record.subjectId === options.viewerId;
+  const isLongTermMemory = (record: StreamerMemoryRecord) =>
+    (record.status === 'confirmed' || record.status === 'protected') &&
+    record.memoryTier === 'long_term' &&
+    (record.phase === 'long_term' || record.phase === 'fading');
+  const isRecentViewerTrace = (record: StreamerMemoryRecord) =>
+    isSameViewerPrivateMemory(record) &&
+    !['suppressed', 'archived'].includes(record.status) &&
+    record.memoryTier === 'short_term' &&
+    record.phase !== 'forgotten';
+  const isRelevant = (record: StreamerMemoryRecord) =>
+    !isSameViewerPrivateMemory(record) ||
+    (!viewerOptOut &&
+      hasMemoryRecallOverlap(input, `${record.title} ${record.content}`));
+  const score = (record: StreamerMemoryRecord) =>
+    record.activation * 55 +
+    record.stability * 35 +
+    record.salience * 20 +
+    (record.subjectId === options.viewerId ? 40 : 0) +
+    terms.filter((term) =>
+      `${record.title} ${record.content}`.toLowerCase().includes(term),
+    ).length *
+      10 +
+    record.importance * 2 +
+    (record.reinforcement - record.disputation) * 5 +
+    record.confidence * 8 +
+    record.updatedAt / 1e13;
+
+  return records
+    .filter(
+      (record) =>
+        (!options.digitalHumanId ||
+          record.digitalHumanId === options.digitalHumanId) &&
+        (!options.activeCoreRecordId ||
+          record.scope !== 'core' ||
+          record.id.startsWith(options.activeCoreRecordId)) &&
+        (isLongTermMemory(record) || isRecentViewerTrace(record)) &&
+        isRelevant(record) &&
+        (record.visibility !== 'private' ||
+          isSameViewerPrivateMemory(record)) &&
+        (!record.expiresAt || record.expiresAt > now) &&
+        (!record.subjectId ||
+          !options.viewerId ||
+          record.subjectId === options.viewerId) &&
+        !isNonAttributableViewerCommand(record),
+    )
+    .sort((left, right) => score(right) - score(left))
+    .slice(0, options.maxRecords ?? 8);
+}
+
 export function buildMemoryContext(
   records: StreamerMemoryRecord[],
   input: string,
@@ -416,49 +533,29 @@ export function buildMemoryContext(
   activeCoreRecordId?: string,
   digitalHumanId?: string,
 ): string {
-  const terms = input
-    .toLowerCase()
-    .split(/[\s，。！？、]+/)
-    .filter((t) => t.length >= 2);
-  const score = (r: StreamerMemoryRecord) =>
-    r.activation * 55 +
-    r.stability * 35 +
-    r.salience * 20 +
-    (r.subjectId === viewerId ? 40 : 0) +
-    terms.filter((t) => r.content.toLowerCase().includes(t)).length * 10 +
-    r.importance * 2 +
-    (r.reinforcement - r.disputation) * 5 +
-    r.confidence * 8 +
-    r.updatedAt / 1e13;
+  const viewerOptOut = isViewerMemoryOptOut(input);
   const isSameViewerPrivateMemory = (record: StreamerMemoryRecord) =>
     record.visibility === 'private' &&
     Boolean(viewerId) &&
     record.subjectId === viewerId;
-  const isLongTermMemory = (record: StreamerMemoryRecord) =>
-    (record.status === 'confirmed' || record.status === 'protected') &&
-    record.memoryTier === 'long_term' &&
-    (record.phase === 'long_term' || record.phase === 'fading');
   const isRecentViewerTrace = (record: StreamerMemoryRecord) =>
     isSameViewerPrivateMemory(record) &&
+    !['suppressed', 'archived'].includes(record.status) &&
     record.memoryTier === 'short_term' &&
     record.phase !== 'forgotten';
-  const selected = records
-    .filter(
-      (record) =>
-        (!digitalHumanId || record.digitalHumanId === digitalHumanId) &&
-        (!activeCoreRecordId ||
-          record.scope !== 'core' ||
-          record.id.startsWith(activeCoreRecordId)) &&
-        (isLongTermMemory(record) || isRecentViewerTrace(record)) &&
-        (record.visibility !== 'private' || isSameViewerPrivateMemory(record)) &&
-        (!record.expiresAt || record.expiresAt > Date.now()) &&
-        (!record.subjectId || !viewerId || record.subjectId === viewerId) &&
-        !isNonAttributableViewerCommand(record),
-    )
-    .sort((a, b) => score(b) - score(a))
-    .slice(0, 8);
+  const selected = selectRelevantMemories(records, input, {
+    viewerId,
+    activeCoreRecordId,
+    digitalHumanId,
+    maxRecords: 8,
+  });
   let used = 0;
   const lines: string[] = [];
+  if (viewerOptOut) {
+    lines.push(
+      '- [使用规则] 观众本轮明确要求停止提及旧话题。简短承认并立即停止，不复述旧内容、不辩解，也不要用另一个旧记忆转移话题。',
+    );
+  }
   if (selected.some(isRecentViewerTrace)) {
     lines.push(
       '- [使用规则] 近期私有记忆只是带 actor 身份的历史话语，不是观众档案。只能归给同一 viewerId；提问、@城市、技能命令和话题提及不得推断为住址、偏好或身份。只有“我住在/我来自/我喜欢”等明确自述才能作为低置信 viewer claim 承接，且不能据此断言第三方或客观事件为真。',

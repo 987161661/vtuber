@@ -73,7 +73,10 @@ export function normalizeCityReportEngagementPayload(
     .split(/\r?\n/u)
     .filter((line) => !LEGACY_SUPPORT_COUPLING_SIGNAL.test(line))
     .join('\n')
-    .replace(/<\/city_report_engagement>/u, '行动约束：不得索取关注、点赞、礼物或其他支持。\n</city_report_engagement>');
+    .replace(
+      /<\/city_report_engagement>/u,
+      '行动约束：不得索取关注、点赞、礼物或其他支持。\n</city_report_engagement>',
+    );
 
   void runtimeMode;
 

@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
   decodeOperatorQueueCommand,
   decodeOperatorQueueIngest,
+  decodeOperatorQueueSnapshotQuery,
   sanitizePreparedSpeechPlan,
 } from '../../examples/react-purupuru-app/server/operatorQueueHttpAdapter';
 
@@ -65,6 +66,45 @@ describe('operator queue HTTP adapter', () => {
       status: 'skipped',
       skipReason: 'duplicate_text',
       order: 1,
+    });
+  });
+
+  it('sanitizes session scope on ingest and snapshot queries', () => {
+    const item = decodeOperatorQueueIngest(
+      'ingest',
+      {
+        eventId: 'event-scoped',
+        text: 'hello',
+        scope: {
+          personaId: ' host-1 ',
+          platform: ' bilibili ',
+          roomId: ' room-1 ',
+          sessionId: ' session-1 ',
+        },
+      },
+      { items: [], now: 1_000 },
+    ).item;
+    const search = new URLSearchParams({
+      view: 'session',
+      personaId: 'host-1',
+      platform: 'bilibili',
+      roomId: 'room-1',
+      sessionId: 'session-1',
+      includeTestRuns: '1',
+      limit: '200',
+    });
+
+    expect(item.scope).toEqual({
+      personaId: 'host-1',
+      platform: 'bilibili',
+      roomId: 'room-1',
+      sessionId: 'session-1',
+    });
+    expect(decodeOperatorQueueSnapshotQuery(search)).toEqual({
+      view: 'session',
+      scope: item.scope,
+      limit: 200,
+      includeTestRuns: true,
     });
   });
 
